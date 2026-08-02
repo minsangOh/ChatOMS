@@ -94,9 +94,28 @@ Claude/Codex에 Context Package와 코드 문맥을 보내는 행위도 외부 �
 
 대상 프로젝트의 schema 파일 생성·변경, migration 생성·실행과 데이터 변환은 모두 사용자 별도 승인이 필요하다. ChatOMS 내부 migration의 자동 실행 정책을 대상 프로젝트에 적용하지 않는다.
 
+## 앱 데이터 경로와 Windows ACL
+
+- 영구 SQLite, log와 artifact 저장 전에 `SecureAppPaths`의 경로·권한 검증을 통과해야 한다. `Degraded`, `Insecure`, `Unsupported`, `Unknown`은 모두 저장 차단 상태다.
+- Windows app root는 `%LOCALAPPDATA%\ChatOMS`이며 current user와 `NT AUTHORITY\SYSTEM`에만 Full Control을 허용한다.
+- DACL inheritance를 보호하고 `Everyone`, `BUILTIN\Users`, `Authenticated Users` 및 승인되지 않은 writable principal의 allow ACE를 허용하지 않는다.
+- 권한 적용 후 DACL을 다시 읽어 current user·SYSTEM 권한, broad allow 부재와 directory inheritance flag를 검증한다. 적용 또는 검증 실패는 fail-closed 처리한다.
+- app root, 필수 하위 directory와 task directory가 symlink 또는 reparse point이면 거부한다. 이 검사는 TOCTOU를 완전히 제거한다고 주장하지 않는다.
+- Phase 1의 검증 범위는 local NTFS user profile이다. UNC, network share, redirected profile과 foreign filesystem은 지원·검증됐다고 간주하지 않는다.
+- ACL 적용은 관리자 권한, owner 변경, deny ACE 추가, SACL 변경, privilege elevation 또는 외부 명령을 요구하지 않는다.
+
 ## 격리 보장 범위
 
 MVP의 격리는 ChatOMS application policy와 공식 CLI가 제공하는 권한·sandbox 기능의 조합이다. 임의 자식 프로세스의 파일·네트워크 동작을 운영체제 전체 수준에서 완전히 격리한다고 보장하지 않는다.
 
 - 지원되지 않는 정책이나 capability가 감지되면 권한을 완화하지 않고 실행을 차단한다.
 - OS 수준 강제 격리가 필요한 회사 장비에서는 조직이 제공하는 별도 보안 통제를 우선 적용한다.
+
+## Redaction과 로컬 진단 로그
+
+- Raw secret, raw prompt, CLI 원문 출력과 인증정보를 로그 API에 직접 전달하거나 영구 저장하지 않는다.
+- Authorization/Proxy-Authorization, Cookie, API key·token·password·session 계열 필드, private key, JWT·provider token 및 URL credential을 저장 전에 결정적으로 마스킹한다.
+- Percent encoding 또는 JSON escape를 해석했을 때 민감정보가 발견되지만 안전한 부분 치환을 보장할 수 없으면 전체 값을 `[REDACTION_FAILED]`로 대체한다.
+- `RedactedText`의 내부 값은 private이며 `Display`와 `Debug`는 검증된 redacted 결과만 노출한다. 검증 실패 시 raw logging fallback을 허용하지 않는다.
+- 영구 로그는 권한 검증을 통과한 local logs directory에만 ANSI 없는 structured 형식으로 기록한다. Remote telemetry와 네트워크 전송은 Phase 1에서 금지한다.
+- 사용자 오류에는 내부 경로, SID, SQL, source chain 또는 secret을 포함하지 않는다. Concrete source chain은 내부 adapter error에서만 유지하고 application 경계를 넘기지 않는다.

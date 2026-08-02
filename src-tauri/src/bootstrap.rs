@@ -1,0 +1,365 @@
+use std::sync::{Arc, Mutex};
+
+use chatoms_application::{
+    bootstrap::{BootstrapService, BootstrapStatus, DatabaseStatus, StorageStatus},
+    error::ApplicationError,
+};
+use chatoms_infrastructure::bootstrap::{
+    DatabaseBootstrapAdapter, LoggingBootstrapAdapter, SharedDatabase, SharedLoggingGuard,
+};
+use chatoms_platform::bootstrap::{
+    StaticPlatformCapabilityAdapter, StorageBootstrapAdapter, SystemTimeProvider,
+};
+use chatoms_ports::{
+    DatabaseBootstrapPort, LoggingBootstrapPort, PlatformCapabilityPort, StorageBootstrapPort,
+    TimeProvider, error::FailureCategory, repository::FoundationRepository,
+};
+
+use crate::state::{
+    AppRuntime, CapabilityHandle, ManagedRuntime, RepositoryHandle, RuntimeResources,
+    TimeProviderHandle,
+};
+
+pub fn compose_runtime<S, D, L, R, T, C>(
+    mut storage: S,
+    mut database: D,
+    mut logging: L,
+    mut repository: R,
+    time: T,
+    capabilities: C,
+    resources: RuntimeResources,
+) -> ManagedRuntime
+where
+    S: StorageBootstrapPort,
+    D: DatabaseBootstrapPort,
+    L: LoggingBootstrapPort,
+    R: FoundationRepository + Send + 'static,
+    T: TimeProvider + Send + 'static,
+    C: PlatformCapabilityPort + Send + 'static,
+{
+    let bootstrap_result =
+        BootstrapService::new(&mut storage, &mut database, &mut logging, &mut repository)
+            .bootstrap();
+
+    match bootstrap_result {
+        Ok(status) if status.ready => ManagedRuntime::ready(AppRuntime::new(
+            status,
+            RepositoryHandle::new(repository),
+            TimeProviderHandle::new(time),
+            CapabilityHandle::new(capabilities),
+            resources,
+        )),
+        Ok(status) => {
+            let error = unavailable_status_error(&status);
+            ManagedRuntime::unavailable(error, Some(status))
+        }
+        Err(error) => ManagedRuntime::unavailable(error, None),
+    }
+}
+
+#[must_use]
+pub fn production_runtime() -> ManagedRuntime {
+    let paths = Arc::new(Mutex::new(None));
+    let database = SharedDatabase::default();
+    let logging_guard = SharedLoggingGuard::default();
+    let resources = RuntimeResources {
+        paths: paths.clone(),
+        database: database.clone(),
+        logging_guard: logging_guard.clone(),
+    };
+
+    #[cfg(windows)]
+    let storage = match StorageBootstrapAdapter::windows_from_environment(paths.clone()) {
+        Ok(storage) => storage,
+        Err(error) => {
+            return ManagedRuntime::unavailable(ApplicationError::from_categorized(&error), None);
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    let storage = StorageBootstrapAdapter::new(
+        chatoms_platform::path::MacOsPathResolver,
+        chatoms_platform::permissions::MacOsPermissionManager,
+        paths.clone(),
+    );
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let storage = UnsupportedStorageBootstrap;
+
+    let database_adapter = DatabaseBootstrapAdapter::new(paths.clone(), database.clone());
+    let logging_adapter = LoggingBootstrapAdapter::new(paths, logging_guard);
+    let repository = database.repository();
+
+    compose_runtime(
+        storage,
+        database_adapter,
+        logging_adapter,
+        repository,
+        SystemTimeProvider,
+        StaticPlatformCapabilityAdapter,
+        resources,
+    )
+}
+
+fn unavailable_status_error(status: &BootstrapStatus) -> ApplicationError {
+    let category = match status.storage_status {
+        StorageStatus::Insecure => FailureCategory::StorageInsecure,
+        StorageStatus::Unavailable => FailureCategory::StorageUnavailable,
+        StorageStatus::Unsupported => FailureCategory::Unsupported,
+        StorageStatus::Ready => match status.database_status {
+            DatabaseStatus::Incompatible | DatabaseStatus::MigrationRequired => {
+                FailureCategory::MigrationFailure
+            }
+            DatabaseStatus::Unavailable | DatabaseStatus::NotChecked => {
+                FailureCategory::StorageUnavailable
+            }
+            DatabaseStatus::Ready | DatabaseStatus::Upgraded => FailureCategory::Internal,
+        },
+    };
+    ApplicationError::from_failure(
+        category,
+        category.default_severity(),
+        category.default_retry(),
+    )
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+struct UnsupportedStorageBootstrap;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+impl StorageBootstrapPort for UnsupportedStorageBootstrap {
+    fn prepare_secure_storage(
+        &mut self,
+    ) -> Result<chatoms_ports::StorageBootstrapState, chatoms_ports::error::PortFailure> {
+        Ok(chatoms_ports::StorageBootstrapState::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use chatoms_domain::{Task, TaskId, TaskStateTransition};
+    use chatoms_ports::{
+        DatabaseBootstrapState, LoggingBootstrapState, PlatformCapabilities,
+        PlatformCapabilityStatus, StorageBootstrapState,
+        error::PortFailure,
+        repository::{ActiveLease, ProjectSummary, RepositoryError},
+    };
+
+    use crate::state::RuntimeState;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct Calls(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Calls {
+        fn push(&self, value: &'static str) {
+            self.0.lock().expect("calls").push(value);
+        }
+    }
+
+    struct StorageFake {
+        calls: Calls,
+        state: StorageBootstrapState,
+    }
+
+    impl StorageBootstrapPort for StorageFake {
+        fn prepare_secure_storage(&mut self) -> Result<StorageBootstrapState, PortFailure> {
+            self.calls.push("storage");
+            Ok(self.state)
+        }
+    }
+
+    struct DatabaseFake {
+        calls: Calls,
+        state: DatabaseBootstrapState,
+    }
+
+    impl DatabaseBootstrapPort for DatabaseFake {
+        fn bootstrap_database(&mut self) -> Result<DatabaseBootstrapState, PortFailure> {
+            self.calls.push("database");
+            Ok(self.state)
+        }
+    }
+
+    struct LoggingFake {
+        calls: Calls,
+        fail: bool,
+    }
+
+    impl LoggingBootstrapPort for LoggingFake {
+        fn bootstrap_logging(&mut self) -> Result<LoggingBootstrapState, PortFailure> {
+            self.calls.push("logging");
+            if self.fail {
+                Err(PortFailure::new(FailureCategory::LoggingFailure))
+            } else {
+                Ok(LoggingBootstrapState::Ready)
+            }
+        }
+    }
+
+    struct RepositoryFake {
+        calls: Calls,
+    }
+
+    impl FoundationRepository for RepositoryFake {
+        fn create_task(
+            &mut self,
+            _task: &Task,
+            _initial_transition: &TaskStateTransition,
+            _lease_acquired_at_ms: i64,
+        ) -> Result<(), RepositoryError> {
+            unreachable!("mutation is not part of startup")
+        }
+        fn get_task(&mut self, _task_id: TaskId) -> Result<Option<Task>, RepositoryError> {
+            unreachable!("task lookup is not part of startup")
+        }
+        fn save_transition(
+            &mut self,
+            _expected_version: u64,
+            _task: &Task,
+            _transition: &TaskStateTransition,
+        ) -> Result<(), RepositoryError> {
+            unreachable!("mutation is not part of startup")
+        }
+        fn save_recovery_target(
+            &mut self,
+            _expected_version: u64,
+            _task: &Task,
+        ) -> Result<(), RepositoryError> {
+            unreachable!("mutation is not part of startup")
+        }
+        fn terminate_task(
+            &mut self,
+            _expected_version: u64,
+            _task: &Task,
+            _transition: &TaskStateTransition,
+        ) -> Result<(), RepositoryError> {
+            unreachable!("mutation is not part of startup")
+        }
+        fn list_task_transitions(
+            &mut self,
+            _task_id: TaskId,
+        ) -> Result<Vec<TaskStateTransition>, RepositoryError> {
+            unreachable!("history is not part of startup")
+        }
+        fn list_projects(&mut self) -> Result<Vec<ProjectSummary>, RepositoryError> {
+            unreachable!("project lookup is not part of startup")
+        }
+        fn active_lease(&mut self) -> Result<Option<ActiveLease>, RepositoryError> {
+            self.calls.push("lease");
+            Ok(None)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TimeFake;
+
+    impl TimeProvider for TimeFake {
+        fn now_ms(&mut self) -> Result<i64, PortFailure> {
+            Ok(1)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CapabilityFake;
+
+    impl PlatformCapabilityPort for CapabilityFake {
+        fn platform_capabilities(&mut self) -> Result<PlatformCapabilities, PortFailure> {
+            Ok(PlatformCapabilities {
+                secure_storage: PlatformCapabilityStatus::Supported,
+                native_permissions: PlatformCapabilityStatus::Supported,
+            })
+        }
+    }
+
+    fn compose(
+        storage: StorageBootstrapState,
+        database: DatabaseBootstrapState,
+        logging_fail: bool,
+    ) -> (ManagedRuntime, Vec<&'static str>) {
+        let calls = Calls(Arc::new(Mutex::new(Vec::new())));
+        let runtime = compose_runtime(
+            StorageFake {
+                calls: calls.clone(),
+                state: storage,
+            },
+            DatabaseFake {
+                calls: calls.clone(),
+                state: database,
+            },
+            LoggingFake {
+                calls: calls.clone(),
+                fail: logging_fail,
+            },
+            RepositoryFake {
+                calls: calls.clone(),
+            },
+            TimeFake,
+            CapabilityFake,
+            RuntimeResources::default(),
+        );
+        let recorded = calls.0.lock().expect("calls").clone();
+        (runtime, recorded)
+    }
+
+    #[test]
+    fn successful_and_logging_degraded_startup_are_ready_in_order() {
+        let (runtime, calls) = compose(
+            StorageBootstrapState::Ready,
+            DatabaseBootstrapState::Ready,
+            false,
+        );
+        assert!(matches!(
+            *runtime.lock().expect("state"),
+            RuntimeState::Ready(_)
+        ));
+        assert_eq!(calls, ["storage", "database", "logging", "lease"]);
+
+        let (runtime, calls) = compose(
+            StorageBootstrapState::Ready,
+            DatabaseBootstrapState::Ready,
+            true,
+        );
+        let state = runtime.lock().expect("state");
+        let RuntimeState::Ready(ready) = &*state else {
+            panic!("logging failure is degraded ready");
+        };
+        assert_eq!(
+            ready.bootstrap_status.logging_status,
+            chatoms_application::bootstrap::LoggingStatus::Unavailable
+        );
+        assert_eq!(calls, ["storage", "database", "logging", "lease"]);
+    }
+
+    #[test]
+    fn critical_statuses_are_unavailable_and_stop_followup_calls() {
+        for (storage, database, expected_calls) in [
+            (
+                StorageBootstrapState::Insecure,
+                DatabaseBootstrapState::Ready,
+                vec!["storage"],
+            ),
+            (
+                StorageBootstrapState::Ready,
+                DatabaseBootstrapState::Unavailable,
+                vec!["storage", "database"],
+            ),
+            (
+                StorageBootstrapState::Ready,
+                DatabaseBootstrapState::Incompatible,
+                vec!["storage", "database"],
+            ),
+        ] {
+            let (runtime, calls) = compose(storage, database, false);
+            let state = runtime.lock().expect("state");
+            let RuntimeState::Unavailable(unavailable) = &*state else {
+                panic!("critical status must be unavailable");
+            };
+            assert!(unavailable.error.to_string().starts_with("APP_"));
+            assert_eq!(calls, expected_calls);
+        }
+    }
+}

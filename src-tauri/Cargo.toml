@@ -1,0 +1,23 @@
+[package]
+name = "chatoms-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+name = "chatoms_app"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+chatoms-application.workspace = true
+chatoms-domain.workspace = true
+chatoms-infrastructure.workspace = true
+chatoms-platform.workspace = true
+chatoms-ports.workspace = true
+serde.workspace = true
+tauri.workspace = true

@@ -9,6 +9,7 @@
 - `ActiveTaskLease`는 `Completed`, `Failed`, `Cancelled` 중 하나에 진입할 때만 해제한다.
 - `CleanupPending`과 `Archived`는 종료 결과 이후의 보존 수명주기 상태이므로 lease를 다시 획득하지 않는다.
 - 상태는 Rust enum으로 표현하고 domain 유스케이스를 통해서만 변경한다.
+- `Paused`는 항상 검증 후 재개할 정상 업무 상태를 `resume_target_state`로 보유한다. `RecoveryRequired`는 복구 분석 전에는 target이 없으며 검증 후에만 target을 설정한다.
 
 ## 상태와 전이
 
@@ -34,10 +35,10 @@
 | `MergeConflict` | Git이 자동 병합하지 못한 충돌이 존재함 | `Merging`, `Paused`, `Cancelled`, `Failed` | 의미 판단·수동 해결은 필요 | 가능 |
 | `PostMergeTesting` | 병합 결과에서 build와 regression test 실행 중 | `Completed`, `Failed`, `RecoveryRequired` | 없음 | 조건부 |
 | `Completed` | 병합 후 필수 검증까지 성공하고 같은 transaction에서 lease를 해제함 | `CleanupPending`, 조건부 `Archived` | 없음 | 불가 |
-| `Paused` | 사용자가 보류했거나 안전하게 중단되었고 실행 중 process가 없음. lease는 유지됨 | 재검증된 재개 대상, `Cancelled`, `RecoveryRequired`, `UnknownExternalEffect` | 재개 시 필요 | 가능 |
+| `Paused` | 사용자가 보류했거나 안전하게 중단되었고 실행 중 process가 없음. 직전 정상 업무 상태를 resume target으로 보유하며 lease는 유지됨 | 저장된 resume target으로 contextual 재개, `Cancelled`, `RecoveryRequired`, `Failed` | 재개 시 필요 | 가능 |
 | `Failed` | 재시도 소진 또는 복구 불가능한 실패로 종료하고 같은 transaction에서 lease를 해제함 | `CleanupPending`, 조건부 `Archived` | 정리 정책에 따름 | 불가 |
-| `RecoveryRequired` | 비정상 종료 후 로컬 상태 확인이 필요하지만 외부 부작용의 불명확성이 확정되지는 않음. lease는 유지됨 | 재검증된 재개 대상, `Paused`, `Cancelled`, `UnknownExternalEffect` | 재개 전 필요 | 가능 |
-| `UnknownExternalEffect` | 중단된 외부 요청의 성공·실패를 판정할 수 없고 lease를 유지함 | `RecoveryRequired`, `Paused`, `Cancelled` | 상태 판정과 후속 조치에 필요 | 자동 재개 불가 |
+| `RecoveryRequired` | 비정상 종료 후 로컬 상태 확인이 필요하지만 외부 부작용의 불명확성이 확정되지는 않음. lease는 유지됨 | 검증된 target으로 contextual 재개, target이 있을 때 contextual `Paused`, `Cancelled`, `Failed` | target 설정과 재개 전 필요 | 가능 |
+| `UnknownExternalEffect` | 중단된 외부 요청의 성공·실패를 판정할 수 없고 lease를 유지함. resume target을 보유하지 않음 | `RecoveryRequired`, `Cancelled`, `Failed` | 상태 판정과 후속 조치에 필요 | 직접 재개·보류 불가 |
 | `Cancelled` | 사용자 취소 또는 승인 거부로 종료하고 같은 transaction에서 lease를 해제함 | `CleanupPending`, 조건부 `Archived` | 파괴적 정리는 별도 정책 적용 | 불가 |
 | `CleanupPending` | 종료 결과가 확정된 뒤 보존 기간·안전 조건을 기다리거나 정리 재시도를 대기함 | `Archived` | 보존 표시가 있으면 자동 정리 금지 | 정리만 재시도 |
 | `Archived` | 적용 가능한 보존·정리 조건을 완료하여 실행·복구 대상이 아님 | 없음 | 없음 | 불가 |
@@ -109,15 +110,15 @@
 
 ### RecoveryRequired
 
-로컬 process, DB, worktree 또는 checkpoint의 일관성을 확인해야 하는 상태다. 읽기 전용 진단으로 실제 상태를 확인한 뒤 사용자가 재개·보류·취소를 선택할 수 있다. 진단 결과만으로 명령이나 공급자 호출을 자동 재실행하지 않는다.
+로컬 process, DB, worktree 또는 checkpoint의 일관성을 확인해야 하는 상태다. 읽기 전용 진단으로 실제 상태를 확인한 뒤 checkpoint/version, worktree와 외부 효과 검증을 나타내는 domain validation과 함께 명시적인 resume target을 설정한다. 검증된 target이 있을 때만 `Paused`로 이동하거나 해당 target으로 재개할 수 있으며, 진단 결과만으로 명령이나 공급자 호출을 자동 재실행하지 않는다.
 
 ### UnknownExternalEffect
 
-외부 요청이 중단되어 원격 부작용의 발생 여부를 알 수 없는 상태다. 성공이나 실패로 추정하지 않으며 동일 외부 쓰기 요청을 자동 재실행하지 않는다. 사용자 또는 외부 시스템의 확인을 거쳐야 `RecoveryRequired` 등으로 이동할 수 있다.
+외부 요청이 중단되어 원격 부작용의 발생 여부를 알 수 없는 상태다. 성공이나 실패로 추정하지 않으며 동일 외부 쓰기 요청을 자동 재실행하지 않는다. resume target을 보유하거나 `Paused`로 직접 이동하지 않으며, 정상 복구는 사용자 또는 외부 시스템의 확인을 거쳐 `RecoveryRequired`로 이동한 뒤 명시적인 복구 target을 설정하는 순서로만 수행한다.
 
 ### 재개 검증
 
-`Paused`, `RecoveryRequired`, `UnknownExternalEffect`에서 재개할 때는 저장된 상태를 그대로 신뢰하지 않고 다음을 다시 검증한다.
+정적 상태 전이 API는 문맥이 필요 없는 edge만 검증한다. 정상 업무 상태에서 `Paused` 진입, `Paused`에서 저장된 target으로 재개, `RecoveryRequired`에서 검증된 target 설정·재개와 target을 유지한 `Paused` 전이는 Task aggregate의 contextual API로만 수행한다. `Paused`와 `RecoveryRequired`에서 재개할 때는 저장된 상태를 그대로 신뢰하지 않고 다음을 다시 검증한다.
 
 1. 마지막 완료 checkpoint와 Task version
 2. task branch와 worktree의 존재, 연결 관계와 현재 변경 상태
@@ -137,5 +138,7 @@
 4. 이전·다음 상태, 원인, actor와 시각을 상태 전이 이력에 추가
 5. 필요하면 checkpoint 참조 갱신
 6. `Completed`, `Failed`, `Cancelled` 진입이면 같은 transaction에서 `ActiveTaskLease` 해제
+
+최초 `Created` transition은 sequence `1`, `from_state = None`, `task_version = 0`으로 기록한다. 이후 sequence는 직전 값에서 정확히 1 증가해야 하며, 마지막 sequence 조회와 연속성·동시성 검증은 repository가 같은 transaction 안에서 수행한다.
 
 하나라도 실패하면 전체를 rollback한다. 정리는 lease 해제와 별개이며 종료 결과가 확정된 뒤 `CleanupPending`에서 수행한다. 장시간 작업 직전과 완료 직후에는 checkpoint를 기록하며, 앱 재시작 시 SQLite 현재 상태와 마지막 완료 checkpoint를 함께 검증한다.

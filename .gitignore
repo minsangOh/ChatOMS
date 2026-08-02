@@ -7,6 +7,7 @@ coverage/
 # Rust / Tauri build output
 target/
 src-tauri/target/
+src-tauri/gen/schemas/
 **/*.rs.bk
 
 # Local databases and SQLite sidecars
