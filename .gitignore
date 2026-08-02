@@ -1,0 +1,62 @@
+# Node / React / frontend build output
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Rust / Tauri build output
+target/
+src-tauri/target/
+**/*.rs.bk
+
+# Local databases and SQLite sidecars
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Runtime logs and local artifacts
+*.log
+/logs/
+/artifacts/
+/.chatoms/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Common authentication and private-key files. Do not add broad certificate
+# exclusions; future public certificates or test fixtures must use a narrow,
+# reviewed path exception when they are intentionally tracked.
+auth.json
+.credentials.json
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# IDE and editor state
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+/tmp/
+/temp/
+*.tmp
