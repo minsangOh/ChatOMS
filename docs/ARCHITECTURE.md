@@ -138,7 +138,13 @@ sequenceDiagram
 - 프로젝트, 프로필 참조, 작업, 현재 상태와 상태 전이 이력을 저장한다.
 - 실행·승인·모델 선택·병합·복구 메타데이터와 artifact 참조를 저장한다.
 - DB의 foreign key·unique·check 제약은 단일 `ActiveTaskLease`와 관계 cardinality 같은 영속 불변조건을 방어하고, domain은 상태 전이와 업무 의미를 검증한다.
-- 상태 갱신과 상태 전이 이력은 하나의 트랜잭션으로 기록한다.
+- 모든 production file connection은 중앙 initializer에서 `foreign_keys=ON`, `journal_mode=WAL`, `synchronous=FULL`, `busy_timeout=5000`을 적용한 뒤 값을 다시 읽어 검증한다. `foreign_keys=OFF` raw connection은 schema가 방어할 수 없는 신뢰 경계 밖이다.
+- migration은 application에 포함된 forward-only SQL과 원문 byte 기준 SHA-256 registry를 사용한다. 각 migration은 독립 transaction에서 SQL, `foreign_key_check`, metadata 기록을 함께 commit하며 실패한 현재 migration만 rollback한다.
+- migration trigger는 immutable column과 불법 lease 직접 조작 방어에만 사용한다. Task·transition·lease lifecycle과 transition sequence 증가는 자동화하지 않으며 repository가 명시적인 transaction과 마지막 sequence 검증을 소유한다.
+- Task 생성은 Task, 최초 `Created` transition과 lease를 하나의 `IMMEDIATE` transaction으로 기록한다. 종료 전이는 Task 갱신, transition 기록과 lease 삭제를 하나의 transaction으로 처리한다.
+- 일반·contextual·post-terminal 전이는 expected version을 SQL `WHERE` 조건으로 검증하고, repository가 transition sequence 연속성과 DB 현재 상태 대비 aggregate 문맥을 재검증한다.
+- Repository는 active lease를 자동 탈취·교체하거나 retry하지 않는다. 충돌은 typed error로 반환하며 recovery 정책은 후속 application use case가 결정한다.
+- 읽기 경로는 UUID, 상태, branch identity, resume/terminal 불변조건과 transition history를 검증한 뒤 domain aggregate로 복원한다.
 
 ### Artifact 저장소
 
@@ -159,3 +165,49 @@ Windows Native와 macOS 구현은 다음과 같은 port 뒤에 분리한다.
 - `UpdateService`
 
 Windows를 우선 구현하며 WSL은 MVP 지원 범위에서 제외한다.
+
+### 안전한 앱 데이터 경로
+
+- `AppPathResolver` port는 경로 계산과 layout 검증만 담당하고, `FilesystemPermissionManager` port는 ACL 적용과 재검증만 담당한다.
+- Windows 구현은 `%LOCALAPPDATA%\ChatOMS` 아래에 `data`, `logs`, `artifacts`, `temp`를 분리하며 DB는 `data\chatoms.sqlite3`에 둔다.
+- `SecureAppPaths`는 절대 local layout 확인, reparse point 거부, directory 생성, 권한 적용과 재검증 순서로 준비하며 `Secure`가 아닌 결과에는 validated path를 반환하지 않는다.
+- Application layer는 `SecureAppPaths`가 반환한 경로만 영구 SQLite, log와 artifact 저장에 사용한다.
+- macOS는 Phase 1에서 동일 port의 compile 구조와 `Unsupported` permission 결과만 제공하며 실제 경로·권한 검증은 macOS 환경에서 후속 수행한다.
+
+## 오류 분류와 안전한 진단 경계
+
+- `chatoms-ports`는 adapter 구현을 모르는 `FailureCategory`, `FailureSeverity`, `RetryDisposition`과 `CategorizedFailure` 계약을 소유한다.
+- Infrastructure와 platform의 concrete error는 SQLite, OS, I/O 및 tracing source chain을 내부 진단용으로 유지하되 ports category로만 분류한다.
+- Application은 domain error 또는 ports category만 stable `ApplicationError` code와 사용자 안전 메시지로 변환한다. `chatoms-infrastructure`와 `chatoms-platform`에 의존하지 않는다.
+- 비신뢰 문자열은 infrastructure의 `SecretRedactor`를 거쳐 `RedactedText`가 된 후에만 영구 로그 경계로 전달한다.
+- Production logging은 `SecureAppPaths` 결과와 `PermissionStatus::Secure`로 만든 validated logs directory만 받고, ANSI 없는 structured JSON을 non-blocking daily rolling file로 기록한다.
+- 이 계약은 application의 stable `ApplicationError` mapping, Tauri IPC의 safe `IpcErrorDto`, frontend의 `FrontendError` safe field 표시까지 연결됐다. Read-only IPC와 `/system`, `/projects` UI가 구현됐으며 source, path, SID, SQL과 secret은 사용자 오류에 노출하지 않는다.
+
+## Phase 1 application service
+
+- Application은 `BootstrapService`, `SystemService`, `ProjectService`, `TaskService`로 분리하며 각 서비스는 필요한 port만 빌려 사용한다. Global singleton이나 concrete adapter service locator는 두지 않는다.
+- Bootstrap 순서는 secure storage 준비 → database bootstrap → logging bootstrap → active lease 조회다. Storage가 secure하지 않으면 뒤 단계를 호출하지 않고, database가 ready/upgraded가 아니면 logging과 lease 조회를 호출하지 않는다.
+- Logging unavailable은 raw fallback 없이 degraded 상태로 처리한다. Secure storage와 database가 준비됐다면 application bootstrap 자체는 ready이며 system health는 `Degraded`다.
+- System/project/task 결과는 Tauri 및 serde와 독립적인 application read model이다. IPC DTO는 Tauri 계층에서 별도로 정의하며 `ProjectDto`와 frontend에는 root path를 노출하지 않는다.
+- Task 생성 시 application이 UUIDv7 Task ID와 branch identity, 최초 `Created` transition을 구성하고 repository의 원자적 create boundary를 호출한다. 이후 sequence 값은 repository port가 history를 캡슐화해 제공하고 concrete repository가 transaction 안에서 재검증한다.
+- 정적 전이, pause 진입, `RecoveryRequired` 진입과 terminal 전이는 domain aggregate를 거쳐 repository transaction port로 저장한다. Resume/recovery target 확정은 실제 validation capability가 없으므로 Phase 1 현재 API에서 `Unsupported`로 보류하며 validation token을 임의 생성하지 않는다.
+- 시간은 `TimeProvider` port로 주입하며 production에서는 검증된 Unix epoch milliseconds를 반환하는 `SystemTimeProvider`를 Tauri composition root가 연결한다.
+
+## Phase 1 production adapter와 Tauri IPC
+
+- Tauri composition root가 platform storage·time·capability adapter와 infrastructure database·logging·repository adapter를 구성하고 `BootstrapService`에 주입한다. Application service는 concrete adapter를 알지 못한다.
+- Production startup은 한 번만 수행한다. Secure path, 단일 SQLite connection owner와 non-blocking logging guard는 managed runtime이 공유 소유하고, command마다 bootstrap이나 connection open을 반복하지 않는다.
+- SQLite connection은 `SharedDatabase`의 `Mutex` 안에 보관하고 repository adapter만 접근한다. Global mutable state나 unsafe `Send`/`Sync` 구현은 사용하지 않는다.
+- Managed runtime은 `Ready(AppRuntime)`와 `Unavailable`을 구분한다. Secure storage·database 실패는 unavailable이며 logging 실패는 raw fallback 없이 degraded ready다. Unavailable에서도 version과 health만 안전하게 조회할 수 있다.
+- Tauri command는 managed state 획득, application service 호출, application read model의 IPC DTO 변환, safe IPC error 변환만 수행한다. SQL, filesystem, ACL, migration 또는 process를 직접 호출하지 않는다.
+- IPC DTO는 camelCase와 안정적인 enum 문자열을 사용한다. UUID는 lowercase canonical 문자열, timestamp는 Unix epoch milliseconds이며 `ProjectDto`에는 전체 root path를 포함하지 않는다.
+- Phase 1 handler는 `get_version`, `get_health`, `get_system_status`, `get_bootstrap_status`, `list_projects`, `get_active_task`, `get_task`, `list_task_history`만 등록한다. Create·transition·Git·provider·updater·installer command는 공개하지 않는다.
+
+## Phase 1 frontend
+
+- React page는 Tauri `invoke`를 직접 호출하지 않는다. 중앙 typed IPC client가 승인된 command 문자열, camelCase payload, response guard와 safe frontend error 변환을 소유한다.
+- Frontend type은 Rust IPC DTO의 camelCase 필드와 안정적 enum 문자열을 그대로 반영한다. Transport 결과는 `unknown`으로 받고 DTO별 runtime guard를 통과한 값만 page state에 전달한다.
+- `/system`은 system·bootstrap status를 중심으로 version, health, storage, database, logging, active lease와 Phase 1 capability를 read-only로 표시한다. 핵심 호출 실패는 safe error state, 보조 호출 실패는 기존 application status를 변경하지 않는 partial notice로 처리한다.
+- `/projects`는 project name, canonical ID와 timestamp만 표시하며 root path를 frontend type과 render tree에 포함하지 않는다. 등록·수정·삭제 또는 task 생성 action은 제공하지 않는다.
+- Router와 page는 React local state만 사용한다. 별도 state manager, query cache, UI library 또는 CSS framework를 추가하지 않는다.
+- 공통 loading, empty, error와 status badge는 semantic role, 텍스트 label, visible focus와 retry disposition을 적용하며 raw invoke error, source, path, SQL, SID, stack 또는 secret을 표시하지 않는다.

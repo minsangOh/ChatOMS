@@ -22,3 +22,29 @@
 | 모델 추천 구현 시점 | 확정 | model recommendation은 application layer 정책 service로 두고 Phase 4에서 추천 근거·비용 정보, 사용자 override와 프로젝트별 고정을 구현한다. 승인 없는 고비용 모델 자동 상향은 금지한다. |
 | 보존 기간 | 확정 | 완료·중단 작업 기록은 90일, 병합된 worktree와 작업 branch는 안전 조건 충족 시까지 최소 7일 보존한다. |
 | 업데이트 배포 | Phase 7 전 결정 | 배포 채널, 릴리스 저장소, 서명키 보관 주체와 플랫폼별 rollback 방식을 Phase 7 시작 전에 확정한다. GitHub Releases와 CI 서명키는 후보일 뿐 현재 결정이 아니다. |
+| Phase 1 build gate | 확정 | Windows에서는 Codex fallback pnpm의 PATH 해석을 우회해 `node_modules\.bin\tauri.cmd`를 직접 실행하고, debug `--no-bundle -- --offline --locked -j 1`로 검증한다. |
+| Installer 검증 시점 | 확정 | MSI·NSIS와 WiX 공급망은 배포·업데이트 단계에서 검증한다. Tauri는 MSI 생성 시 사용자 cache에 WiX를 외부 다운로드할 수 있으므로 Phase 1에서는 bundle을 생성하지 않는다. Installer icon은 최종 제품 icon 확정 후 검증한다. |
+| 정적 전이와 contextual 전이 | 확정 | 정적 상태 행렬은 문맥 없는 전이만 다룬다. 정상 업무 상태의 pause, `Paused`에서 저장된 target으로의 재개, `RecoveryRequired`의 target 설정·pause·재개는 검증 token과 Task aggregate API로 수행한다. `Paused`는 항상 resume target을 보유하며 transition sequence는 1부터 시작하고 연속성 검증은 repository가 담당한다. |
+| 불명 외부 효과 복구 | 확정 | `UnknownExternalEffect`는 resume target을 보유하거나 `Paused`로 직접 전이하지 않는다. `RecoveryRequired`로 이동해 복구 분석과 target 검증을 마친 뒤에만 재개하며, `RecoveryRequired → Paused`는 검증된 resume target이 있을 때만 target을 유지하며 허용한다. |
+| SQLite connection과 migration | 확정 | Production file DB는 connection마다 `foreign_keys=ON`, WAL, `synchronous=FULL`, 5초 busy timeout을 적용·재검증한다. Migration은 embedded forward-only SQL, 원문 SHA-256 checksum과 독립 transaction을 사용하며 commit 전 `foreign_key_check`를 수행한다. Lifecycle 자동 trigger와 checksum 자동 갱신은 금지하고 sequence 연속성은 repository가 검증한다. |
+| Repository transaction 경계 | 확정 | Repository가 Task lifecycle transaction을 소유한다. 생성은 Task·최초 `Created` transition·lease를 함께 commit하고, 종료는 Task 갱신·transition·lease 삭제를 함께 commit한다. expected version과 transition sequence를 검증하며 active lease 자동 탈취·교체와 retry를 금지한다. Persistence row는 domain aggregate와 transition으로 검증해 복원한다. |
+| Windows 앱 데이터 경로 | 확정 | `%LOCALAPPDATA%\ChatOMS` 아래에 `data`, `logs`, `artifacts`, `temp`를 분리하고 DB는 `data\chatoms.sqlite3`를 사용한다. Identifier는 `io.github.minsangoh.chatoms`로 유지한다. |
+| Windows 앱 데이터 ACL | 확정 | current user와 `NT AUTHORITY\SYSTEM`만 Full Control을 허용하는 protected DACL을 적용·재검증한다. Broad writable principal, reparse point 또는 비-Secure 결과에서는 영구 저장을 차단하며 관리자 권한을 요구하지 않는다. |
+| macOS path·permission 검증 | 연기 | Phase 1은 port와 compile 가능한 stub 구조만 제공한다. 실제 Application Support 경로와 권한 적용·빌드 검증은 macOS 환경에서 별도로 수행한다. |
+| Cross-layer failure category | 확정 | Platform-neutral `FailureCategory`, severity와 retry 계약은 `chatoms-ports`가 소유한다. Application은 이 계약만 stable error code로 변환하며 infrastructure/platform concrete error를 소유하거나 참조하지 않는다. |
+| Source chain과 사용자 오류 분리 | 확정 | SQLite·I/O·OS·tracing source chain은 concrete adapter error에 유지한다. Application error는 category, severity, retry와 고정된 사용자 안전 메시지만 보유한다. |
+| RedactedText 저장 경계 | 확정 | 비신뢰 텍스트는 bounded·deterministic redaction 및 잔여 민감정보 검증을 통과한 `RedactedText`로만 영구 진단 경계를 통과한다. 실패 시 raw fallback 없이 fail-closed marker를 사용한다. |
+| 로컬 진단 로그 | 확정 | 권한 검증된 logs directory에 ANSI 없는 structured JSON을 non-blocking daily rolling file로 기록한다. Remote telemetry는 사용하지 않으며 application bootstrap 연결은 후속 단계에서 수행한다. |
+| Application dependency inversion | 확정 | Application service는 domain과 ports만 사용하며 infrastructure/platform concrete adapter, filesystem, SQLite, process 또는 Tauri에 의존하지 않는다. |
+| Bootstrap fail-fast 순서 | 확정 | Secure storage → database → logging → active lease 순서로 호출한다. Storage 또는 database가 준비되지 않으면 후속 port를 호출하지 않으며 logging failure는 raw fallback 없이 degraded health로 처리한다. |
+| Application 시간 정책 | 확정 | Use case timestamp는 `TimeProvider` port에서 받는다. Application은 `SystemTime`이나 environment를 직접 읽지 않으며 production clock adapter는 후속 wiring 단계에서 제공한다. |
+| Task identity 생성 책임 | 확정 | Task 생성 use case가 domain UUIDv7 ID를 만들고 canonical task branch identity와 최초 transition을 구성한다. 사용자 입력으로 task ID나 branch identity를 받지 않는다. |
+| Contextual resume capability | 보류 | Pause와 `RecoveryRequired` 진입은 구현하지만 resume, recovery target 확정과 recovery pause는 실제 외부 상태 validation capability가 추가될 때까지 `Unsupported`다. Opaque validation token을 임의 생성하지 않는다. |
+| Application read model | 확정 | `BootstrapStatus`, `SystemStatus`, `ProjectView`, `TaskView`, active task와 transition view는 Tauri/serde 독립 모델이다. IPC DTO와 사용자 경로 표시 정책은 IPC 단계에서 별도 결정한다. |
+| Production adapter wiring | 확정 | Platform과 infrastructure의 production adapter 생성·수명 관리는 Tauri composition root 책임이다. Application은 ports만 사용하며 bootstrap은 startup에서 한 번 수행한다. |
+| Startup critical/degraded 정책 | 확정 | Secure storage 또는 database 실패는 `Unavailable` runtime으로 제한하고 system health만 안전하게 제공한다. Logging 실패는 raw fallback 없이 `Degraded` ready로 처리하며 logging guard는 runtime 수명 동안 보존한다. |
+| Phase 1 IPC surface | 확정 | System 4개, project 목록 1개, task read-only 3개 command만 등록한다. Task create·transition IPC는 Git/worktree/provider orchestration이 준비될 때까지 공개하지 않는다. |
+| IPC DTO 및 경로 정책 | 확정 | Application read model과 serde DTO를 분리하고 camelCase를 사용한다. `ProjectDto`에는 전체 root path를 포함하지 않으며 IPC error에는 source, path, SQL, SID, stack 또는 secret을 포함하지 않는다. |
+| Frontend IPC boundary | 확정 | Page는 `invoke`를 직접 호출하지 않고 중앙 typed client의 read-only API만 사용한다. Response는 `unknown`에서 DTO guard로 검증하고 오류는 승인된 code·message·severity·retry만 render한다. |
+| Frontend state 관리 | 확정 | Phase 1 `/system`과 `/projects`는 React local component state를 사용한다. 별도 state management 또는 query/cache package를 추가하지 않는다. |
+| Frontend mutation 범위 | 확정 | Project root path와 task mutation UI는 노출하지 않는다. Task 생성·전이, Git/provider, settings, updater와 installer UI는 해당 후속 Phase까지 구현하지 않는다. |
