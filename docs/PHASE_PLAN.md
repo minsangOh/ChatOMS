@@ -54,12 +54,23 @@ Phase 1 기반
 **완료 조건:**
 
 - Windows에서 앱 셸과 debug build가 실행된다.
+- Windows build gate는 로컬 Tauri wrapper를 사용한 debug `--no-bundle` build이며 installer 생성 성공은 Phase 1 완료 조건이 아니다.
+- MSI·NSIS 생성, WiX 공급망, installer 권한과 installer icon 검증은 배포·업데이트 단계로 연기한다.
 - 시스템 상태와 프로젝트 빈 화면만 제공되며 범위 밖 화면은 구현되지 않는다.
 - SQLite migration 재실행과 순서 검증이 통과한다.
 - 단일 `ActiveTaskLease`, 불변 project 연결, 단일 task branch와 최대 단일 worktree 제약 테스트가 통과한다.
 - 사용자 오류와 내부 오류가 분리되고 마스킹 테스트가 통과한다.
 - Rust format/clippy/test, TypeScript typecheck와 프런트 테스트가 통과한다.
 - 실행 경로에 Git, CLI, 네트워크와 업데이트 구현이 없다.
+
+**현재 구현 상태:**
+
+- Secure storage, database migration, structured logging과 system clock production adapter가 Tauri composition root에 연결됐다.
+- Ready/Unavailable managed state와 system/project/task 최소 read-only Tauri IPC가 구현됐다.
+- Typed frontend IPC client와 `/system`, `/projects` read-only 화면이 구현됐다. `/system`은 healthy·degraded·unavailable·partial error 상태를, `/projects`는 loading·empty·list·safe error 상태를 제공한다.
+- Frontend typecheck, 17개 component/page/router/IPC client 테스트와 Vite build, workspace fmt/test/clippy/check를 완료했다.
+- Tauri debug `--no-bundle -- --offline --locked -j 1` build와 executable metadata·PE·icon 검증을 완료했다. MSI·NSIS installer와 bundle 검증은 배포·업데이트 단계로 유지한다.
+- Phase 1 구현과 로컬 커밋 정리는 완료됐으며, branch integration은 별도 승인 후 수행한다.
 
 ## Phase 2 — 프로젝트와 Git 격리
 

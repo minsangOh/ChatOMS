@@ -26,7 +26,9 @@ ChatOMS는 공식 Claude Code CLI와 공식 Codex CLI를 로컬에서 조율하�
 
 ## 현재 개발 상태
 
-현재는 요구사항과 부트스트랩 문서만 존재하며, 승인된 구현 범위는 Phase 1이다. 아직 실행 가능한 애플리케이션, 빌드 manifest 또는 설치 명령이 없다. 설치·개발·테스트 명령은 Phase 1 구현 이후 실제 도구 구성이 확정되면 추가한다.
+Phase 1의 앱 아이콘은 프로젝트 내부에서 결정적으로 생성한 임시 자산이며, 후속 UI 디자인 단계에서 교체한다.
+
+Phase 1 수동 스캐폴드는 Windows에서 TypeScript typecheck, Vite build, Rust workspace check와 Tauri debug executable 생성을 통과했다. Phase 1 build gate는 installer를 생성하지 않는 `tauri build --debug --no-bundle -- --offline --locked -j 1`이다. Codex fallback pnpm 환경에서는 `node_modules\.bin\tauri.cmd`를 직접 실행한다.
 
 ## 문서
 
