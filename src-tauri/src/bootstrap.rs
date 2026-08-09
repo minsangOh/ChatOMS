@@ -9,7 +9,9 @@ use chatoms_infrastructure::bootstrap::{
     DatabaseBootstrapAdapter, LegacyProjectPreflightAdapter, LoggingBootstrapAdapter,
     SharedDatabase, SharedLoggingGuard,
 };
+#[cfg(any(not(test), windows))]
 use chatoms_infrastructure::git::GitCliAdapter;
+#[cfg(not(test))]
 use chatoms_platform::ManagedWorktreePaths;
 use chatoms_platform::bootstrap::{
     StaticPlatformCapabilityAdapter, StorageBootstrapAdapter, SystemTimeProvider,
@@ -17,6 +19,15 @@ use chatoms_platform::bootstrap::{
 use chatoms_ports::{
     DatabaseBootstrapPort, LoggingBootstrapPort, PlatformCapabilityPort, StorageBootstrapPort,
     TimeProvider, error::FailureCategory, repository::FoundationRepository,
+};
+#[cfg(test)]
+use chatoms_ports::{
+    error::PortFailure,
+    filesystem::{DirectoryIdentity, DirectoryIdentityGuard, FilesystemIdentityPort},
+    git::{
+        GitService, ProjectInspection, RepositorySafetyToken, RepositoryStatus,
+        WorktreeCreationOutcome, WorktreePathProvider,
+    },
 };
 
 use crate::state::{
@@ -56,7 +67,7 @@ where
                     );
                 }
             };
-            #[cfg(windows)]
+            #[cfg(all(windows, not(test)))]
             let mut worktree_paths = match ManagedWorktreePaths::windows_from_environment() {
                 Ok(paths) => paths,
                 Err(error) => {
@@ -66,17 +77,21 @@ where
                     );
                 }
             };
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", not(test)))]
             let mut worktree_paths = ManagedWorktreePaths::new(
                 chatoms_platform::path::MacOsPathResolver,
                 chatoms_platform::permissions::MacOsPermissionManager,
             );
-            #[cfg(not(any(windows, target_os = "macos")))]
+            #[cfg(all(not(any(windows, target_os = "macos")), not(test)))]
             let mut worktree_paths = UnsupportedWorktreePaths;
-            #[cfg(windows)]
+            #[cfg(test)]
+            let mut worktree_paths = TestWorktreePaths;
+            #[cfg(all(windows, not(test)))]
             let mut filesystem = chatoms_platform::filesystem::WindowsFilesystemIdentity;
-            #[cfg(not(windows))]
+            #[cfg(all(not(windows), not(test)))]
             let mut filesystem = UnsupportedFilesystemIdentity;
+            #[cfg(test)]
+            let mut filesystem = TestFilesystemIdentity;
             if let Err(error) = GitIsolationService::new(
                 &mut repository,
                 &mut git,
@@ -118,14 +133,116 @@ fn runtime_git_adapter() -> Result<GitCliAdapter, chatoms_ports::error::PortFail
 }
 
 #[cfg(test)]
-fn runtime_git_adapter() -> Result<GitCliAdapter, chatoms_ports::error::PortFailure> {
-    GitCliAdapter::new(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("target")
-            .join("test-git-control")
-            .join(chatoms_domain::GitOperationId::new().to_string()),
-    )
+fn runtime_git_adapter() -> Result<TestGitService, PortFailure> {
+    Ok(TestGitService)
+}
+
+#[cfg(test)]
+struct TestGitService;
+
+#[cfg(test)]
+impl GitService for TestGitService {
+    fn is_available(&mut self) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn inspect_project(
+        &mut self,
+        _input: &std::path::Path,
+    ) -> Result<ProjectInspection, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn repository_status(
+        &mut self,
+        _root: &std::path::Path,
+    ) -> Result<RepositoryStatus, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn validate_non_git_source(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn validate_repository_source(
+        &mut self,
+        _root: &std::path::Path,
+        _base_commit: &str,
+    ) -> Result<RepositorySafetyToken, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn initialize_repository(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn has_commit_author(&mut self, _root: &std::path::Path) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn create_initial_snapshot(&mut self, _root: &std::path::Path) -> Result<String, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn create_task_worktree(
+        &mut self,
+        _root: &std::path::Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &std::path::Path,
+        _safety: &RepositorySafetyToken,
+    ) -> Result<WorktreeCreationOutcome, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn verify_task_worktree(
+        &mut self,
+        _root: &std::path::Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &std::path::Path,
+    ) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+}
+
+#[cfg(test)]
+struct TestFilesystemIdentity;
+
+#[cfg(test)]
+impl FilesystemIdentityPort for TestFilesystemIdentity {
+    fn inspect_supported_directory(
+        &mut self,
+        _path: &std::path::Path,
+    ) -> Result<DirectoryIdentity, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn verify_local_tree(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+
+    fn acquire_guard(
+        &mut self,
+        _path: &std::path::Path,
+        _expected: &DirectoryIdentity,
+    ) -> Result<Box<dyn DirectoryIdentityGuard>, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
+}
+
+#[cfg(test)]
+struct TestWorktreePaths;
+
+#[cfg(test)]
+impl WorktreePathProvider for TestWorktreePaths {
+    fn prepare_worktree_path(
+        &mut self,
+        _project_id: chatoms_domain::ProjectId,
+        _task_id: chatoms_domain::TaskId,
+    ) -> Result<std::path::PathBuf, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Internal))
+    }
 }
 
 #[must_use]
