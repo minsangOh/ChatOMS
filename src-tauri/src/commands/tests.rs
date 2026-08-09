@@ -12,6 +12,10 @@ use chatoms_domain::{Task, TaskId, TaskStateTransition};
 use chatoms_ports::{
     PlatformCapabilities, PlatformCapabilityPort, PlatformCapabilityStatus, TimeProvider,
     error::{FailureCategory, PortFailure},
+    git::{
+        GitService, ProjectInspection, RepositorySafetyToken, RepositoryStatus,
+        WorktreeCreationOutcome,
+    },
     repository::{
         ActiveLease, FoundationRepository, ProjectSummary, RepositoryError, RepositoryErrorCode,
     },
@@ -21,8 +25,8 @@ use super::{REGISTERED_HANDLERS, projects, system, tasks};
 use crate::{
     dto::HealthStateDto,
     state::{
-        AppRuntime, CapabilityHandle, ManagedRuntime, RepositoryHandle, RuntimeResources,
-        TimeProviderHandle,
+        AppRuntime, CapabilityHandle, ManagedRuntime, RepositoryHandle, RuntimePorts,
+        RuntimeResources, TimeProviderHandle,
     },
 };
 
@@ -112,7 +116,74 @@ impl PlatformCapabilityPort for CapabilityFake {
     }
 }
 
+struct GitCapabilityFake {
+    available: Result<bool, PortFailure>,
+}
+
+impl GitService for GitCapabilityFake {
+    fn is_available(&mut self) -> Result<bool, PortFailure> {
+        self.available
+    }
+    fn inspect_project(
+        &mut self,
+        _input: &std::path::Path,
+    ) -> Result<ProjectInspection, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn repository_status(
+        &mut self,
+        _root: &std::path::Path,
+    ) -> Result<RepositoryStatus, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn validate_non_git_source(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn validate_repository_source(
+        &mut self,
+        _root: &std::path::Path,
+        _base_commit: &str,
+    ) -> Result<RepositorySafetyToken, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn initialize_repository(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn has_commit_author(&mut self, _root: &std::path::Path) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn create_initial_snapshot(&mut self, _root: &std::path::Path) -> Result<String, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn create_task_worktree(
+        &mut self,
+        _root: &std::path::Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &std::path::Path,
+        _safety: &RepositorySafetyToken,
+    ) -> Result<WorktreeCreationOutcome, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn verify_task_worktree(
+        &mut self,
+        _root: &std::path::Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &std::path::Path,
+    ) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+}
+
 fn ready_runtime(calls: Arc<CallCounts>) -> ManagedRuntime {
+    ready_runtime_with_git(calls, Ok(true))
+}
+
+fn ready_runtime_with_git(
+    calls: Arc<CallCounts>,
+    available: Result<bool, PortFailure>,
+) -> ManagedRuntime {
     ManagedRuntime::ready(AppRuntime::new(
         BootstrapStatus {
             storage_status: StorageStatus::Ready,
@@ -122,11 +193,46 @@ fn ready_runtime(calls: Arc<CallCounts>) -> ManagedRuntime {
             application_version: APPLICATION_VERSION,
             ready: true,
         },
-        RepositoryHandle::new(RepositoryFake { calls }),
-        TimeProviderHandle::new(TimeFake),
-        CapabilityHandle::new(CapabilityFake),
+        RuntimePorts {
+            repository: RepositoryHandle::new(RepositoryFake { calls }),
+            time: TimeProviderHandle::new(TimeFake),
+            capabilities: CapabilityHandle::new(CapabilityFake),
+            git: crate::state::GitServiceHandle::new(GitCapabilityFake { available }),
+            filesystem: crate::state::FilesystemIdentityHandle::new(
+                chatoms_platform::filesystem::WindowsFilesystemIdentity,
+            ),
+            worktree_paths: crate::state::WorktreePathHandle::new(
+                chatoms_platform::ManagedWorktreePaths::windows_from_environment()
+                    .expect("test worktree paths"),
+            ),
+        },
         RuntimeResources::default(),
     ))
+}
+
+#[test]
+fn system_status_exposes_only_the_verified_git_capability_result() {
+    let supported = ready_runtime_with_git(Arc::new(CallCounts::default()), Ok(true));
+    assert_eq!(
+        system::handle_get_system_status(&supported)
+            .expect("supported status")
+            .capabilities
+            .git_execution,
+        crate::dto::CapabilityStatusDto::Supported
+    );
+    for unavailable in [
+        Ok(false),
+        Err(PortFailure::new(FailureCategory::Unsupported)),
+    ] {
+        let runtime = ready_runtime_with_git(Arc::new(CallCounts::default()), unavailable);
+        assert_eq!(
+            system::handle_get_system_status(&runtime)
+                .expect("unavailable status")
+                .capabilities
+                .git_execution,
+            crate::dto::CapabilityStatusDto::Unavailable
+        );
+    }
 }
 
 fn unavailable_runtime() -> ManagedRuntime {
@@ -197,8 +303,8 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 }
 
 #[test]
-fn handler_allowlist_contains_only_approved_read_only_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 8);
+fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
+    assert_eq!(REGISTERED_HANDLERS.len(), 16);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -206,7 +312,15 @@ fn handler_allowlist_contains_only_approved_read_only_commands() {
             "get_health",
             "get_system_status",
             "get_bootstrap_status",
+            "get_legacy_migration_diagnostic",
             "list_projects",
+            "inspect_project_candidate",
+            "register_project",
+            "get_project_git_status",
+            "create_isolation_task",
+            "get_task_isolation",
+            "approve_git_initialization",
+            "create_task_worktree",
             "get_active_task",
             "get_task",
             "list_task_history",

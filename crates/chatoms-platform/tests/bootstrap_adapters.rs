@@ -12,7 +12,8 @@ use chatoms_ports::{
     PlatformCapabilityPort, PlatformCapabilityStatus, StorageBootstrapPort, StorageBootstrapState,
     TimeProvider,
     error::{CategorizedFailure, FailureCategory},
-    path::{AppPathResolver, PathError, PathErrorCode, ResolvedAppPaths, TaskId},
+    filesystem::FilesystemIdentityPort,
+    path::{AppPathResolver, PathError, PathErrorCode, ProjectId, ResolvedAppPaths, TaskId},
     permissions::{FilesystemPermissionManager, PermissionError, PermissionStatus},
 };
 use tempfile::TempDir;
@@ -21,6 +22,54 @@ use tempfile::TempDir;
 struct TempResolver {
     paths: ResolvedAppPaths,
     reject_layout: bool,
+}
+
+#[cfg(windows)]
+fn create_junction(link: &Path, target: &Path) {
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("run mklink junction fixture");
+    assert!(
+        output.status.success(),
+        "junction fixture is mandatory: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn real_junction_alias_has_same_identity_and_rebinding_is_detected() {
+    let temp = TempDir::new().expect("temp");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir(&first).expect("first target");
+    std::fs::create_dir(&second).expect("second target");
+    create_junction(&alias, &first);
+
+    let mut filesystem = chatoms_platform::filesystem::WindowsFilesystemIdentity;
+    let direct = filesystem
+        .inspect_supported_directory(&first)
+        .expect("direct identity");
+    let through_alias = filesystem
+        .inspect_supported_directory(&alias)
+        .expect("junction alias identity");
+    assert!(direct.same_object(&through_alias));
+
+    std::fs::remove_dir(&alias).expect("remove test junction only");
+    assert!(
+        first.is_dir(),
+        "junction removal must not remove its target"
+    );
+    create_junction(&alias, &second);
+    let rebound = filesystem
+        .inspect_supported_directory(&alias)
+        .expect("rebound alias identity");
+    assert!(!direct.same_object(&rebound));
+    assert!(filesystem.acquire_guard(&alias, &direct).is_err());
 }
 
 impl TempResolver {
@@ -33,6 +82,7 @@ impl TempResolver {
                 logs_dir: app_root.join("logs"),
                 artifacts_dir: app_root.join("artifacts"),
                 temp_dir: app_root.join("temp"),
+                worktrees_dir: app_root.join("worktrees"),
                 app_root,
             },
             reject_layout: false,
@@ -56,11 +106,25 @@ impl AppPathResolver for TempResolver {
     fn temp_dir(&self) -> Result<PathBuf, PathError> {
         Ok(self.paths.temp_dir.clone())
     }
+    fn worktrees_dir(&self) -> Result<PathBuf, PathError> {
+        Ok(self.paths.worktrees_dir.clone())
+    }
     fn task_artifact_dir(&self, task_id: TaskId) -> Result<PathBuf, PathError> {
         Ok(self.paths.artifacts_dir.join(task_id.to_string()))
     }
     fn task_temp_dir(&self, task_id: TaskId) -> Result<PathBuf, PathError> {
         Ok(self.paths.temp_dir.join(task_id.to_string()))
+    }
+    fn task_worktree_dir(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> Result<PathBuf, PathError> {
+        Ok(self
+            .paths
+            .worktrees_dir
+            .join(project_id.to_string())
+            .join(task_id.to_string()))
     }
     fn validate_layout(&self) -> Result<ResolvedAppPaths, PathError> {
         if self.reject_layout {

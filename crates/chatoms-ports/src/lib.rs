@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod filesystem;
+pub mod git;
 pub mod path;
 pub mod permissions;
 pub mod repository;

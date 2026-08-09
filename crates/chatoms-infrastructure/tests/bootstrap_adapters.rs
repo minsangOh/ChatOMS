@@ -21,6 +21,7 @@ fn paths(temp: &TempDir) -> ResolvedAppPaths {
         logs_dir: app_root.join("logs"),
         artifacts_dir: app_root.join("artifacts"),
         temp_dir: app_root.join("temp"),
+        worktrees_dir: app_root.join("worktrees"),
         app_root,
     }
 }
@@ -69,7 +70,7 @@ fn newer_database_is_incompatible_and_failures_are_safe() {
     connection
         .execute(
             "INSERT INTO schema_migrations (version, name, checksum_sha256, applied_at_ms)
-             VALUES (2, 'future', ?1, 1)",
+             VALUES (3, 'future', ?1, 1)",
             ["0".repeat(64)],
         )
         .expect("future migration marker");

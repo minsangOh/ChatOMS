@@ -1,18 +1,26 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use chatoms_domain::{Task, TaskId, TaskStateTransition};
+use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition};
 use chatoms_ports::{
     DatabaseBootstrapPort, DatabaseBootstrapState, LoggingBootstrapPort, LoggingBootstrapState,
     error::{CategorizedFailure, FailureCategory, PortFailure},
+    filesystem::FilesystemIdentityPort,
+    git::{GitService, RepositoryKind},
     path::ResolvedAppPaths,
     permissions::PermissionStatus,
     repository::{
-        ActiveLease, FoundationRepository, ProjectSummary, RepositoryError, RepositoryErrorCode,
+        ActiveLease, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        GitOperationReceipt, GitOperationReceiptKind, ProjectFilesystemIdentityRecord,
+        ProjectRecord, ProjectSummary, RepositoryError, RepositoryErrorCode, TaskGitIsolation,
     },
 };
 
 use crate::{
-    database::{DatabaseConnection, DatabaseError, MigrationRunner, SqliteFoundationRepository},
+    database::{
+        DatabaseConnection, DatabaseError, LegacyProject, LegacyProjectIdentity,
+        LegacyProjectPreflight, MigrationRunner, SqliteFoundationRepository,
+    },
     logging::{LogLevel, LoggingConfig, LoggingGuard, ValidatedLogDirectory, initialize_logging},
 };
 
@@ -21,6 +29,14 @@ pub type SharedResolvedAppPaths = Arc<Mutex<Option<ResolvedAppPaths>>>;
 #[derive(Clone, Default)]
 pub struct SharedDatabase {
     inner: Arc<Mutex<Option<DatabaseConnection>>>,
+    migration_diagnostic: Arc<Mutex<Option<LegacyMigrationDiagnostic>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyMigrationDiagnostic {
+    pub project_id: String,
+    pub display_path: String,
+    pub reason_code: &'static str,
 }
 
 impl SharedDatabase {
@@ -38,17 +54,39 @@ impl SharedDatabase {
             .map(|database| database.is_some())
             .unwrap_or(false)
     }
+
+    #[must_use]
+    pub fn migration_diagnostic(&self) -> Option<LegacyMigrationDiagnostic> {
+        self.migration_diagnostic
+            .lock()
+            .ok()
+            .and_then(|diagnostic| diagnostic.clone())
+    }
 }
 
 pub struct DatabaseBootstrapAdapter {
     paths: SharedResolvedAppPaths,
     database: SharedDatabase,
+    legacy_preflight: Option<Box<dyn LegacyProjectPreflight + Send>>,
 }
 
 impl DatabaseBootstrapAdapter {
     #[must_use]
     pub const fn new(paths: SharedResolvedAppPaths, database: SharedDatabase) -> Self {
-        Self { paths, database }
+        Self {
+            paths,
+            database,
+            legacy_preflight: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_legacy_preflight(
+        mut self,
+        preflight: impl LegacyProjectPreflight + Send + 'static,
+    ) -> Self {
+        self.legacy_preflight = Some(Box::new(preflight));
+        self
     }
 }
 
@@ -65,12 +103,37 @@ impl DatabaseBootstrapPort for DatabaseBootstrapAdapter {
             .map(|paths| paths.database_path.clone())
             .ok_or_else(storage_unavailable)?;
         let mut connection = DatabaseConnection::open(database_path).map_err(database_failure)?;
-        let outcome = match MigrationRunner::default().run(&mut connection) {
+        let runner = MigrationRunner::default();
+        let migration_result = if let Some(preflight) = self.legacy_preflight.as_deref_mut() {
+            runner.run_with_preflight(&mut connection, preflight)
+        } else {
+            runner.run(&mut connection)
+        };
+        let outcome = match migration_result {
             Ok(outcome) => outcome,
             Err(DatabaseError::DatabaseNewerThanApplication { .. }) => {
                 return Ok(DatabaseBootstrapState::Incompatible);
             }
-            Err(error) => return Err(database_failure(error)),
+            Err(error) => {
+                if let DatabaseError::LegacyProjectPreflightFailed {
+                    project_id,
+                    display_path,
+                    reason,
+                } = &error
+                {
+                    let mut diagnostic = self
+                        .database
+                        .migration_diagnostic
+                        .lock()
+                        .map_err(|_| internal_failure())?;
+                    *diagnostic = Some(LegacyMigrationDiagnostic {
+                        project_id: project_id.clone(),
+                        display_path: display_path.clone(),
+                        reason_code: reason,
+                    });
+                }
+                return Err(database_failure(error));
+            }
         };
         let status = if outcome.applied_count == 0 {
             DatabaseBootstrapState::Ready
@@ -80,6 +143,125 @@ impl DatabaseBootstrapPort for DatabaseBootstrapAdapter {
         let mut stored = self.database.inner.lock().map_err(|_| internal_failure())?;
         *stored = Some(connection);
         Ok(status)
+    }
+}
+
+pub struct LegacyProjectPreflightAdapter<G, F> {
+    git: G,
+    filesystem: F,
+}
+
+impl<G, F> LegacyProjectPreflightAdapter<G, F> {
+    #[must_use]
+    pub const fn new(git: G, filesystem: F) -> Self {
+        Self { git, filesystem }
+    }
+}
+
+impl<G, F> LegacyProjectPreflight for LegacyProjectPreflightAdapter<G, F>
+where
+    G: GitService,
+    F: FilesystemIdentityPort,
+{
+    fn resolve(
+        &mut self,
+        projects: &[LegacyProject],
+    ) -> Result<Vec<LegacyProjectIdentity>, DatabaseError> {
+        let mut identities = Vec::with_capacity(projects.len());
+        for project in projects {
+            // Do not let a legacy database path reach Git before it has passed the
+            // same storage trust gate used for newly registered projects.
+            let stored_root = self
+                .filesystem
+                .inspect_supported_directory(Path::new(&project.root_path))
+                .map_err(|_| {
+                    legacy_preflight_error(project, "stable root identity could not be confirmed")
+                })?;
+            self.filesystem
+                .verify_local_tree(&stored_root.canonical_path)
+                .map_err(|_| {
+                    legacy_preflight_error(project, "project contains cloud or unsupported content")
+                })?;
+            let inspection = self
+                .git
+                .inspect_project(&stored_root.canonical_path)
+                .map_err(|_| {
+                    legacy_preflight_error(
+                        project,
+                        "project root is missing, remote, or unsupported",
+                    )
+                })?;
+            let root = self
+                .filesystem
+                .inspect_supported_directory(&inspection.canonical_root)
+                .map_err(|_| {
+                    legacy_preflight_error(project, "stable root identity could not be confirmed")
+                })?;
+            self.filesystem
+                .verify_local_tree(&root.canonical_path)
+                .map_err(|_| {
+                    legacy_preflight_error(project, "project contains cloud or unsupported content")
+                })?;
+            let common = inspection
+                .git_common_dir
+                .as_deref()
+                .map(|path| self.filesystem.inspect_supported_directory(path))
+                .transpose()
+                .map_err(|_| {
+                    legacy_preflight_error(
+                        project,
+                        "Git common directory identity could not be confirmed",
+                    )
+                })?;
+            if inspection.repository_kind == RepositoryKind::Git && common.is_none() {
+                return Err(legacy_preflight_error(
+                    project,
+                    "Git common directory identity is missing",
+                ));
+            }
+            identities.push(LegacyProjectIdentity {
+                project_id: project.project_id.clone(),
+                canonical_path_key: inspection.canonical_key,
+                display_path: inspection.display_path,
+                root_volume_serial_hex: root.volume_serial_hex,
+                root_file_id_hex: root.file_id_hex,
+                repository_kind: match inspection.repository_kind {
+                    RepositoryKind::Git => "Git",
+                    RepositoryKind::NonGit => "NonGit",
+                },
+                git_common_volume_serial_hex: common
+                    .as_ref()
+                    .map(|identity| identity.volume_serial_hex.clone()),
+                git_common_file_id_hex: common.map(|identity| identity.file_id_hex),
+            });
+        }
+        Ok(identities)
+    }
+}
+
+fn legacy_preflight_error(project: &LegacyProject, reason: &'static str) -> DatabaseError {
+    DatabaseError::LegacyProjectPreflightFailed {
+        project_id: project.project_id.clone(),
+        display_path: legacy_display_hint(project),
+        reason,
+    }
+}
+
+fn legacy_display_hint(project: &LegacyProject) -> String {
+    let tail = Path::new(&project.root_path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|component| !component.is_empty())
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>();
+    if tail.is_empty() {
+        project.name.clone()
+    } else {
+        format!(
+            "…\\{}",
+            tail.into_iter().rev().collect::<Vec<_>>().join("\\")
+        )
     }
 }
 
@@ -154,6 +336,41 @@ impl SharedFoundationRepository {
 }
 
 impl FoundationRepository for SharedFoundationRepository {
+    fn create_project(&mut self, project: &ProjectRecord) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| repository.create_project(project))
+    }
+
+    fn create_project_with_identity(
+        &mut self,
+        project: &ProjectRecord,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.create_project_with_identity(project, identity)
+        })
+    }
+
+    fn get_project_identity(
+        &mut self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectFilesystemIdentityRecord>, RepositoryError> {
+        self.with_repository(|repository| repository.get_project_identity(project_id))
+    }
+
+    fn update_project_identity(
+        &mut self,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| repository.update_project_identity(identity))
+    }
+
+    fn get_project(
+        &mut self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectRecord>, RepositoryError> {
+        self.with_repository(|repository| repository.get_project(project_id))
+    }
+
     fn create_task(
         &mut self,
         task: &Task,
@@ -212,6 +429,133 @@ impl FoundationRepository for SharedFoundationRepository {
 
     fn active_lease(&mut self) -> Result<Option<ActiveLease>, RepositoryError> {
         self.with_repository(|repository| repository.active_lease())
+    }
+
+    fn create_isolation_task(
+        &mut self,
+        task: &Task,
+        initial_transition: &TaskStateTransition,
+        classified_transition: &TaskStateTransition,
+        lease_acquired_at_ms: i64,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.create_isolation_task(
+                task,
+                initial_transition,
+                classified_transition,
+                lease_acquired_at_ms,
+                isolation,
+            )
+        })
+    }
+
+    fn get_task_isolation(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
+        self.with_repository(|repository| repository.get_task_isolation(task_id))
+    }
+
+    fn begin_git_initialization(
+        &mut self,
+        expected_version: u64,
+        isolation: &TaskGitIsolation,
+        approval: &GitInitApproval,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.begin_git_initialization(expected_version, isolation, approval)
+        })
+    }
+
+    fn save_isolation_intent(
+        &mut self,
+        expected_version: u64,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_isolation_intent(expected_version, isolation)
+        })
+    }
+
+    fn append_git_operation_receipt(
+        &mut self,
+        operation_id: chatoms_domain::GitOperationId,
+        kind: GitOperationReceiptKind,
+        evidence: Option<&str>,
+        recorded_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.append_git_operation_receipt(operation_id, kind, evidence, recorded_at_ms)
+        })
+    }
+
+    fn list_git_operation_receipts(
+        &mut self,
+        operation_id: chatoms_domain::GitOperationId,
+    ) -> Result<Vec<GitOperationReceipt>, RepositoryError> {
+        self.with_repository(|repository| repository.list_git_operation_receipts(operation_id))
+    }
+
+    fn list_incomplete_git_operations(
+        &mut self,
+    ) -> Result<Vec<GitOperationAttempt>, RepositoryError> {
+        self.with_repository(|repository| repository.list_incomplete_git_operations())
+    }
+
+    fn save_isolation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_isolation_transition(expected_version, task, transition, isolation)
+        })
+    }
+
+    fn save_git_initialization_completion(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_git_initialization_completion(
+                expected_version,
+                task,
+                transition,
+                isolation,
+                identity,
+            )
+        })
+    }
+
+    fn save_worktree_completion(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_worktree_completion(expected_version, task, transition, isolation)
+        })
+    }
+
+    fn terminate_isolation_task(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.terminate_isolation_task(expected_version, task, transition, isolation)
+        })
     }
 }
 

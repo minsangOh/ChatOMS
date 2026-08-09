@@ -19,7 +19,7 @@
 |---|---|---|---|---|
 | `Created` | 유효한 프로젝트 참조와 작업 입력으로 생성되고 `ActiveTaskLease`를 획득함 | `ProjectValidated`, `AwaitingGitInitApproval`, `Cancelled`, `Failed` | Git 초기화가 필요하면 다음 단계에서 필요 | 가능 |
 | `ProjectValidated` | 경로와 프로젝트 기본 조건 검증 완료 | `WorktreeCreating`, `Cancelled`, `Failed` | 없음 | 가능 |
-| `AwaitingGitInitApproval` | 대상 폴더가 Git 저장소가 아니며 초기화 설명이 준비됨 | `GitInitialized`, `Cancelled`, `Paused` | `GitInitialized` 전이 필요 | 가능 |
+| `AwaitingGitInitApproval` | 대상 폴더가 Git 저장소가 아니며 초기화 설명이 준비됨 | `GitInitialized`, `RecoveryRequired`, `Cancelled`, `Paused` | `GitInitialized` 전이 필요 | 가능 |
 | `GitInitialized` | 승인된 Git 초기화와 초기 snapshot 완료 | `WorktreeCreating`, `Failed` | 완료된 승인 필요 | 가능 |
 | `WorktreeCreating` | 기준 commit을 고정하고 예약된 task branch를 실제 생성한 뒤 worktree 생성 중 | `WorktreeReady`, `RecoveryRequired`, `Failed`, `Cancelled` | 없음 | 조건부 |
 | `WorktreeReady` | 작업 전용 branch와 worktree 검증 완료 | `PlanningWithClaude`, `Paused`, `Cancelled` | 공급자 전송 동의 필요 | 가능 |
@@ -142,3 +142,7 @@
 최초 `Created` transition은 sequence `1`, `from_state = None`, `task_version = 0`으로 기록한다. 이후 sequence는 직전 값에서 정확히 1 증가해야 하며, 마지막 sequence 조회와 연속성·동시성 검증은 repository가 같은 transaction 안에서 수행한다.
 
 하나라도 실패하면 전체를 rollback한다. 정리는 lease 해제와 별개이며 종료 결과가 확정된 뒤 `CleanupPending`에서 수행한다. 장시간 작업 직전과 완료 직후에는 checkpoint를 기록하며, 앱 재시작 시 SQLite 현재 상태와 마지막 완료 checkpoint를 함께 검증한다.
+
+Phase 2 Git isolation은 SQLite transaction 밖에서 local Git 효과를 만든다. Application은 stable project identity를 guard한 뒤 immutable intent와 command-start evidence를 먼저 저장하고 transaction을 종료한다. 각 Git 단계 성공 receipt를 durable하게 기록하고 실제 root/common-dir, branch, base commit, HEAD와 worktree 관계를 읽기 전용으로 재검증한다. `CompletionRecorded` receipt, task transition과 isolation summary는 하나의 SQLite transaction으로 확정한다.
+
+Git command 실패, 성공 receipt 저장 실패, 결과 불명확, 경쟁 선점 또는 사후 검증 실패에서는 branch/worktree를 자동 삭제하거나 명령을 재실행하지 않는다. `RecoveryRequired`로 전이하고 기존 `ActiveTaskLease`를 유지한다. Startup reconciliation도 Git mutation·삭제·lease 해제를 수행하지 않으며 exact success receipt와 실제 상태가 모두 일치할 때만 완료 상태를 확정한다. lease/task 불일치는 corruption으로 fail-closed한다.

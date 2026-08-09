@@ -49,6 +49,7 @@ fn paths(temp: &TempDir) -> ResolvedAppPaths {
         logs_dir: app_root.join("logs"),
         artifacts_dir: app_root.join("artifacts"),
         temp_dir: app_root.join("temp"),
+        worktrees_dir: app_root.join("worktrees"),
         app_root,
     }
 }

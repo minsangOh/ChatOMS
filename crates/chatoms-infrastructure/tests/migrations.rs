@@ -1,8 +1,23 @@
 mod support;
 
+use std::{
+    cell::RefCell,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
+
+use chatoms_infrastructure::bootstrap::LegacyProjectPreflightAdapter;
 use chatoms_infrastructure::database::{
-    DatabaseConnection, DatabaseError, FOUNDATION_MIGRATION, Migration, MigrationRunner,
-    checksum_sha256, validate_registry,
+    DatabaseConnection, DatabaseError, FOUNDATION_MIGRATION, LegacyProject, LegacyProjectIdentity,
+    LegacyProjectPreflight, Migration, MigrationRunner, checksum_sha256, validate_registry,
+};
+use chatoms_ports::{
+    error::{FailureCategory, PortFailure},
+    filesystem::{DirectoryIdentity, DirectoryIdentityGuard, FilesystemIdentityPort},
+    git::{
+        GitService, ProjectInspection, RepositoryKind, RepositorySafetyToken, RepositoryStatus,
+        WorktreeCreationOutcome,
+    },
 };
 use rusqlite::{Connection, params};
 
@@ -21,9 +36,11 @@ fn run_registry(
 
 #[test]
 fn production_registry_and_checksum_policy_are_valid() {
-    assert_eq!(FOUNDATION_MIGRATION.len(), 1);
+    assert_eq!(FOUNDATION_MIGRATION.len(), 2);
     assert_eq!(FOUNDATION_MIGRATION[0].version, 1);
     assert_eq!(FOUNDATION_MIGRATION[0].name, "foundation");
+    assert_eq!(FOUNDATION_MIGRATION[1].version, 2);
+    assert_eq!(FOUNDATION_MIGRATION[1].name, "git_isolation");
     validate_registry(&FOUNDATION_MIGRATION).expect("production registry must be valid");
 
     let checksum = FOUNDATION_MIGRATION[0].checksum_sha256();
@@ -42,6 +59,454 @@ fn production_registry_and_checksum_policy_are_valid() {
         checksum_sha256(b"same bytes"),
         checksum_sha256(b"same bytes")
     );
+}
+
+#[test]
+fn phase2_schema_enforces_canonical_project_and_git_intent_invariants() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project-one");
+    let duplicate = connection.execute(
+        "INSERT INTO projects (id, name, root_path, canonical_path_key, display_path, created_at_ms, updated_at_ms)
+         VALUES ('project-two', 'Two', 'C:/OTHER', 'c:/project/project-one', 'Two', 100, 100)",
+        [],
+    );
+    assert!(duplicate.as_ref().is_err_and(is_constraint_error));
+    assert!(
+        connection
+            .execute(
+                "UPDATE projects SET root_path = 'C:/moved' WHERE id = 'project-one'",
+                []
+            )
+            .as_ref()
+            .is_err_and(is_constraint_error)
+    );
+
+    create_active_task(&mut connection, "task-one", "project-one");
+    let invalid_ready = connection.execute(
+        "INSERT INTO task_git_isolations (
+            task_id, project_id, status, expected_task_version,
+            branch_created_by_app, worktree_created_by_app, created_at_ms, updated_at_ms
+         ) VALUES ('task-one', 'project-one', 'WorktreeReady', 0, 1, 1, 100, 100)",
+        [],
+    );
+    assert!(invalid_ready.as_ref().is_err_and(is_constraint_error));
+
+    connection.execute(
+        "INSERT INTO task_git_isolations (
+            task_id, project_id, status, operation_id, expected_task_version,
+            branch_created_by_app, worktree_created_by_app, created_at_ms, updated_at_ms
+         ) VALUES ('task-one', 'project-one', 'GitInitInProgress', 'operation-one', 0, 0, 0, 100, 100)",
+        [],
+    ).expect("valid isolation intent");
+    let stale_approval = connection.execute(
+        "INSERT INTO git_init_approvals (operation_id, task_id, project_id, approved_task_version, approved_at_ms)
+         VALUES ('operation-one', 'task-one', 'project-one', 1, 100)",
+        [],
+    );
+    assert!(stale_approval.as_ref().is_err_and(is_constraint_error));
+    connection.execute(
+        "INSERT INTO git_init_approvals (operation_id, task_id, project_id, approved_task_version, approved_at_ms)
+         VALUES ('operation-one', 'task-one', 'project-one', 0, 100)",
+        [],
+    ).expect("approval bound to exact intent");
+    assert!(
+        connection
+            .execute(
+                "UPDATE git_init_approvals SET approved_task_version = 1",
+                []
+            )
+            .as_ref()
+            .is_err_and(is_constraint_error)
+    );
+}
+
+#[test]
+fn isolation_status_truth_table_is_enforced_by_sql_for_every_status() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "task", "project");
+    let valid = [
+        ("AwaitingGitInitApproval", None, None, 0, 0),
+        ("Ready", None, None, 0, 0),
+        ("Ready", Some("operation"), None, 0, 0),
+        ("GitInitInProgress", Some("operation"), None, 0, 0),
+        ("WorktreeCreating", Some("operation"), Some("base"), 0, 0),
+        ("WorktreeReady", Some("operation"), Some("base"), 1, 1),
+        ("RecoveryRequired", Some("operation"), None, 0, 0),
+        ("RecoveryRequired", Some("operation"), Some("base"), 0, 0),
+    ];
+    for (status, operation, base, branch_owned, worktree_owned) in valid {
+        let (base_branch, base_commit, worktree_path) = if base.is_some() {
+            (Some("main"), Some("a".repeat(40)), Some("C:/managed/task"))
+        } else {
+            (None, None, None)
+        };
+        connection
+            .execute(
+                "INSERT INTO task_git_isolations (
+                    task_id, project_id, status, operation_id, expected_task_version,
+                    base_branch, base_commit, worktree_path, branch_created_by_app,
+                    worktree_created_by_app, created_at_ms, updated_at_ms
+                 ) VALUES ('task', 'project', ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, 100, 100)",
+                params![
+                    status,
+                    operation,
+                    base_branch,
+                    base_commit,
+                    worktree_path,
+                    branch_owned,
+                    worktree_owned
+                ],
+            )
+            .unwrap_or_else(|error| panic!("valid status {status} rejected: {error}"));
+        connection
+            .execute("DELETE FROM task_git_isolations WHERE task_id = 'task'", [])
+            .expect("delete truth-table fixture");
+    }
+
+    for (status, operation, base, branch_owned, worktree_owned) in [
+        ("AwaitingGitInitApproval", Some("operation"), None, 0, 0),
+        ("GitInitInProgress", None, None, 0, 0),
+        ("WorktreeCreating", Some("operation"), None, 0, 0),
+        ("WorktreeReady", Some("operation"), Some("base"), 0, 1),
+        ("RecoveryRequired", None, None, 0, 0),
+        ("RecoveryRequired", Some("operation"), Some("base"), 1, 1),
+    ] {
+        let (base_branch, base_commit, worktree_path) = if base.is_some() {
+            (Some("main"), Some("a".repeat(40)), Some("C:/managed/task"))
+        } else {
+            (None, None, None)
+        };
+        let result = connection.execute(
+            "INSERT INTO task_git_isolations (
+                task_id, project_id, status, operation_id, expected_task_version,
+                base_branch, base_commit, worktree_path, branch_created_by_app,
+                worktree_created_by_app, created_at_ms, updated_at_ms
+             ) VALUES ('task', 'project', ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, 100, 100)",
+            params![
+                status,
+                operation,
+                base_branch,
+                base_commit,
+                worktree_path,
+                branch_owned,
+                worktree_owned
+            ],
+        );
+        assert!(
+            result.as_ref().is_err_and(is_constraint_error),
+            "invalid status shape accepted: {status}"
+        );
+    }
+}
+
+struct StableLegacyPreflight {
+    duplicate_identity: bool,
+}
+
+struct LegacyGitSpy {
+    calls: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl GitService for LegacyGitSpy {
+    fn is_available(&mut self) -> Result<bool, PortFailure> {
+        Ok(true)
+    }
+    fn inspect_project(&mut self, _input: &Path) -> Result<ProjectInspection, PortFailure> {
+        self.calls.borrow_mut().push("git.inspect");
+        Ok(ProjectInspection {
+            canonical_root: PathBuf::from("C:/canonical/project"),
+            canonical_key: "c:/canonical/project".to_owned(),
+            display_path: "…\\project".to_owned(),
+            suggested_name: "project".to_owned(),
+            confirmation_token: "migration".to_owned(),
+            repository_kind: RepositoryKind::Git,
+            repository_status: None,
+            git_common_dir: Some(PathBuf::from("C:/canonical/project/.git")),
+        })
+    }
+    fn repository_status(&mut self, _root: &Path) -> Result<RepositoryStatus, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn validate_non_git_source(&mut self, _root: &Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn validate_repository_source(
+        &mut self,
+        _root: &Path,
+        _base_commit: &str,
+    ) -> Result<RepositorySafetyToken, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn initialize_repository(&mut self, _root: &Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn has_commit_author(&mut self, _root: &Path) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn create_initial_snapshot(&mut self, _root: &Path) -> Result<String, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn create_task_worktree(
+        &mut self,
+        _root: &Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &Path,
+        _safety: &RepositorySafetyToken,
+    ) -> Result<WorktreeCreationOutcome, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+    fn verify_task_worktree(
+        &mut self,
+        _root: &Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &Path,
+    ) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+}
+
+struct LegacyFilesystemSpy {
+    calls: Rc<RefCell<Vec<&'static str>>>,
+    fail_stored_root: bool,
+    fail_detected_root: bool,
+}
+
+impl FilesystemIdentityPort for LegacyFilesystemSpy {
+    fn inspect_supported_directory(
+        &mut self,
+        path: &Path,
+    ) -> Result<DirectoryIdentity, PortFailure> {
+        self.calls.borrow_mut().push("filesystem.inspect");
+        if self.fail_stored_root
+            || (self.fail_detected_root && path == Path::new("C:/canonical/project"))
+        {
+            return Err(PortFailure::new(FailureCategory::Unsupported));
+        }
+        Ok(DirectoryIdentity {
+            canonical_path: path.to_path_buf(),
+            volume_serial_hex: "volume".to_owned(),
+            file_id_hex: path.to_string_lossy().into_owned(),
+        })
+    }
+    fn verify_local_tree(&mut self, _root: &Path) -> Result<(), PortFailure> {
+        self.calls.borrow_mut().push("filesystem.verify");
+        Ok(())
+    }
+    fn acquire_guard(
+        &mut self,
+        _path: &Path,
+        _expected: &DirectoryIdentity,
+    ) -> Result<Box<dyn DirectoryIdentityGuard>, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+}
+
+#[test]
+fn legacy_preflight_checks_stored_fixed_drive_policy_before_any_git_probe() {
+    for root_path in ["C:/legacy/project", "Z:/mapped-network/project"] {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut preflight = LegacyProjectPreflightAdapter::new(
+            LegacyGitSpy {
+                calls: Rc::clone(&calls),
+            },
+            LegacyFilesystemSpy {
+                calls: Rc::clone(&calls),
+                fail_stored_root: true,
+                fail_detected_root: false,
+            },
+        );
+        let projects = [LegacyProject {
+            project_id: "legacy".to_owned(),
+            name: "Legacy".to_owned(),
+            root_path: root_path.to_owned(),
+        }];
+        assert!(preflight.resolve(&projects).is_err());
+        assert_eq!(*calls.borrow(), ["filesystem.inspect"]);
+    }
+}
+
+#[test]
+fn legacy_preflight_rechecks_detected_root_and_common_directory_after_git_probe() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut preflight = LegacyProjectPreflightAdapter::new(
+        LegacyGitSpy {
+            calls: Rc::clone(&calls),
+        },
+        LegacyFilesystemSpy {
+            calls: Rc::clone(&calls),
+            fail_stored_root: false,
+            fail_detected_root: true,
+        },
+    );
+    let projects = [LegacyProject {
+        project_id: "legacy".to_owned(),
+        name: "Legacy".to_owned(),
+        root_path: "C:/legacy/project".to_owned(),
+    }];
+    assert!(preflight.resolve(&projects).is_err());
+    assert_eq!(
+        *calls.borrow(),
+        [
+            "filesystem.inspect",
+            "filesystem.verify",
+            "git.inspect",
+            "filesystem.inspect"
+        ]
+    );
+}
+
+#[test]
+fn detected_root_preflight_failure_rolls_back_populated_0001_upgrade() {
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    MigrationRunner::new(&FOUNDATION_MIGRATION[..1])
+        .run(&mut connection)
+        .expect("apply 0001 only");
+    drop(connection);
+    database
+        .open_raw()
+        .execute(
+            "INSERT INTO projects (id, name, root_path, created_at_ms, updated_at_ms)
+             VALUES ('legacy-root-failure', 'Legacy', 'C:/legacy/project', 100, 100)",
+            [],
+        )
+        .expect("legacy project");
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut preflight = LegacyProjectPreflightAdapter::new(
+        LegacyGitSpy {
+            calls: Rc::clone(&calls),
+        },
+        LegacyFilesystemSpy {
+            calls: Rc::clone(&calls),
+            fail_stored_root: false,
+            fail_detected_root: true,
+        },
+    );
+    let mut connection = DatabaseConnection::open(database.path()).expect("reopen database");
+    assert!(matches!(
+        MigrationRunner::default().run_with_preflight(&mut connection, &mut preflight),
+        Err(DatabaseError::LegacyProjectPreflightFailed { .. })
+    ));
+    assert!(calls.borrow().contains(&"git.inspect"));
+    assert!(!table_exists(
+        &database.open_raw(),
+        "project_filesystem_identities"
+    ));
+}
+
+impl LegacyProjectPreflight for StableLegacyPreflight {
+    fn resolve(
+        &mut self,
+        projects: &[LegacyProject],
+    ) -> Result<Vec<LegacyProjectIdentity>, DatabaseError> {
+        Ok(projects
+            .iter()
+            .enumerate()
+            .map(|(index, project)| LegacyProjectIdentity {
+                project_id: project.project_id.clone(),
+                canonical_path_key: format!("c:/legacy/{}", project.project_id),
+                display_path: format!("legacy\\{}", project.name),
+                root_volume_serial_hex: "0000000000000001".to_owned(),
+                root_file_id_hex: if self.duplicate_identity {
+                    "00000000000000000000000000000001".to_owned()
+                } else {
+                    format!("{index:032x}")
+                },
+                repository_kind: "NonGit",
+                git_common_volume_serial_hex: None,
+                git_common_file_id_hex: None,
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn populated_0001_upgrade_requires_preflight_and_persists_confirmed_identity_atomically() {
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    MigrationRunner::new(&FOUNDATION_MIGRATION[..1])
+        .run(&mut connection)
+        .expect("apply 0001 only");
+    drop(connection);
+    database
+        .open_raw()
+        .execute(
+            "INSERT INTO projects (id, name, root_path, created_at_ms, updated_at_ms)
+             VALUES ('legacy-one', 'Legacy One', 'C:/legacy/one', 100, 100)",
+            [],
+        )
+        .expect("legacy project");
+    let mut connection = DatabaseConnection::open(database.path()).expect("reopen database");
+
+    let error = MigrationRunner::default()
+        .run(&mut connection)
+        .expect_err("unconfirmed legacy identity must stop migration");
+    assert!(matches!(
+        error,
+        DatabaseError::LegacyProjectPreflightFailed { .. }
+    ));
+    assert!(!table_exists(
+        &database.open_raw(),
+        "project_filesystem_identities"
+    ));
+
+    let mut preflight = StableLegacyPreflight {
+        duplicate_identity: false,
+    };
+    MigrationRunner::default()
+        .run_with_preflight(&mut connection, &mut preflight)
+        .expect("confirmed legacy upgrade");
+    let row: (String, String, i64) = database
+        .open_raw()
+        .query_row(
+            "SELECT projects.display_path, identity.root_file_id_hex, identity.confirmed
+             FROM projects
+             JOIN project_filesystem_identities AS identity ON identity.project_id = projects.id
+             WHERE projects.id = 'legacy-one'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("migrated identity");
+    assert_eq!(row.0, "legacy\\Legacy One");
+    assert_eq!(row.1, "00000000000000000000000000000000");
+    assert_eq!(row.2, 1);
+}
+
+#[test]
+fn duplicate_legacy_stable_identity_aborts_0002_without_partial_schema() {
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    MigrationRunner::new(&FOUNDATION_MIGRATION[..1])
+        .run(&mut connection)
+        .expect("apply 0001 only");
+    drop(connection);
+    let raw = database.open_raw();
+    for (id, name) in [("legacy-one", "One"), ("legacy-two", "Two")] {
+        raw.execute(
+            "INSERT INTO projects (id, name, root_path, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, 100, 100)",
+            params![id, name, format!("C:/legacy/{id}")],
+        )
+        .expect("legacy project");
+    }
+    drop(raw);
+    let mut connection = DatabaseConnection::open(database.path()).expect("reopen database");
+    let mut preflight = StableLegacyPreflight {
+        duplicate_identity: true,
+    };
+    assert!(matches!(
+        MigrationRunner::default().run_with_preflight(&mut connection, &mut preflight),
+        Err(DatabaseError::LegacyProjectPreflightFailed { .. })
+    ));
+    assert!(!table_exists(
+        &database.open_raw(),
+        "project_filesystem_identities"
+    ));
 }
 
 #[test]
@@ -80,21 +545,21 @@ fn registry_rejects_zero_non_one_start_duplicates_order_and_empty_fields() {
 fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     let database = TestDatabase::empty();
     let first = run_registry(&database, &FOUNDATION_MIGRATION).expect("first migration run");
-    assert_eq!(first.schema_version, 1);
-    assert_eq!(first.applied_count, 1);
+    assert_eq!(first.schema_version, 2);
+    assert_eq!(first.applied_count, 2);
 
     let connection = database.open_raw();
     let metadata: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations",
+             FROM schema_migrations WHERE version = 2",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("read migration metadata");
-    assert_eq!(metadata.0, 1);
-    assert_eq!(metadata.1, "foundation");
-    assert_eq!(metadata.2, FOUNDATION_MIGRATION[0].checksum_sha256());
+    assert_eq!(metadata.0, 2);
+    assert_eq!(metadata.1, "git_isolation");
+    assert_eq!(metadata.2, FOUNDATION_MIGRATION[1].checksum_sha256());
     assert!(metadata.3 >= 0);
     let schema_before: String = connection
         .query_row(
@@ -107,7 +572,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     drop(connection);
 
     let second = run_registry(&database, &FOUNDATION_MIGRATION).expect("second migration run");
-    assert_eq!(second.schema_version, 1);
+    assert_eq!(second.schema_version, 2);
     assert_eq!(second.applied_count, 0);
     let connection = database.open_raw();
     let schema_after: String = connection
@@ -119,11 +584,11 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
         )
         .expect("read schema snapshot after reopen");
     assert_eq!(schema_after, schema_before);
-    assert_eq!(count_rows(&connection, "schema_migrations"), 1);
+    assert_eq!(count_rows(&connection, "schema_migrations"), 2);
     let metadata_after: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations",
+             FROM schema_migrations WHERE version = 2",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )

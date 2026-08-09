@@ -231,10 +231,12 @@ impl CategorizedFailure for PortFailure {
 impl CategorizedFailure for RepositoryError {
     fn category(&self) -> FailureCategory {
         match self.code() {
-            RepositoryErrorCode::ProjectNotFound | RepositoryErrorCode::TaskNotFound => {
-                FailureCategory::NotFound
-            }
-            RepositoryErrorCode::DuplicateTask => FailureCategory::AlreadyExists,
+            RepositoryErrorCode::ProjectNotFound
+            | RepositoryErrorCode::TaskNotFound
+            | RepositoryErrorCode::IsolationNotFound => FailureCategory::NotFound,
+            RepositoryErrorCode::DuplicateProject
+            | RepositoryErrorCode::DuplicateTask
+            | RepositoryErrorCode::DuplicateIsolation => FailureCategory::AlreadyExists,
             RepositoryErrorCode::VersionConflict => FailureCategory::VersionConflict,
             RepositoryErrorCode::TransitionSequenceConflict => FailureCategory::SequenceConflict,
             RepositoryErrorCode::ActiveLeaseConflict => FailureCategory::ActiveLeaseConflict,

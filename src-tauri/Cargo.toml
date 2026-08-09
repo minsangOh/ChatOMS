@@ -7,7 +7,7 @@ publish.workspace = true
 build = "build.rs"
 
 [lib]
-name = "chatoms_app"
+name = "chatoms_app_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
@@ -21,3 +21,4 @@ chatoms-platform.workspace = true
 chatoms-ports.workspace = true
 serde.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog = "=2.7.2"

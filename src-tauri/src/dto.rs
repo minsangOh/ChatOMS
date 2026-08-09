@@ -1,10 +1,15 @@
 use chatoms_application::{
     bootstrap::{ActiveTaskStatus, BootstrapStatus, DatabaseStatus, LoggingStatus, StorageStatus},
-    projects::ProjectView,
+    git_isolation::{IsolationBlocker, TaskIsolationView},
+    projects::{ProjectCandidateView, ProjectStatusView, ProjectView},
     system::{CapabilityStatus, HealthStatus, SystemStatus},
     tasks::{ActiveTaskView, TaskTransitionView, TaskView},
 };
 use chatoms_domain::TaskState;
+use chatoms_ports::{
+    git::{RepositoryKind, RepositoryStatus},
+    repository::GitIsolationStatus,
+};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -82,6 +87,26 @@ pub struct BootstrapStatusDto {
     pub ready: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyMigrationDiagnosticDto {
+    pub project_id: String,
+    pub display_path: String,
+    pub reason_code: String,
+}
+
+impl From<chatoms_infrastructure::bootstrap::LegacyMigrationDiagnostic>
+    for LegacyMigrationDiagnosticDto
+{
+    fn from(value: chatoms_infrastructure::bootstrap::LegacyMigrationDiagnostic) -> Self {
+        Self {
+            project_id: value.project_id,
+            display_path: value.display_path,
+            reason_code: value.reason_code.to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CapabilityStatusDto {
@@ -119,8 +144,80 @@ pub struct SystemStatusDto {
 pub struct ProjectDto {
     pub id: String,
     pub name: String,
+    pub display_path: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepositoryKindDto {
+    Git,
+    NonGit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryStatusDto {
+    pub clean: bool,
+    pub detached_head: bool,
+    pub current_branch: Option<String>,
+    pub head_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCandidateDto {
+    pub suggested_name: String,
+    pub display_path: String,
+    pub confirmation_token: String,
+    pub repository_kind: RepositoryKindDto,
+    pub repository_status: Option<RepositoryStatusDto>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStatusDto {
+    pub project_id: String,
+    pub repository_kind: RepositoryKindDto,
+    pub repository_status: Option<RepositoryStatusDto>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitIsolationStatusDto {
+    AwaitingGitInitApproval,
+    Ready,
+    GitInitInProgress,
+    WorktreeCreating,
+    WorktreeReady,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IsolationBlockerDto {
+    DirtyRepository,
+    DetachedHead,
+    UnbornRepository,
+    MissingCurrentBranch,
+    GitAuthorMissing,
+    GitOperationFailed,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskIsolationDto {
+    pub task_id: String,
+    pub project_id: String,
+    pub task_state: TaskStateDto,
+    pub task_version: u64,
+    pub isolation_status: GitIsolationStatusDto,
+    pub branch_identity: String,
+    pub base_branch: Option<String>,
+    pub base_commit: Option<String>,
+    pub blocker: Option<IsolationBlockerDto>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -224,8 +321,88 @@ impl From<ProjectView> for ProjectDto {
         Self {
             id: value.id().to_string(),
             name: value.name().to_owned(),
+            display_path: value.display_path().to_owned(),
             created_at_ms: value.created_at_ms(),
             updated_at_ms: value.updated_at_ms(),
+        }
+    }
+}
+
+impl From<RepositoryKind> for RepositoryKindDto {
+    fn from(value: RepositoryKind) -> Self {
+        match value {
+            RepositoryKind::Git => Self::Git,
+            RepositoryKind::NonGit => Self::NonGit,
+        }
+    }
+}
+impl From<RepositoryStatus> for RepositoryStatusDto {
+    fn from(value: RepositoryStatus) -> Self {
+        Self {
+            clean: value.clean,
+            detached_head: value.detached_head,
+            current_branch: value.current_branch,
+            head_commit: value.head_commit,
+        }
+    }
+}
+impl From<ProjectCandidateView> for ProjectCandidateDto {
+    fn from(value: ProjectCandidateView) -> Self {
+        Self {
+            suggested_name: value.suggested_name,
+            display_path: value.display_path,
+            confirmation_token: value.confirmation_token,
+            repository_kind: value.repository_kind.into(),
+            repository_status: value.repository_status.map(Into::into),
+        }
+    }
+}
+impl From<ProjectStatusView> for ProjectStatusDto {
+    fn from(value: ProjectStatusView) -> Self {
+        Self {
+            project_id: value.project_id.to_string(),
+            repository_kind: value.repository_kind.into(),
+            repository_status: value.repository_status.map(Into::into),
+        }
+    }
+}
+impl From<GitIsolationStatus> for GitIsolationStatusDto {
+    fn from(value: GitIsolationStatus) -> Self {
+        match value {
+            GitIsolationStatus::AwaitingGitInitApproval => Self::AwaitingGitInitApproval,
+            GitIsolationStatus::Ready => Self::Ready,
+            GitIsolationStatus::GitInitInProgress => Self::GitInitInProgress,
+            GitIsolationStatus::WorktreeCreating => Self::WorktreeCreating,
+            GitIsolationStatus::WorktreeReady => Self::WorktreeReady,
+            GitIsolationStatus::RecoveryRequired => Self::RecoveryRequired,
+        }
+    }
+}
+impl From<IsolationBlocker> for IsolationBlockerDto {
+    fn from(value: IsolationBlocker) -> Self {
+        match value {
+            IsolationBlocker::DirtyRepository => Self::DirtyRepository,
+            IsolationBlocker::DetachedHead => Self::DetachedHead,
+            IsolationBlocker::UnbornRepository => Self::UnbornRepository,
+            IsolationBlocker::MissingCurrentBranch => Self::MissingCurrentBranch,
+            IsolationBlocker::GitAuthorMissing => Self::GitAuthorMissing,
+            IsolationBlocker::GitOperationFailed => Self::GitOperationFailed,
+            IsolationBlocker::RecoveryRequired => Self::RecoveryRequired,
+        }
+    }
+}
+impl From<TaskIsolationView> for TaskIsolationDto {
+    fn from(value: TaskIsolationView) -> Self {
+        Self {
+            task_id: value.task_id.to_string(),
+            project_id: value.project_id.to_string(),
+            task_state: value.task_state.into(),
+            task_version: value.task_version,
+            isolation_status: value.isolation_status.into(),
+            branch_identity: value.branch_identity,
+            base_branch: value.base_branch,
+            base_commit: value.base_commit,
+            blocker: value.blocker.map(Into::into),
         }
     }
 }
@@ -396,6 +573,7 @@ mod tests {
         let project = ProjectDto {
             id: TaskId::new().to_string(),
             name: "Foundation".to_owned(),
+            display_path: "%USERPROFILE%\\Foundation".to_owned(),
             created_at_ms: 1,
             updated_at_ms: 2,
         };

@@ -60,11 +60,26 @@ pub fn open_configured(path: &Path) -> Connection {
 pub fn insert_project(connection: &Connection, id: &str) {
     connection
         .execute(
-            "INSERT INTO projects (id, name, root_path, created_at_ms, updated_at_ms)
-             VALUES (?1, 'Project', 'C:/project', 100, 100)",
-            [id],
+            "INSERT INTO projects (
+                id, name, root_path, canonical_path_key, display_path,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, 'Project', ?2, ?3, '%USERPROFILE%/project', 100, 100)",
+            rusqlite::params![id, format!("C:/project/{id}"), format!("c:/project/{id}")],
         )
         .expect("insert project");
+    let stable_id = id.bytes().fold(0_u128, |value, byte| {
+        value.wrapping_mul(257).wrapping_add(u128::from(byte))
+    });
+    connection
+        .execute(
+            "INSERT INTO project_filesystem_identities (
+                project_id, identity_scheme, root_volume_serial_hex, root_file_id_hex,
+                repository_kind, confirmed, revision, verified_at_ms
+             ) VALUES (?1, 'WindowsFileIdV1', '0000000000000001', ?2,
+                'NonGit', 1, 1, 100)",
+            rusqlite::params![id, format!("{stable_id:032x}")],
+        )
+        .expect("insert project identity");
 }
 
 pub fn insert_task(

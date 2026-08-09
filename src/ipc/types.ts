@@ -63,6 +63,12 @@ export interface BootstrapStatusDto {
   ready: boolean;
 }
 
+export interface LegacyMigrationDiagnosticDto {
+  projectId: string;
+  displayPath: string;
+  reasonCode: string;
+}
+
 export interface CapabilityDto {
   secureStorage: CapabilityStatus;
   nativePermissions: CapabilityStatus;
@@ -86,9 +92,18 @@ export interface SystemStatusDto {
 export interface ProjectDto {
   id: string;
   name: string;
+  displayPath: string;
   createdAtMs: number;
   updatedAtMs: number;
 }
+
+export type RepositoryKind = "git" | "nonGit";
+export interface RepositoryStatusDto { clean: boolean; detachedHead: boolean; currentBranch: string | null; headCommit: string | null; }
+export interface ProjectCandidateDto { suggestedName: string; displayPath: string; confirmationToken: string; repositoryKind: RepositoryKind; repositoryStatus: RepositoryStatusDto | null; }
+export interface ProjectStatusDto { projectId: string; repositoryKind: RepositoryKind; repositoryStatus: RepositoryStatusDto | null; }
+export type GitIsolationStatus = "awaitingGitInitApproval" | "ready" | "gitInitInProgress" | "worktreeCreating" | "worktreeReady" | "recoveryRequired";
+export type IsolationBlocker = "dirtyRepository" | "detachedHead" | "unbornRepository" | "missingCurrentBranch" | "gitAuthorMissing" | "gitOperationFailed" | "recoveryRequired";
+export interface TaskIsolationDto { taskId: string; projectId: string; taskState: TaskState; taskVersion: number; isolationStatus: GitIsolationStatus; branchIdentity: string; baseBranch: string | null; baseCommit: string | null; blocker: IsolationBlocker | null; }
 
 export interface ActiveTaskDto {
   taskId: string;

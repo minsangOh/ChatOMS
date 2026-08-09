@@ -27,7 +27,7 @@ export const systemStatus: SystemStatusDto = {
   capabilities: {
     secureStorage: "supported",
     nativePermissions: "supported",
-    gitExecution: "unavailable",
+    gitExecution: "supported",
     claudeExecution: "unavailable",
     codexExecution: "unavailable",
     updater: "unavailable",
@@ -41,7 +41,15 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
     getHealth: async () => health,
     getSystemStatus: async () => systemStatus,
     getBootstrapStatus: async () => bootstrapStatus,
+    getLegacyMigrationDiagnostic: async () => null,
     listProjects: async (): Promise<ProjectDto[]> => [],
+    inspectProjectCandidate: async () => { throw new Error("not implemented in frontend tests"); },
+    registerProject: async () => { throw new Error("not implemented in frontend tests"); },
+    getProjectGitStatus: async () => { throw new Error("not implemented in frontend tests"); },
+    createIsolationTask: async () => { throw new Error("not implemented in frontend tests"); },
+    getTaskIsolation: async () => { throw new Error("not implemented in frontend tests"); },
+    approveGitInitialization: async () => { throw new Error("not implemented in frontend tests"); },
+    createTaskWorktree: async () => { throw new Error("not implemented in frontend tests"); },
     getActiveTask: async () => null,
     getTask: async () => {
       throw new Error("not implemented in frontend tests");

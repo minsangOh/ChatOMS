@@ -4,7 +4,12 @@ import { LoadingState } from "../components/LoadingState";
 import { StatusBadge } from "../components/StatusBadge";
 import { toFrontendError, type FrontendError } from "../ipc/errors";
 import type { IpcClient } from "../ipc/client";
-import type { BootstrapStatusDto, HealthState, SystemStatusDto } from "../ipc/types";
+import type {
+  BootstrapStatusDto,
+  HealthState,
+  LegacyMigrationDiagnosticDto,
+  SystemStatusDto,
+} from "../ipc/types";
 
 interface SystemPageProps {
   client: IpcClient;
@@ -13,6 +18,7 @@ interface SystemPageProps {
 type SystemPageState =
   | { kind: "loading" }
   | { kind: "error"; error: FrontendError }
+  | { kind: "legacy"; diagnostic: LegacyMigrationDiagnosticDto }
   | {
       kind: "ready";
       system: SystemStatusDto;
@@ -35,11 +41,19 @@ export function SystemPage({ client }: SystemPageProps) {
       client.getHealth(),
       client.getSystemStatus(),
       client.getBootstrapStatus(),
-    ]).then(([versionResult, healthResult, systemResult, bootstrapResult]) => {
+      client.getLegacyMigrationDiagnostic(),
+    ]).then(([versionResult, healthResult, systemResult, bootstrapResult, diagnosticResult]) => {
       if (!active) {
         return;
       }
       if (systemResult.status === "rejected") {
+        if (
+          diagnosticResult.status === "fulfilled" &&
+          diagnosticResult.value !== null
+        ) {
+          setState({ kind: "legacy", diagnostic: diagnosticResult.value });
+          return;
+        }
         setState({ kind: "error", error: toFrontendError(systemResult.reason) });
         return;
       }
@@ -81,6 +95,38 @@ export function SystemPage({ client }: SystemPageProps) {
   if (state.kind === "error") {
     return <ErrorState error={state.error} onRetry={retry} />;
   }
+  if (state.kind === "legacy") {
+    return (
+      <div className="page-stack">
+        <header className="page-header">
+          <div>
+            <p className="eyebrow">Migration review required</p>
+            <h1>Legacy project verification stopped</h1>
+            <p>ChatOMS did not merge, remove, or guess this project identity.</p>
+          </div>
+          <StatusBadge status="unavailable" />
+        </header>
+        <section className="content-card" aria-labelledby="legacy-project-heading">
+          <h2 id="legacy-project-heading">Project requiring review</h2>
+          <dl className="detail-list">
+            <div>
+              <dt>Project ID</dt>
+              <dd className="identifier">{state.diagnostic.projectId}</dd>
+            </div>
+            <div>
+              <dt>Display path</dt>
+              <dd>{state.diagnostic.displayPath}</dd>
+            </div>
+            <div>
+              <dt>Reason</dt>
+              <dd>{state.diagnostic.reasonCode}</dd>
+            </div>
+          </dl>
+          <p className="muted">Resolve the path or duplicate identity outside ChatOMS, then restart the app.</p>
+        </section>
+      </div>
+    );
+  }
 
   const { system, bootstrap } = state;
   return (
@@ -89,7 +135,7 @@ export function SystemPage({ client }: SystemPageProps) {
         <div>
           <p className="eyebrow">Foundation status</p>
           <h1>System</h1>
-          <p>Local readiness and Phase 1 platform capabilities.</p>
+          <p>Local readiness and Phase 2 platform capabilities.</p>
         </div>
         <StatusBadge status={state.health} />
       </header>

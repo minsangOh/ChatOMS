@@ -78,9 +78,11 @@ Phase 1 기반
 
 **목적:** 프로젝트 등록부터 작업별 branch/worktree 격리까지 안전하게 제공한다.
 
-**포함 범위:** 프로젝트 등록·검증, Git 감지, 비-Git 폴더 초기화 승인, 기준 commit 기록, 작업 branch/worktree 생성, 상태 조회와 정리.
+**포함 범위:** 프로젝트 등록·stable filesystem identity 검증, Git 감지, 비-Git 폴더 초기화 승인, 기준 commit 기록, 작업 branch/worktree 생성, 프로젝트·task isolation 상태 조회, controlled Git process, durable operation evidence, 부분 성공 검증·startup reconciliation과 `RecoveryRequired` 기록.
 
-**제외 범위:** Claude/Codex 실행, 하네스 자동화, 기본 브랜치 병합, 원격 Git 쓰기.
+**안전 제한:** Windows production Git runtime은 HKLM installer candidate를 final path, fixed-drive identity, pinned Authenticode signer와 distribution boundary로 검증하며 PATH 탐색·runtime fallback을 하지 않는다. 프로젝트 Git probe와 app/control/worktree directory 생성 전에는 storage trust gate를 통과해야 한다. Network·Cloud Files·linked worktree·separate git-dir·bare repository·active external filter·local `filter.*`/`include.*`/`includeIf.*`와 Git LFS를 거부한다. 정적 repository filter execution은 차단하지만 동일 사용자 권한의 동시 악성 변조는 accepted residual risk다. Git 실패나 불명확한 결과에서 branch/worktree를 자동 삭제·재실행하지 않으며 `RecoveryRequired` task의 lease를 유지한다.
+
+**제외 범위:** Claude/Codex 실행, 하네스 자동화, 기본 브랜치 병합, 원격 Git 쓰기, 보존 기간 기반 정리, 완료 작업의 일반 branch/worktree 수명주기 정리와 사용자 기존 Git 리소스 삭제.
 
 **완료 조건:** 승인 없는 `git init`이 차단되고, clean 저장소에서 작업별 worktree가 생성되며 원본 작업 디렉터리에 AI 변경이 발생하지 않는다.
 

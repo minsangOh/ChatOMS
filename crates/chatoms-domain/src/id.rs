@@ -78,3 +78,4 @@ uuid_v7_id!(AppProfileId);
 uuid_v7_id!(ProviderBindingId);
 uuid_v7_id!(TaskId);
 uuid_v7_id!(TaskStateTransitionId);
+uuid_v7_id!(GitOperationId);

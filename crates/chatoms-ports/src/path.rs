@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, path::PathBuf};
 
-pub use chatoms_domain::TaskId;
+pub use chatoms_domain::{ProjectId, TaskId};
 
 pub const APP_IDENTIFIER: &str = "io.github.minsangoh.chatoms";
 pub const APP_DIRECTORY_NAME: &str = "ChatOMS";
@@ -70,6 +70,7 @@ pub struct ResolvedAppPaths {
     pub logs_dir: PathBuf,
     pub artifacts_dir: PathBuf,
     pub temp_dir: PathBuf,
+    pub worktrees_dir: PathBuf,
 }
 
 pub trait AppPathResolver {
@@ -78,8 +79,14 @@ pub trait AppPathResolver {
     fn logs_dir(&self) -> Result<PathBuf, PathError>;
     fn artifacts_dir(&self) -> Result<PathBuf, PathError>;
     fn temp_dir(&self) -> Result<PathBuf, PathError>;
+    fn worktrees_dir(&self) -> Result<PathBuf, PathError>;
     fn task_artifact_dir(&self, task_id: TaskId) -> Result<PathBuf, PathError>;
     fn task_temp_dir(&self, task_id: TaskId) -> Result<PathBuf, PathError>;
+    fn task_worktree_dir(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> Result<PathBuf, PathError>;
     fn validate_layout(&self) -> Result<ResolvedAppPaths, PathError>;
     fn validate_managed_path(&self, path: &std::path::Path) -> Result<(), PathError>;
 }

@@ -3,10 +3,14 @@ use std::sync::{Arc, Mutex};
 use chatoms_application::{
     bootstrap::{BootstrapService, BootstrapStatus, DatabaseStatus, StorageStatus},
     error::ApplicationError,
+    git_isolation::GitIsolationService,
 };
 use chatoms_infrastructure::bootstrap::{
-    DatabaseBootstrapAdapter, LoggingBootstrapAdapter, SharedDatabase, SharedLoggingGuard,
+    DatabaseBootstrapAdapter, LegacyProjectPreflightAdapter, LoggingBootstrapAdapter,
+    SharedDatabase, SharedLoggingGuard,
 };
+use chatoms_infrastructure::git::GitCliAdapter;
+use chatoms_platform::ManagedWorktreePaths;
 use chatoms_platform::bootstrap::{
     StaticPlatformCapabilityAdapter, StorageBootstrapAdapter, SystemTimeProvider,
 };
@@ -16,8 +20,8 @@ use chatoms_ports::{
 };
 
 use crate::state::{
-    AppRuntime, CapabilityHandle, ManagedRuntime, RepositoryHandle, RuntimeResources,
-    TimeProviderHandle,
+    AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle, ManagedRuntime,
+    RepositoryHandle, RuntimePorts, RuntimeResources, TimeProviderHandle, WorktreePathHandle,
 };
 
 pub fn compose_runtime<S, D, L, R, T, C>(
@@ -25,7 +29,7 @@ pub fn compose_runtime<S, D, L, R, T, C>(
     mut database: D,
     mut logging: L,
     mut repository: R,
-    time: T,
+    mut time: T,
     capabilities: C,
     resources: RuntimeResources,
 ) -> ManagedRuntime
@@ -42,19 +46,86 @@ where
             .bootstrap();
 
     match bootstrap_result {
-        Ok(status) if status.ready => ManagedRuntime::ready(AppRuntime::new(
-            status,
-            RepositoryHandle::new(repository),
-            TimeProviderHandle::new(time),
-            CapabilityHandle::new(capabilities),
-            resources,
-        )),
+        Ok(status) if status.ready => {
+            let mut git = match runtime_git_adapter() {
+                Ok(git) => git,
+                Err(error) => {
+                    return ManagedRuntime::unavailable(
+                        ApplicationError::from_categorized(&error),
+                        Some(status),
+                    );
+                }
+            };
+            #[cfg(windows)]
+            let mut worktree_paths = match ManagedWorktreePaths::windows_from_environment() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    return ManagedRuntime::unavailable(
+                        ApplicationError::from_categorized(&error),
+                        Some(status),
+                    );
+                }
+            };
+            #[cfg(target_os = "macos")]
+            let mut worktree_paths = ManagedWorktreePaths::new(
+                chatoms_platform::path::MacOsPathResolver,
+                chatoms_platform::permissions::MacOsPermissionManager,
+            );
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let mut worktree_paths = UnsupportedWorktreePaths;
+            #[cfg(windows)]
+            let mut filesystem = chatoms_platform::filesystem::WindowsFilesystemIdentity;
+            #[cfg(not(windows))]
+            let mut filesystem = UnsupportedFilesystemIdentity;
+            if let Err(error) = GitIsolationService::new(
+                &mut repository,
+                &mut git,
+                &mut filesystem,
+                &mut worktree_paths,
+                &mut time,
+            )
+            .reconcile_startup()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
+            ManagedRuntime::ready(AppRuntime::new(
+                status,
+                RuntimePorts {
+                    repository: RepositoryHandle::new(repository),
+                    time: TimeProviderHandle::new(time),
+                    capabilities: CapabilityHandle::new(capabilities),
+                    git: GitServiceHandle::new(git),
+                    filesystem: FilesystemIdentityHandle::new(filesystem),
+                    worktree_paths: WorktreePathHandle::new(worktree_paths),
+                },
+                resources,
+            ))
+        }
         Ok(status) => {
             let error = unavailable_status_error(&status);
             ManagedRuntime::unavailable(error, Some(status))
         }
-        Err(error) => ManagedRuntime::unavailable(error, None),
+        Err(error) => {
+            let diagnostic = resources.database.migration_diagnostic();
+            ManagedRuntime::unavailable_with_migration_diagnostic(error, None, diagnostic)
+        }
     }
+}
+
+#[cfg(not(test))]
+fn runtime_git_adapter() -> Result<GitCliAdapter, chatoms_ports::error::PortFailure> {
+    GitCliAdapter::from_environment()
+}
+
+#[cfg(test)]
+fn runtime_git_adapter() -> Result<GitCliAdapter, chatoms_ports::error::PortFailure> {
+    GitCliAdapter::new(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("target")
+            .join("test-git-control")
+            .join(chatoms_domain::GitOperationId::new().to_string()),
+    )
 }
 
 #[must_use]
@@ -86,6 +157,25 @@ pub fn production_runtime() -> ManagedRuntime {
     #[cfg(not(any(windows, target_os = "macos")))]
     let storage = UnsupportedStorageBootstrap;
 
+    #[cfg(windows)]
+    let database_adapter = {
+        let preflight_git = match GitCliAdapter::from_environment() {
+            Ok(git) => git,
+            Err(error) => {
+                return ManagedRuntime::unavailable(
+                    ApplicationError::from_categorized(&error),
+                    None,
+                );
+            }
+        };
+        DatabaseBootstrapAdapter::new(paths.clone(), database.clone()).with_legacy_preflight(
+            LegacyProjectPreflightAdapter::new(
+                preflight_git,
+                chatoms_platform::filesystem::WindowsFilesystemIdentity,
+            ),
+        )
+    };
+    #[cfg(not(windows))]
     let database_adapter = DatabaseBootstrapAdapter::new(paths.clone(), database.clone());
     let logging_adapter = LoggingBootstrapAdapter::new(paths, logging_guard);
     let repository = database.repository();
@@ -125,6 +215,22 @@ fn unavailable_status_error(status: &BootstrapStatus) -> ApplicationError {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 struct UnsupportedStorageBootstrap;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+struct UnsupportedWorktreePaths;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+impl chatoms_ports::git::WorktreePathProvider for UnsupportedWorktreePaths {
+    fn prepare_worktree_path(
+        &mut self,
+        _project_id: chatoms_domain::ProjectId,
+        _task_id: chatoms_domain::TaskId,
+    ) -> Result<std::path::PathBuf, chatoms_ports::error::PortFailure> {
+        Err(chatoms_ports::error::PortFailure::new(
+            FailureCategory::Unsupported,
+        ))
+    }
+}
 
 #[cfg(not(any(windows, target_os = "macos")))]
 impl StorageBootstrapPort for UnsupportedStorageBootstrap {
@@ -252,6 +358,11 @@ mod tests {
             self.calls.push("lease");
             Ok(None)
         }
+        fn list_incomplete_git_operations(
+            &mut self,
+        ) -> Result<Vec<chatoms_ports::repository::GitOperationAttempt>, RepositoryError> {
+            Ok(Vec::new())
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -316,7 +427,7 @@ mod tests {
             *runtime.lock().expect("state"),
             RuntimeState::Ready(_)
         ));
-        assert_eq!(calls, ["storage", "database", "logging", "lease"]);
+        assert_eq!(calls, ["storage", "database", "logging", "lease", "lease"]);
 
         let (runtime, calls) = compose(
             StorageBootstrapState::Ready,
@@ -331,7 +442,7 @@ mod tests {
             ready.bootstrap_status.logging_status,
             chatoms_application::bootstrap::LoggingStatus::Unavailable
         );
-        assert_eq!(calls, ["storage", "database", "logging", "lease"]);
+        assert_eq!(calls, ["storage", "database", "logging", "lease", "lease"]);
     }
 
     #[test]

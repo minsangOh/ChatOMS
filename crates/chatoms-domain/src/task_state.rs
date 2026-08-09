@@ -134,7 +134,10 @@ impl TaskState {
                 Created,
                 ProjectValidated | AwaitingGitInitApproval | Cancelled | Failed
             ) | (ProjectValidated, WorktreeCreating | Cancelled | Failed)
-                | (AwaitingGitInitApproval, GitInitialized | Cancelled)
+                | (
+                    AwaitingGitInitApproval,
+                    GitInitialized | RecoveryRequired | Cancelled
+                )
                 | (GitInitialized, WorktreeCreating | Failed)
                 | (
                     WorktreeCreating,

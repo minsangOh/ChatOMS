@@ -5,6 +5,32 @@ use sha2::{Digest, Sha256};
 
 use super::{DatabaseConnection, DatabaseError, schema};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyProject {
+    pub project_id: String,
+    pub name: String,
+    pub root_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyProjectIdentity {
+    pub project_id: String,
+    pub canonical_path_key: String,
+    pub display_path: String,
+    pub root_volume_serial_hex: String,
+    pub root_file_id_hex: String,
+    pub repository_kind: &'static str,
+    pub git_common_volume_serial_hex: Option<String>,
+    pub git_common_file_id_hex: Option<String>,
+}
+
+pub trait LegacyProjectPreflight {
+    fn resolve(
+        &mut self,
+        projects: &[LegacyProject],
+    ) -> Result<Vec<LegacyProjectIdentity>, DatabaseError>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Migration {
     pub version: u32,
@@ -24,8 +50,10 @@ impl Migration {
     }
 }
 
-pub static FOUNDATION_MIGRATION: [Migration; 1] =
-    [Migration::new(1, "foundation", schema::FOUNDATION_SQL)];
+pub static FOUNDATION_MIGRATION: [Migration; 2] = [
+    Migration::new(1, "foundation", schema::FOUNDATION_SQL),
+    Migration::new(2, "git_isolation", schema::GIT_ISOLATION_SQL),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MigrationOutcome {
@@ -53,6 +81,22 @@ impl MigrationRunner {
         &self,
         database: &mut DatabaseConnection,
     ) -> Result<MigrationOutcome, DatabaseError> {
+        self.run_internal(database, None)
+    }
+
+    pub fn run_with_preflight(
+        &self,
+        database: &mut DatabaseConnection,
+        preflight: &mut dyn LegacyProjectPreflight,
+    ) -> Result<MigrationOutcome, DatabaseError> {
+        self.run_internal(database, Some(preflight))
+    }
+
+    fn run_internal(
+        &self,
+        database: &mut DatabaseConnection,
+        mut preflight: Option<&mut dyn LegacyProjectPreflight>,
+    ) -> Result<MigrationOutcome, DatabaseError> {
         bootstrap_metadata(database.raw_mut())?;
         validate_registry(self.registry)?;
 
@@ -74,7 +118,23 @@ impl MigrationRunner {
 
         let mut applied_count = 0;
         for migration in self.registry.iter().skip(applied.len()).copied() {
-            apply_one(database.raw_mut(), migration)?;
+            let identities = if migration.version == 2 && migration.name == "git_isolation" {
+                let projects = load_legacy_projects(database.raw_mut())?;
+                if projects.is_empty() {
+                    Vec::new()
+                } else if let Some(resolver) = preflight.as_deref_mut() {
+                    validate_preflight_result(&projects, resolver.resolve(&projects)?)?
+                } else {
+                    return Err(DatabaseError::LegacyProjectPreflightFailed {
+                        project_id: projects[0].project_id.clone(),
+                        display_path: safe_legacy_display(&projects[0]),
+                        reason: "stable filesystem identity was not confirmed",
+                    });
+                }
+            } else {
+                Vec::new()
+            };
+            apply_one(database.raw_mut(), migration, &identities)?;
             applied_count += 1;
         }
 
@@ -85,6 +145,88 @@ impl MigrationRunner {
                 .map_or(0, |migration| migration.version),
             applied_count,
         })
+    }
+}
+
+fn load_legacy_projects(connection: &Connection) -> Result<Vec<LegacyProject>, DatabaseError> {
+    let mut statement = connection
+        .prepare("SELECT id, name, root_path FROM projects ORDER BY id")
+        .map_err(|source| DatabaseError::MigrationExecutionFailed {
+            version: 2,
+            name: "git_isolation",
+            source,
+        })?;
+    statement
+        .query_map([], |row| {
+            Ok(LegacyProject {
+                project_id: row.get(0)?,
+                name: row.get(1)?,
+                root_path: row.get(2)?,
+            })
+        })
+        .map_err(|source| DatabaseError::MigrationExecutionFailed {
+            version: 2,
+            name: "git_isolation",
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| DatabaseError::MigrationExecutionFailed {
+            version: 2,
+            name: "git_isolation",
+            source,
+        })
+}
+
+fn validate_preflight_result(
+    projects: &[LegacyProject],
+    identities: Vec<LegacyProjectIdentity>,
+) -> Result<Vec<LegacyProjectIdentity>, DatabaseError> {
+    if identities.len() != projects.len() {
+        return Err(DatabaseError::LegacyProjectPreflightFailed {
+            project_id: projects[0].project_id.clone(),
+            display_path: safe_legacy_display(&projects[0]),
+            reason: "preflight did not resolve every legacy project",
+        });
+    }
+    let mut project_ids = std::collections::HashSet::new();
+    let mut canonical_keys = std::collections::HashSet::new();
+    let mut stable_ids = std::collections::HashSet::new();
+    for identity in &identities {
+        if !project_ids.insert(identity.project_id.clone())
+            || !projects
+                .iter()
+                .any(|project| project.project_id == identity.project_id)
+            || !canonical_keys.insert(identity.canonical_path_key.clone())
+            || !stable_ids.insert((
+                identity.root_volume_serial_hex.clone(),
+                identity.root_file_id_hex.clone(),
+            ))
+        {
+            return Err(DatabaseError::LegacyProjectPreflightFailed {
+                project_id: identity.project_id.clone(),
+                display_path: identity.display_path.clone(),
+                reason: "duplicate or ambiguous stable project identity",
+            });
+        }
+    }
+    Ok(identities)
+}
+
+fn safe_legacy_display(project: &LegacyProject) -> String {
+    let tail = std::path::Path::new(&project.root_path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|component| !component.is_empty())
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>();
+    if tail.is_empty() {
+        project.name.clone()
+    } else {
+        format!(
+            "…\\{}",
+            tail.into_iter().rev().collect::<Vec<_>>().join("\\")
+        )
     }
 }
 
@@ -339,13 +481,70 @@ fn validate_applied_prefix(
     Ok(())
 }
 
-fn apply_one(connection: &mut Connection, migration: Migration) -> Result<(), DatabaseError> {
+fn apply_one(
+    connection: &mut Connection,
+    migration: Migration,
+    identities: &[LegacyProjectIdentity],
+) -> Result<(), DatabaseError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|source| migration_error(migration, source))?;
     transaction
         .execute_batch(migration.sql)
         .map_err(|source| migration_error(migration, source))?;
+    if migration.version == 2 && migration.name == "git_isolation" {
+        for identity in identities {
+            transaction
+                .execute(
+                    "UPDATE projects
+                     SET canonical_path_key = ?2, display_path = ?3
+                     WHERE id = ?1 AND canonical_path_key IS NULL AND display_path IS NULL",
+                    params![
+                        identity.project_id,
+                        identity.canonical_path_key,
+                        identity.display_path
+                    ],
+                )
+                .map_err(|source| migration_error(migration, source))?;
+            transaction
+                .execute(
+                    "INSERT INTO project_filesystem_identities (
+                        project_id, identity_scheme, root_volume_serial_hex, root_file_id_hex,
+                        repository_kind, git_common_volume_serial_hex, git_common_file_id_hex,
+                        confirmed, revision, verified_at_ms
+                     ) VALUES (?1, 'WindowsFileIdV1', ?2, ?3, ?4, ?5, ?6, 1, 1, ?7)",
+                    params![
+                        identity.project_id,
+                        identity.root_volume_serial_hex,
+                        identity.root_file_id_hex,
+                        identity.repository_kind,
+                        identity.git_common_volume_serial_hex,
+                        identity.git_common_file_id_hex,
+                        current_unix_epoch_ms()?
+                    ],
+                )
+                .map_err(|source| migration_error(migration, source))?;
+        }
+        let unresolved: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM projects
+                 WHERE canonical_path_key IS NULL OR display_path IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM project_filesystem_identities AS identity
+                        WHERE identity.project_id = projects.id AND identity.confirmed = 1
+                    )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| migration_error(migration, source))?;
+        if unresolved != 0 {
+            return Err(DatabaseError::LegacyProjectPreflightFailed {
+                project_id: "multiple".to_owned(),
+                display_path: "legacy projects".to_owned(),
+                reason: "migration left an unconfirmed project identity",
+            });
+        }
+    }
 
     let violations = foreign_key_violation_count(&transaction, migration)?;
     if violations != 0 {

@@ -1,5 +1,18 @@
 # ChatOMS
 
+## Development toolchain
+
+Use Node `22.18.0` (also recorded in `.node-version`) and the repository-pinned pnpm through Corepack. Do not rely on an ambient pnpm binary:
+
+```powershell
+corepack pnpm --version # 11.9.0
+corepack pnpm typecheck
+corepack pnpm test:run
+corepack pnpm build
+```
+
+Tauri uses the same `corepack pnpm build` entrypoint before its Rust build.
+
 ChatOMS는 공식 Claude Code CLI와 공식 Codex CLI를 로컬에서 조율하는 크로스플랫폼 데스크톱 AI 코딩 하네스다. Claude가 요구사항 분석·설계·최종 리뷰를 담당하고, Codex가 격리된 Git worktree에서 구현·테스트·수정을 수행하는 순차 워크플로를 GUI로 제공하는 것이 목표다.
 
 ## MVP 범위
@@ -26,9 +39,9 @@ ChatOMS는 공식 Claude Code CLI와 공식 Codex CLI를 로컬에서 조율하�
 
 ## 현재 개발 상태
 
-Phase 1의 앱 아이콘은 프로젝트 내부에서 결정적으로 생성한 임시 자산이며, 후속 UI 디자인 단계에서 교체한다.
+Phase 2는 존재하는 로컬 디렉터리의 등록, enclosing Git root 감지, Git 상태 조회, 승인된 비-Git 프로젝트 초기 snapshot과 작업별 branch/worktree 격리를 구현한다. 프로젝트 선택은 native folder picker와 직접 경로 입력을 모두 지원한다. dirty·detached HEAD·unborn 저장소는 등록과 조회는 가능하지만 worktree 생성은 차단한다.
 
-Phase 1 수동 스캐폴드는 Windows에서 TypeScript typecheck, Vite build, Rust workspace check와 Tauri debug executable 생성을 통과했다. Phase 1 build gate는 installer를 생성하지 않는 `tauri build --debug --no-bundle -- --offline --locked -j 1`이다. Codex fallback pnpm 환경에서는 `node_modules\.bin\tauri.cmd`를 직접 실행한다.
+Git worktree는 `%LOCALAPPDATA%\ChatOMS\worktrees\<project-id>\<task-id>`에만 생성한다. 원격 Git 쓰기, 기본 브랜치 병합, Claude/Codex 실행과 보존 정책 기반 정리는 아직 구현하지 않았다. Windows build gate는 installer를 생성하지 않는 `node_modules\.bin\tauri.cmd build --debug --no-bundle -- --offline --locked -j 1`이다.
 
 ## 문서
 

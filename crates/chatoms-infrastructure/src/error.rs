@@ -89,7 +89,8 @@ impl CategorizedFailure for DatabaseError {
             | Self::MigrationChecksumMismatch { .. }
             | Self::MigrationOutOfOrder { .. }
             | Self::DatabaseNewerThanApplication { .. }
-            | Self::MigrationExecutionFailed { .. } => FailureCategory::MigrationFailure,
+            | Self::MigrationExecutionFailed { .. }
+            | Self::LegacyProjectPreflightFailed { .. } => FailureCategory::MigrationFailure,
             Self::ForeignKeyViolation { .. } | Self::InvariantViolation { .. } => {
                 FailureCategory::InvariantViolation
             }

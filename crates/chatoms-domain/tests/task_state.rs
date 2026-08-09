@@ -68,6 +68,7 @@ fn complete_static_transition_matrix_matches_independent_expectation() {
         (ProjectValidated, Cancelled),
         (ProjectValidated, Failed),
         (AwaitingGitInitApproval, GitInitialized),
+        (AwaitingGitInitApproval, RecoveryRequired),
         (AwaitingGitInitApproval, Cancelled),
         (GitInitialized, WorktreeCreating),
         (GitInitialized, Failed),

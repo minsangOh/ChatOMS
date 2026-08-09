@@ -8,7 +8,9 @@ mod task_state;
 mod transition;
 
 pub use error::DomainError;
-pub use id::{AppProfileId, ProjectId, ProviderBindingId, TaskId, TaskStateTransitionId};
+pub use id::{
+    AppProfileId, GitOperationId, ProjectId, ProviderBindingId, TaskId, TaskStateTransitionId,
+};
 pub use task::{RecoveryValidation, ResumeValidation, Task, TaskBranchIdentity, TaskSnapshot};
 pub use task_state::TaskState;
 pub use transition::{

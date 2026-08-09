@@ -3,6 +3,7 @@
 
 pub mod bootstrap;
 pub mod error;
+pub mod git_isolation;
 pub mod projects;
 pub mod system;
 pub mod tasks;

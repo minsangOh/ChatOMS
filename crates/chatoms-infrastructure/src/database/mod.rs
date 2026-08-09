@@ -7,8 +7,8 @@ use thiserror::Error;
 
 pub use connection::{DatabaseConnection, PragmaSettings};
 pub use migration::{
-    FOUNDATION_MIGRATION, Migration, MigrationOutcome, MigrationRunner, checksum_sha256,
-    validate_registry,
+    FOUNDATION_MIGRATION, LegacyProject, LegacyProjectIdentity, LegacyProjectPreflight, Migration,
+    MigrationOutcome, MigrationRunner, checksum_sha256, validate_registry,
 };
 pub use repository::SqliteFoundationRepository;
 
@@ -53,6 +53,14 @@ pub enum DatabaseError {
         name: &'static str,
         #[source]
         source: rusqlite::Error,
+    },
+    #[error(
+        "legacy project migration preflight failed for project {project_id} ({display_path}): {reason}"
+    )]
+    LegacyProjectPreflightFailed {
+        project_id: String,
+        display_path: String,
+        reason: &'static str,
     },
     #[error("migration {version} produced {violations} foreign-key violations")]
     ForeignKeyViolation { version: u32, violations: usize },

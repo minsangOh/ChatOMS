@@ -6,7 +6,7 @@ use std::{
 };
 
 use chatoms_ports::path::{
-    APP_DIRECTORY_NAME, AppPathResolver, DATABASE_FILE_NAME, PathError, PathErrorCode,
+    APP_DIRECTORY_NAME, AppPathResolver, DATABASE_FILE_NAME, PathError, PathErrorCode, ProjectId,
     ResolvedAppPaths, TaskId,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
@@ -42,6 +42,7 @@ impl WindowsPathResolver {
             logs_dir: app_root.join("logs"),
             artifacts_dir: app_root.join("artifacts"),
             temp_dir: app_root.join("temp"),
+            worktrees_dir: app_root.join("worktrees"),
             app_root,
         };
         validate_syntactic_layout(&paths)?;
@@ -56,6 +57,7 @@ impl WindowsPathResolver {
             &self.paths.logs_dir,
             &self.paths.artifacts_dir,
             &self.paths.temp_dir,
+            &self.paths.worktrees_dir,
         ] {
             validate_optional_directory(directory)?;
         }
@@ -84,12 +86,33 @@ impl AppPathResolver for WindowsPathResolver {
         Ok(self.paths.temp_dir.clone())
     }
 
+    fn worktrees_dir(&self) -> Result<PathBuf, PathError> {
+        Ok(self.paths.worktrees_dir.clone())
+    }
+
     fn task_artifact_dir(&self, task_id: TaskId) -> Result<PathBuf, PathError> {
         task_child(&self.paths.artifacts_dir, task_id)
     }
 
     fn task_temp_dir(&self, task_id: TaskId) -> Result<PathBuf, PathError> {
         task_child(&self.paths.temp_dir, task_id)
+    }
+
+    fn task_worktree_dir(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> Result<PathBuf, PathError> {
+        let project = identifier_component(project_id.to_string())?;
+        let task = identifier_component(task_id.to_string())?;
+        let project_dir = self.paths.worktrees_dir.join(project);
+        let child = project_dir.join(task);
+        if child.parent() != Some(project_dir.as_path())
+            || !child.starts_with(&self.paths.worktrees_dir)
+        {
+            return Err(PathError::new(PathErrorCode::InvalidTaskPath));
+        }
+        Ok(child)
     }
 
     fn validate_layout(&self) -> Result<ResolvedAppPaths, PathError> {
@@ -151,6 +174,7 @@ fn validate_syntactic_layout(paths: &ResolvedAppPaths) -> Result<(), PathError> 
         || !paths.logs_dir.starts_with(&paths.app_root)
         || !paths.artifacts_dir.starts_with(&paths.app_root)
         || !paths.temp_dir.starts_with(&paths.app_root)
+        || !paths.worktrees_dir.starts_with(&paths.app_root)
         || !paths.database_path.starts_with(&paths.data_dir)
         || paths.database_path.file_name() != Some(OsStr::new(DATABASE_FILE_NAME))
     {
@@ -160,7 +184,15 @@ fn validate_syntactic_layout(paths: &ResolvedAppPaths) -> Result<(), PathError> 
 }
 
 fn task_child(parent: &Path, task_id: TaskId) -> Result<PathBuf, PathError> {
-    let component = task_id.to_string();
+    let component = identifier_component(task_id.to_string())?;
+    let child = parent.join(component);
+    if child.parent() != Some(parent) || !child.starts_with(parent) {
+        return Err(PathError::new(PathErrorCode::InvalidTaskPath));
+    }
+    Ok(child)
+}
+
+fn identifier_component(component: String) -> Result<String, PathError> {
     if component.len() != 36
         || component
             .bytes()
@@ -168,11 +200,7 @@ fn task_child(parent: &Path, task_id: TaskId) -> Result<PathBuf, PathError> {
     {
         return Err(PathError::new(PathErrorCode::InvalidTaskPath));
     }
-    let child = parent.join(component);
-    if child.parent() != Some(parent) || !child.starts_with(parent) {
-        return Err(PathError::new(PathErrorCode::InvalidTaskPath));
-    }
-    Ok(child)
+    Ok(component)
 }
 
 fn validate_existing_directory(path: &Path) -> Result<(), PathError> {

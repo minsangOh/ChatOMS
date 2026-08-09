@@ -13,15 +13,24 @@ use chatoms_ports::{
     TimeProvider,
     error::{FailureCategory, PortFailure},
     repository::{
-        ActiveLease, FoundationRepository, ProjectSummary, RepositoryError, RepositoryErrorCode,
+        ActiveLease, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
+        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, RepositoryError,
+        RepositoryErrorCode, TaskGitIsolation,
     },
 };
 
 #[derive(Default)]
 pub struct FakeRepository {
     pub projects: Vec<ProjectSummary>,
+    pub project_records: HashMap<ProjectId, ProjectRecord>,
+    pub project_identities: HashMap<ProjectId, ProjectFilesystemIdentityRecord>,
     pub tasks: HashMap<TaskId, Task>,
     pub transitions: HashMap<TaskId, Vec<TaskStateTransition>>,
+    pub isolations: HashMap<TaskId, TaskGitIsolation>,
+    pub approvals: Vec<GitInitApproval>,
+    pub attempts: HashMap<chatoms_domain::GitOperationId, GitOperationAttempt>,
+    pub receipts: Vec<GitOperationReceipt>,
     pub active_lease: Option<ActiveLease>,
     pub calls: Vec<&'static str>,
     pub shared_calls: Option<Arc<Mutex<Vec<&'static str>>>>,
@@ -61,6 +70,66 @@ impl FakeRepository {
 }
 
 impl FoundationRepository for FakeRepository {
+    fn create_project(&mut self, project: &ProjectRecord) -> Result<(), RepositoryError> {
+        self.record("create_project");
+        self.maybe_fail("create_project")?;
+        if self
+            .project_records
+            .values()
+            .any(|existing| existing.canonical_path_key == project.canonical_path_key)
+        {
+            return Err(RepositoryError::new(RepositoryErrorCode::DuplicateProject));
+        }
+        self.projects.push(ProjectSummary::from(project.clone()));
+        self.project_records.insert(project.id, project.clone());
+        Ok(())
+    }
+
+    fn create_project_with_identity(
+        &mut self,
+        project: &ProjectRecord,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        self.create_project(project)?;
+        if self.project_identities.values().any(|existing| {
+            existing.root_volume_serial_hex == identity.root_volume_serial_hex
+                && existing.root_file_id_hex == identity.root_file_id_hex
+        }) {
+            return Err(RepositoryError::new(RepositoryErrorCode::DuplicateProject));
+        }
+        self.project_identities.insert(project.id, identity.clone());
+        Ok(())
+    }
+
+    fn get_project_identity(
+        &mut self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectFilesystemIdentityRecord>, RepositoryError> {
+        self.record("get_project_identity");
+        self.maybe_fail("get_project_identity")?;
+        Ok(self.project_identities.get(&project_id).cloned())
+    }
+
+    fn update_project_identity(
+        &mut self,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        self.record("update_project_identity");
+        self.maybe_fail("update_project_identity")?;
+        self.project_identities
+            .insert(identity.project_id, identity.clone());
+        Ok(())
+    }
+
+    fn get_project(
+        &mut self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectRecord>, RepositoryError> {
+        self.record("get_project");
+        self.maybe_fail("get_project")?;
+        Ok(self.project_records.get(&project_id).cloned())
+    }
+
     fn create_task(
         &mut self,
         task: &Task,
@@ -156,6 +225,255 @@ impl FoundationRepository for FakeRepository {
         self.maybe_fail("active_lease")?;
         Ok(self.active_lease)
     }
+
+    fn create_isolation_task(
+        &mut self,
+        task: &Task,
+        initial_transition: &TaskStateTransition,
+        classified_transition: &TaskStateTransition,
+        lease_acquired_at_ms: i64,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.record("create_isolation_task");
+        self.maybe_fail("create_isolation_task")?;
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions.insert(
+            task.id(),
+            vec![initial_transition.clone(), classified_transition.clone()],
+        );
+        self.isolations.insert(task.id(), isolation.clone());
+        self.active_lease = Some(ActiveLease {
+            task_id: task.id(),
+            acquired_at_ms: lease_acquired_at_ms,
+        });
+        Ok(())
+    }
+
+    fn get_task_isolation(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
+        self.record("get_task_isolation");
+        self.maybe_fail("get_task_isolation")?;
+        Ok(self.isolations.get(&task_id).cloned())
+    }
+
+    fn begin_git_initialization(
+        &mut self,
+        _expected_version: u64,
+        isolation: &TaskGitIsolation,
+        approval: &GitInitApproval,
+    ) -> Result<(), RepositoryError> {
+        self.record("begin_git_initialization");
+        self.maybe_fail("begin_git_initialization")?;
+        self.isolations.insert(isolation.task_id, isolation.clone());
+        self.approvals.push(*approval);
+        self.attempts.insert(
+            approval.operation_id,
+            GitOperationAttempt {
+                operation_id: approval.operation_id,
+                task_id: approval.task_id,
+                project_id: approval.project_id,
+                operation_kind: GitOperationKind::GitInitialize,
+                status: GitOperationAttemptStatus::IntentRecorded,
+                approved_task_version: approval.approved_task_version,
+                project_identity_revision: self
+                    .project_identities
+                    .get(&approval.project_id)
+                    .map_or(1, |identity| identity.revision),
+                created_at_ms: approval.approved_at_ms,
+                updated_at_ms: approval.approved_at_ms,
+            },
+        );
+        Ok(())
+    }
+
+    fn save_isolation_intent(
+        &mut self,
+        _expected_version: u64,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_isolation_intent");
+        self.maybe_fail("save_isolation_intent")?;
+        self.isolations.insert(isolation.task_id, isolation.clone());
+        Ok(())
+    }
+
+    fn append_git_operation_receipt(
+        &mut self,
+        operation_id: chatoms_domain::GitOperationId,
+        kind: GitOperationReceiptKind,
+        evidence: Option<&str>,
+        recorded_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        self.record("append_git_operation_receipt");
+        self.maybe_fail("append_git_operation_receipt")?;
+        self.receipts.push(GitOperationReceipt {
+            operation_id,
+            sequence: u64::try_from(
+                self.receipts
+                    .iter()
+                    .filter(|receipt| receipt.operation_id == operation_id)
+                    .count()
+                    + 1,
+            )
+            .expect("receipt count"),
+            kind,
+            evidence: evidence.map(ToOwned::to_owned),
+            recorded_at_ms,
+        });
+        Ok(())
+    }
+
+    fn list_git_operation_receipts(
+        &mut self,
+        operation_id: chatoms_domain::GitOperationId,
+    ) -> Result<Vec<GitOperationReceipt>, RepositoryError> {
+        Ok(self
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.operation_id == operation_id)
+            .cloned()
+            .collect())
+    }
+
+    fn list_incomplete_git_operations(
+        &mut self,
+    ) -> Result<Vec<GitOperationAttempt>, RepositoryError> {
+        self.record("list_incomplete_git_operations");
+        self.maybe_fail("list_incomplete_git_operations")?;
+        Ok(self
+            .attempts
+            .values()
+            .filter(|attempt| attempt.status == GitOperationAttemptStatus::IntentRecorded)
+            .copied()
+            .collect())
+    }
+
+    fn save_isolation_transition(
+        &mut self,
+        _expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_isolation_transition");
+        self.maybe_fail("save_isolation_transition")?;
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        self.isolations.insert(task.id(), isolation.clone());
+        if isolation.status == chatoms_ports::repository::GitIsolationStatus::WorktreeCreating {
+            let operation_id = isolation.operation_id.expect("worktree operation id");
+            self.attempts.insert(
+                operation_id,
+                GitOperationAttempt {
+                    operation_id,
+                    task_id: task.id(),
+                    project_id: task.project_id(),
+                    operation_kind: GitOperationKind::WorktreeCreate,
+                    status: GitOperationAttemptStatus::IntentRecorded,
+                    approved_task_version: isolation.expected_task_version,
+                    project_identity_revision: self
+                        .project_identities
+                        .get(&task.project_id())
+                        .map_or(1, |identity| identity.revision),
+                    created_at_ms: isolation.updated_at_ms,
+                    updated_at_ms: isolation.updated_at_ms,
+                },
+            );
+        }
+        if isolation.status == chatoms_ports::repository::GitIsolationStatus::RecoveryRequired
+            && let Some(operation_id) = isolation.operation_id
+        {
+            if let Some(attempt) = self.attempts.get_mut(&operation_id) {
+                attempt.status = GitOperationAttemptStatus::RecoveryRequired;
+            }
+            let sequence = u64::try_from(
+                self.receipts
+                    .iter()
+                    .filter(|receipt| receipt.operation_id == operation_id)
+                    .count()
+                    + 1,
+            )
+            .expect("receipt count");
+            self.receipts.push(GitOperationReceipt {
+                operation_id,
+                sequence,
+                kind: GitOperationReceiptKind::RecoveryRequired,
+                evidence: None,
+                recorded_at_ms: isolation.updated_at_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn save_git_initialization_completion(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_git_initialization_completion");
+        self.maybe_fail("save_git_initialization_completion")?;
+        self.save_isolation_transition(expected_version, task, transition, isolation)?;
+        self.project_identities
+            .insert(identity.project_id, identity.clone());
+        if let Some(operation_id) = isolation.operation_id {
+            if let Some(attempt) = self.attempts.get_mut(&operation_id) {
+                attempt.status = GitOperationAttemptStatus::Completed;
+            }
+            self.receipts.push(GitOperationReceipt {
+                operation_id,
+                sequence: u64::try_from(self.receipts.len() + 1).expect("receipt count"),
+                kind: GitOperationReceiptKind::CompletionRecorded,
+                evidence: None,
+                recorded_at_ms: isolation.updated_at_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn save_worktree_completion(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_worktree_completion");
+        self.maybe_fail("save_worktree_completion")?;
+        self.save_isolation_transition(expected_version, task, transition, isolation)?;
+        if let Some(operation_id) = isolation.operation_id {
+            if let Some(attempt) = self.attempts.get_mut(&operation_id) {
+                attempt.status = GitOperationAttemptStatus::Completed;
+            }
+            self.receipts.push(GitOperationReceipt {
+                operation_id,
+                sequence: u64::try_from(self.receipts.len() + 1).expect("receipt count"),
+                kind: GitOperationReceiptKind::CompletionRecorded,
+                evidence: None,
+                recorded_at_ms: isolation.updated_at_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn terminate_isolation_task(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        self.save_isolation_transition(expected_version, task, transition, isolation)?;
+        self.active_lease = None;
+        Ok(())
+    }
 }
 
 pub struct FakeTime {
@@ -186,6 +504,8 @@ pub fn project(name: &str, root_path: &str, created_at_ms: i64) -> ProjectSummar
         id: ProjectId::new(),
         name: name.to_owned(),
         root_path: root_path.to_owned(),
+        canonical_path_key: root_path.to_lowercase().replace('\\', "/"),
+        display_path: root_path.to_owned(),
         created_at_ms,
         updated_at_ms: created_at_ms + 1,
     }

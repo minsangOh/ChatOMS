@@ -1,11 +1,16 @@
 use std::str::FromStr;
 
 use chatoms_domain::{
-    ActorKind, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId, TaskSnapshot, TaskState,
-    TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot,
+    ActorKind, GitOperationId, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId,
+    TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
+    TaskStateTransitionSnapshot,
 };
+use chatoms_ports::git::RepositoryKind;
 use chatoms_ports::repository::{
-    ActiveLease, FoundationRepository, ProjectSummary, RepositoryError, RepositoryErrorCode,
+    ActiveLease, FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationAttempt,
+    GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
+    ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, RepositoryError,
+    RepositoryErrorCode, TaskGitIsolation,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -22,6 +27,91 @@ impl<'connection> SqliteFoundationRepository<'connection> {
 }
 
 impl FoundationRepository for SqliteFoundationRepository<'_> {
+    fn create_project(&mut self, project: &ProjectRecord) -> Result<(), RepositoryError> {
+        validate_project(project)?;
+        self.database
+            .raw_mut()
+            .execute(
+                "INSERT INTO projects (
+                    id, name, root_path, canonical_path_key, display_path,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    project.id.to_string(),
+                    project.name,
+                    project.root_path,
+                    project.canonical_path_key,
+                    project.display_path,
+                    project.created_at_ms,
+                    project.updated_at_ms
+                ],
+            )
+            .map_err(|source| {
+                RepositoryError::with_source(RepositoryErrorCode::DuplicateProject, source)
+            })?;
+        Ok(())
+    }
+
+    fn create_project_with_identity(
+        &mut self,
+        project: &ProjectRecord,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_project(project)?;
+        validate_project_identity(identity)?;
+        if identity.project_id != project.id {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO projects (
+                    id, name, root_path, canonical_path_key, display_path,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    project.id.to_string(),
+                    project.name,
+                    project.root_path,
+                    project.canonical_path_key,
+                    project.display_path,
+                    project.created_at_ms,
+                    project.updated_at_ms
+                ],
+            )
+            .map_err(|source| {
+                RepositoryError::with_source(RepositoryErrorCode::DuplicateProject, source)
+            })?;
+        insert_project_identity(&transaction, identity)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn get_project_identity(
+        &mut self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectFilesystemIdentityRecord>, RepositoryError> {
+        load_project_identity(self.database.raw_mut(), project_id)
+    }
+
+    fn update_project_identity(
+        &mut self,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_project_identity(identity)?;
+        update_project_identity_row(self.database.raw_mut(), identity)
+    }
+
+    fn get_project(
+        &mut self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectRecord>, RepositoryError> {
+        load_project(self.database.raw_mut(), project_id)
+    }
+
     fn create_task(
         &mut self,
         task: &Task,
@@ -233,6 +323,879 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
     fn active_lease(&mut self) -> Result<Option<ActiveLease>, RepositoryError> {
         query_active_lease(self.database.raw_mut())
     }
+
+    fn create_isolation_task(
+        &mut self,
+        task: &Task,
+        initial_transition: &TaskStateTransition,
+        classified_transition: &TaskStateTransition,
+        lease_acquired_at_ms: i64,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        validate_new_isolation_task(
+            task,
+            initial_transition,
+            classified_transition,
+            lease_acquired_at_ms,
+            isolation,
+        )?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        if !project_exists(&transaction, task.project_id())? {
+            return Err(repository_error(RepositoryErrorCode::ProjectNotFound));
+        }
+        if task_exists(&transaction, task.id())? {
+            return Err(repository_error(RepositoryErrorCode::DuplicateTask));
+        }
+        if query_active_lease(&transaction)?.is_some() {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        insert_task(&transaction, task).map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::DuplicateTask, source)
+        })?;
+        insert_transition(&transaction, initial_transition).map_err(operation_failed)?;
+        insert_transition(&transaction, classified_transition).map_err(operation_failed)?;
+        transaction
+            .execute(
+                "INSERT INTO active_task_leases (singleton_key, task_id, acquired_at_ms)
+                 VALUES (1, ?1, ?2)",
+                params![task.id().to_string(), lease_acquired_at_ms],
+            )
+            .map_err(|source| {
+                RepositoryError::with_source(RepositoryErrorCode::ActiveLeaseConflict, source)
+            })?;
+        insert_isolation(&transaction, isolation)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn get_task_isolation(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
+        load_isolation(self.database.raw_mut(), task_id)
+    }
+
+    fn begin_git_initialization(
+        &mut self,
+        expected_version: u64,
+        isolation: &TaskGitIsolation,
+        approval: &GitInitApproval,
+    ) -> Result<(), RepositoryError> {
+        if isolation.status != GitIsolationStatus::GitInitInProgress
+            || isolation.operation_id != Some(approval.operation_id)
+            || isolation.task_id != approval.task_id
+            || isolation.project_id != approval.project_id
+            || approval.approved_task_version != expected_version
+            || isolation.expected_task_version != expected_version
+            || approval.approved_at_ms < 0
+        {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        validate_isolation_expected_version(&transaction, isolation.task_id, expected_version)?;
+        update_isolation(&transaction, isolation)?;
+        insert_git_operation_attempt(&transaction, isolation, GitOperationKind::GitInitialize)?;
+        transaction
+            .execute(
+                "INSERT INTO git_init_approvals (
+                    operation_id, task_id, project_id, approved_task_version, approved_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    approval.operation_id.to_string(),
+                    approval.task_id.to_string(),
+                    approval.project_id.to_string(),
+                    to_sql_integer(approval.approved_task_version)
+                        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                    approval.approved_at_ms
+                ],
+            )
+            .map_err(operation_failed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_isolation_intent(
+        &mut self,
+        expected_version: u64,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        validate_isolation_expected_version(&transaction, isolation.task_id, expected_version)?;
+        update_isolation(&transaction, isolation)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn append_git_operation_receipt(
+        &mut self,
+        operation_id: GitOperationId,
+        kind: GitOperationReceiptKind,
+        evidence: Option<&str>,
+        recorded_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        if recorded_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        insert_operation_receipt(&transaction, operation_id, kind, evidence, recorded_at_ms)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn list_git_operation_receipts(
+        &mut self,
+        operation_id: GitOperationId,
+    ) -> Result<Vec<GitOperationReceipt>, RepositoryError> {
+        load_operation_receipts(self.database.raw_mut(), operation_id)
+    }
+
+    fn list_incomplete_git_operations(
+        &mut self,
+    ) -> Result<Vec<GitOperationAttempt>, RepositoryError> {
+        load_incomplete_operations(self.database.raw_mut())
+    }
+
+    fn save_isolation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        if task.state().is_terminal() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        persist_isolation_transition(
+            &transaction,
+            expected_version,
+            task,
+            transition,
+            isolation,
+            false,
+        )?;
+        if isolation.status == GitIsolationStatus::WorktreeCreating {
+            insert_git_operation_attempt(
+                &transaction,
+                isolation,
+                GitOperationKind::WorktreeCreate,
+            )?;
+        }
+        if isolation.status == GitIsolationStatus::RecoveryRequired {
+            complete_operation_attempt(
+                &transaction,
+                isolation,
+                "RecoveryRequired",
+                GitOperationReceiptKind::RecoveryRequired,
+            )?;
+        }
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_git_initialization_completion(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+        identity: &ProjectFilesystemIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        if task.state() != TaskState::GitInitialized
+            || isolation.status != GitIsolationStatus::Ready
+            || identity.project_id != task.project_id()
+            || identity.repository_kind != RepositoryKind::Git
+        {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_project_identity(identity)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        persist_isolation_transition(
+            &transaction,
+            expected_version,
+            task,
+            transition,
+            isolation,
+            false,
+        )?;
+        update_project_identity_row(&transaction, identity)?;
+        complete_operation_attempt(
+            &transaction,
+            isolation,
+            "Completed",
+            GitOperationReceiptKind::CompletionRecorded,
+        )?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_worktree_completion(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        if task.state() != TaskState::WorktreeReady
+            || isolation.status != GitIsolationStatus::WorktreeReady
+        {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        persist_isolation_transition(
+            &transaction,
+            expected_version,
+            task,
+            transition,
+            isolation,
+            false,
+        )?;
+        complete_operation_attempt(
+            &transaction,
+            isolation,
+            "Completed",
+            GitOperationReceiptKind::CompletionRecorded,
+        )?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn terminate_isolation_task(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        if !task.state().is_terminal() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        persist_isolation_transition(
+            &transaction,
+            expected_version,
+            task,
+            transition,
+            isolation,
+            true,
+        )?;
+        transaction.commit().map_err(operation_failed)
+    }
+}
+
+fn validate_project(project: &ProjectRecord) -> Result<(), RepositoryError> {
+    if project.name.trim().is_empty()
+        || project.root_path.is_empty()
+        || project.canonical_path_key.is_empty()
+        || project.display_path.is_empty()
+        || project.created_at_ms < 0
+        || project.updated_at_ms < project.created_at_ms
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn validate_project_identity(
+    identity: &ProjectFilesystemIdentityRecord,
+) -> Result<(), RepositoryError> {
+    let root_valid = is_lower_hex(&identity.root_volume_serial_hex, 16)
+        && is_lower_hex(&identity.root_file_id_hex, 32);
+    let common_valid = match identity.repository_kind {
+        RepositoryKind::Git => {
+            identity
+                .git_common_volume_serial_hex
+                .as_deref()
+                .is_some_and(|value| is_lower_hex(value, 16))
+                && identity
+                    .git_common_file_id_hex
+                    .as_deref()
+                    .is_some_and(|value| is_lower_hex(value, 32))
+        }
+        RepositoryKind::NonGit => {
+            identity.git_common_volume_serial_hex.is_none()
+                && identity.git_common_file_id_hex.is_none()
+        }
+    };
+    if !root_valid || !common_valid || identity.revision == 0 || identity.verified_at_ms < 0 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn insert_project_identity(
+    connection: &Connection,
+    identity: &ProjectFilesystemIdentityRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO project_filesystem_identities (
+                project_id, identity_scheme, root_volume_serial_hex, root_file_id_hex,
+                repository_kind, git_common_volume_serial_hex, git_common_file_id_hex,
+                confirmed, revision, verified_at_ms
+             ) VALUES (?1, 'WindowsFileIdV1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                identity.project_id.to_string(),
+                identity.root_volume_serial_hex,
+                identity.root_file_id_hex,
+                repository_kind_text(identity.repository_kind),
+                identity.git_common_volume_serial_hex,
+                identity.git_common_file_id_hex,
+                i64::from(identity.confirmed),
+                i64::try_from(identity.revision)
+                    .map_err(|_| repository_error(RepositoryErrorCode::InvalidAggregate))?,
+                identity.verified_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::DuplicateProject, source)
+        })?;
+    Ok(())
+}
+
+fn update_project_identity_row(
+    connection: &Connection,
+    identity: &ProjectFilesystemIdentityRecord,
+) -> Result<(), RepositoryError> {
+    let changed = connection
+        .execute(
+            "UPDATE project_filesystem_identities
+             SET repository_kind = ?2,
+                 git_common_volume_serial_hex = ?3,
+                 git_common_file_id_hex = ?4,
+                 confirmed = ?5,
+                 revision = ?6,
+                 verified_at_ms = ?7
+             WHERE project_id = ?1 AND revision < ?6",
+            params![
+                identity.project_id.to_string(),
+                repository_kind_text(identity.repository_kind),
+                identity.git_common_volume_serial_hex,
+                identity.git_common_file_id_hex,
+                i64::from(identity.confirmed),
+                i64::try_from(identity.revision)
+                    .map_err(|_| repository_error(RepositoryErrorCode::InvalidAggregate))?,
+                identity.verified_at_ms,
+            ],
+        )
+        .map_err(operation_failed)?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(repository_error(RepositoryErrorCode::VersionConflict))
+    }
+}
+
+fn insert_git_operation_attempt(
+    connection: &Connection,
+    isolation: &TaskGitIsolation,
+    kind: GitOperationKind,
+) -> Result<(), RepositoryError> {
+    let operation_id = isolation
+        .operation_id
+        .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidAggregate))?;
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM project_filesystem_identities WHERE project_id = ?1",
+            [isolation.project_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(operation_failed)?;
+    connection
+        .execute(
+            "INSERT INTO git_operation_attempts (
+                operation_id, task_id, project_id, operation_kind, status,
+                approved_task_version, project_identity_revision, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 'IntentRecorded', ?5, ?6, ?7, ?7)",
+            params![
+                operation_id.to_string(),
+                isolation.task_id.to_string(),
+                isolation.project_id.to_string(),
+                operation_kind_text(kind),
+                to_sql_integer(isolation.expected_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                revision,
+                isolation.updated_at_ms,
+            ],
+        )
+        .map_err(operation_failed)?;
+    Ok(())
+}
+
+fn insert_operation_receipt(
+    connection: &Connection,
+    operation_id: GitOperationId,
+    kind: GitOperationReceiptKind,
+    evidence: Option<&str>,
+    recorded_at_ms: i64,
+) -> Result<(), RepositoryError> {
+    let next: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1
+             FROM git_operation_receipts WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(operation_failed)?;
+    connection
+        .execute(
+            "INSERT INTO git_operation_receipts (
+                operation_id, sequence, receipt_kind, evidence, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                operation_id.to_string(),
+                next,
+                receipt_kind_text(kind),
+                evidence,
+                recorded_at_ms
+            ],
+        )
+        .map_err(operation_failed)?;
+    Ok(())
+}
+
+fn complete_operation_attempt(
+    connection: &Connection,
+    isolation: &TaskGitIsolation,
+    status: &str,
+    receipt: GitOperationReceiptKind,
+) -> Result<(), RepositoryError> {
+    let operation_id = isolation
+        .operation_id
+        .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidAggregate))?;
+    let changed = connection
+        .execute(
+            "UPDATE git_operation_attempts
+             SET status = ?2, updated_at_ms = ?3
+             WHERE operation_id = ?1 AND status = 'IntentRecorded'",
+            params![operation_id.to_string(), status, isolation.updated_at_ms],
+        )
+        .map_err(operation_failed)?;
+    if changed != 1 {
+        return Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        ));
+    }
+    insert_operation_receipt(
+        connection,
+        operation_id,
+        receipt,
+        None,
+        isolation.updated_at_ms,
+    )
+}
+
+fn load_operation_receipts(
+    connection: &Connection,
+    operation_id: GitOperationId,
+) -> Result<Vec<GitOperationReceipt>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, receipt_kind, evidence, recorded_at_ms
+             FROM git_operation_receipts
+             WHERE operation_id = ?1 ORDER BY sequence",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map([operation_id.to_string()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(operation_failed)?;
+    let mut receipts = Vec::new();
+    for row in rows {
+        let (sequence, kind, evidence, recorded_at_ms) = row.map_err(operation_failed)?;
+        receipts.push(GitOperationReceipt {
+            operation_id,
+            sequence: u64::try_from(sequence)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+            kind: parse_receipt_kind(&kind)?,
+            evidence,
+            recorded_at_ms,
+        });
+    }
+    Ok(receipts)
+}
+
+fn load_incomplete_operations(
+    connection: &Connection,
+) -> Result<Vec<GitOperationAttempt>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT operation_id, task_id, project_id, operation_kind, status,
+                    approved_task_version, project_identity_revision, created_at_ms, updated_at_ms
+             FROM git_operation_attempts
+             WHERE status = 'IntentRecorded'
+             ORDER BY created_at_ms, operation_id",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })
+        .map_err(operation_failed)?;
+    let mut attempts = Vec::new();
+    for row in rows {
+        let (operation, task, project, kind, status, version, revision, created, updated) =
+            row.map_err(operation_failed)?;
+        attempts.push(GitOperationAttempt {
+            operation_id: GitOperationId::from_str(&operation)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+            task_id: TaskId::from_str(&task)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+            project_id: ProjectId::from_str(&project)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+            operation_kind: parse_operation_kind(&kind)?,
+            status: parse_attempt_status(&status)?,
+            approved_task_version: u64::try_from(version)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+            project_identity_revision: u64::try_from(revision)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+            created_at_ms: created,
+            updated_at_ms: updated,
+        });
+    }
+    Ok(attempts)
+}
+
+const fn operation_kind_text(kind: GitOperationKind) -> &'static str {
+    match kind {
+        GitOperationKind::GitInitialize => "GitInitialize",
+        GitOperationKind::WorktreeCreate => "WorktreeCreate",
+    }
+}
+
+const fn receipt_kind_text(kind: GitOperationReceiptKind) -> &'static str {
+    match kind {
+        GitOperationReceiptKind::CommandStarted => "CommandStarted",
+        GitOperationReceiptKind::CommandSucceeded => "CommandSucceeded",
+        GitOperationReceiptKind::PostVerified => "PostVerified",
+        GitOperationReceiptKind::CompletionRecorded => "CompletionRecorded",
+        GitOperationReceiptKind::RecoveryRequired => "RecoveryRequired",
+    }
+}
+
+fn parse_operation_kind(value: &str) -> Result<GitOperationKind, RepositoryError> {
+    match value {
+        "GitInitialize" => Ok(GitOperationKind::GitInitialize),
+        "WorktreeCreate" => Ok(GitOperationKind::WorktreeCreate),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+fn parse_attempt_status(value: &str) -> Result<GitOperationAttemptStatus, RepositoryError> {
+    match value {
+        "IntentRecorded" => Ok(GitOperationAttemptStatus::IntentRecorded),
+        "RecoveryRequired" => Ok(GitOperationAttemptStatus::RecoveryRequired),
+        "Completed" => Ok(GitOperationAttemptStatus::Completed),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+fn parse_receipt_kind(value: &str) -> Result<GitOperationReceiptKind, RepositoryError> {
+    match value {
+        "CommandStarted" => Ok(GitOperationReceiptKind::CommandStarted),
+        "CommandSucceeded" => Ok(GitOperationReceiptKind::CommandSucceeded),
+        "PostVerified" => Ok(GitOperationReceiptKind::PostVerified),
+        "CompletionRecorded" => Ok(GitOperationReceiptKind::CompletionRecorded),
+        "RecoveryRequired" => Ok(GitOperationReceiptKind::RecoveryRequired),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+const fn repository_kind_text(kind: RepositoryKind) -> &'static str {
+    match kind {
+        RepositoryKind::Git => "Git",
+        RepositoryKind::NonGit => "NonGit",
+    }
+}
+
+fn validate_new_isolation_task(
+    task: &Task,
+    initial: &TaskStateTransition,
+    classified: &TaskStateTransition,
+    lease_acquired_at_ms: i64,
+    isolation: &TaskGitIsolation,
+) -> Result<(), RepositoryError> {
+    task.validate_invariants()
+        .map_err(|_| repository_error(RepositoryErrorCode::InvalidAggregate))?;
+    validate_nonnegative_task(task)?;
+    let expected_isolation_status = match task.state() {
+        TaskState::ProjectValidated => GitIsolationStatus::Ready,
+        TaskState::AwaitingGitInitApproval => GitIsolationStatus::AwaitingGitInitApproval,
+        _ => return Err(repository_error(RepositoryErrorCode::InvalidAggregate)),
+    };
+    if task.version() != 1
+        || !task.state().requires_active_lease()
+        || initial.task_id() != task.id()
+        || initial.sequence() != 1
+        || initial.from_state().is_some()
+        || initial.to_state() != TaskState::Created
+        || initial.task_version() != 0
+        || classified.task_id() != task.id()
+        || classified.sequence() != 2
+        || classified.from_state() != Some(TaskState::Created)
+        || classified.to_state() != task.state()
+        || classified.task_version() != 1
+        || classified.occurred_at_ms() != task.updated_at_ms()
+        || initial.occurred_at_ms() < task.created_at_ms()
+        || classified.occurred_at_ms() < initial.occurred_at_ms()
+        || lease_acquired_at_ms < 0
+        || isolation.task_id != task.id()
+        || isolation.project_id != task.project_id()
+        || isolation.status != expected_isolation_status
+        || isolation.operation_id.is_some()
+        || isolation.expected_task_version != task.version()
+        || isolation.base_branch.is_some()
+        || isolation.base_commit.is_some()
+        || isolation.worktree_path.is_some()
+        || isolation.branch_created_by_app
+        || isolation.worktree_created_by_app
+        || isolation.created_at_ms < 0
+        || isolation.updated_at_ms < isolation.created_at_ms
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn insert_isolation(
+    connection: &Connection,
+    isolation: &TaskGitIsolation,
+) -> Result<(), RepositoryError> {
+    validate_isolation_shape(isolation)?;
+    connection
+        .execute(
+            "INSERT INTO task_git_isolations (
+                task_id, project_id, status, operation_id, expected_task_version,
+                base_branch, base_commit, worktree_path, branch_created_by_app,
+                worktree_created_by_app, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                isolation.task_id.to_string(),
+                isolation.project_id.to_string(),
+                isolation_status_text(isolation.status),
+                isolation.operation_id.map(|value| value.to_string()),
+                to_sql_integer(isolation.expected_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                isolation.base_branch,
+                isolation.base_commit,
+                isolation.worktree_path,
+                i64::from(isolation.branch_created_by_app),
+                i64::from(isolation.worktree_created_by_app),
+                isolation.created_at_ms,
+                isolation.updated_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::DuplicateIsolation, source)
+        })?;
+    Ok(())
+}
+
+fn update_isolation(
+    connection: &Connection,
+    isolation: &TaskGitIsolation,
+) -> Result<(), RepositoryError> {
+    validate_isolation_shape(isolation)?;
+    let changed = connection
+        .execute(
+            "UPDATE task_git_isolations
+             SET status = ?1,
+                 operation_id = ?2,
+                 expected_task_version = ?3,
+                 base_branch = ?4,
+                 base_commit = ?5,
+                 worktree_path = ?6,
+                 branch_created_by_app = ?7,
+                 worktree_created_by_app = ?8,
+                 updated_at_ms = ?9
+             WHERE task_id = ?10 AND project_id = ?11",
+            params![
+                isolation_status_text(isolation.status),
+                isolation.operation_id.map(|value| value.to_string()),
+                to_sql_integer(isolation.expected_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                isolation.base_branch,
+                isolation.base_commit,
+                isolation.worktree_path,
+                i64::from(isolation.branch_created_by_app),
+                i64::from(isolation.worktree_created_by_app),
+                isolation.updated_at_ms,
+                isolation.task_id.to_string(),
+                isolation.project_id.to_string(),
+            ],
+        )
+        .map_err(operation_failed)?;
+    if changed != 1 {
+        return Err(repository_error(RepositoryErrorCode::IsolationNotFound));
+    }
+    Ok(())
+}
+
+fn validate_isolation_shape(isolation: &TaskGitIsolation) -> Result<(), RepositoryError> {
+    let empty_base = isolation.base_branch.is_none()
+        && isolation.base_commit.is_none()
+        && isolation.worktree_path.is_none();
+    let complete_base = isolation
+        .base_branch
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        && isolation.base_commit.as_deref().is_some_and(|value| {
+            is_lower_hex(value, value.len()) && matches!(value.len(), 40 | 64)
+        })
+        && isolation
+            .worktree_path
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    let no_ownership = !isolation.branch_created_by_app && !isolation.worktree_created_by_app;
+    let valid = match isolation.status {
+        GitIsolationStatus::AwaitingGitInitApproval => {
+            isolation.operation_id.is_none() && empty_base && no_ownership
+        }
+        GitIsolationStatus::Ready => empty_base && no_ownership,
+        GitIsolationStatus::GitInitInProgress => {
+            isolation.operation_id.is_some() && empty_base && no_ownership
+        }
+        GitIsolationStatus::WorktreeCreating => {
+            isolation.operation_id.is_some() && complete_base && no_ownership
+        }
+        GitIsolationStatus::WorktreeReady => {
+            isolation.operation_id.is_some()
+                && complete_base
+                && isolation.branch_created_by_app
+                && isolation.worktree_created_by_app
+        }
+        GitIsolationStatus::RecoveryRequired => {
+            isolation.operation_id.is_some() && (empty_base || complete_base) && no_ownership
+        }
+    };
+    if valid && isolation.created_at_ms >= 0 && isolation.updated_at_ms >= isolation.created_at_ms {
+        Ok(())
+    } else {
+        Err(repository_error(RepositoryErrorCode::InvalidAggregate))
+    }
+}
+
+fn validate_isolation_expected_version(
+    connection: &Connection,
+    task_id: TaskId,
+    expected_version: u64,
+) -> Result<(), RepositoryError> {
+    let task = load_task(connection, task_id)?
+        .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+    if task.version() != expected_version {
+        return Err(repository_error(RepositoryErrorCode::VersionConflict));
+    }
+    if load_isolation(connection, task_id)?.is_none() {
+        return Err(repository_error(RepositoryErrorCode::IsolationNotFound));
+    }
+    Ok(())
+}
+
+fn persist_isolation_transition(
+    connection: &Connection,
+    expected_version: u64,
+    task: &Task,
+    transition: &TaskStateTransition,
+    isolation: &TaskGitIsolation,
+    terminal: bool,
+) -> Result<(), RepositoryError> {
+    task.validate_invariants()
+        .map_err(|_| repository_error(RepositoryErrorCode::InvalidAggregate))?;
+    validate_nonnegative_task(task)?;
+    if task.state().is_terminal() != terminal
+        || isolation.task_id != task.id()
+        || isolation.project_id != task.project_id()
+        || isolation.expected_task_version != task.version()
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    let current = load_task(connection, task.id())?
+        .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+    validate_transition_persistence(connection, expected_version, &current, task, transition)?;
+    if query_active_lease(connection)?
+        .as_ref()
+        .map(|active| active.task_id)
+        != Some(task.id())
+    {
+        return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+    }
+    let current_isolation = load_isolation(connection, task.id())?
+        .ok_or_else(|| repository_error(RepositoryErrorCode::IsolationNotFound))?;
+    if current_isolation.project_id != isolation.project_id
+        || current_isolation.created_at_ms != isolation.created_at_ms
+        || isolation.updated_at_ms < current_isolation.updated_at_ms
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    update_task(connection, expected_version, task)?;
+    insert_transition(connection, transition).map_err(operation_failed)?;
+    update_isolation(connection, isolation)?;
+    if terminal {
+        let deleted = connection
+            .execute(
+                "DELETE FROM active_task_leases WHERE task_id = ?1",
+                [task.id().to_string()],
+            )
+            .map_err(operation_failed)?;
+        if deleted != 1 {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+    }
+    Ok(())
 }
 
 fn validate_new_task(
@@ -616,7 +1579,8 @@ fn validate_transition_history(
 fn load_projects(connection: &Connection) -> Result<Vec<ProjectSummary>, RepositoryError> {
     let mut statement = connection
         .prepare(
-            "SELECT id, name, root_path, created_at_ms, updated_at_ms
+            "SELECT id, name, root_path, canonical_path_key, display_path,
+                    created_at_ms, updated_at_ms
              FROM projects
              ORDER BY created_at_ms ASC, id ASC",
         )
@@ -627,16 +1591,21 @@ fn load_projects(connection: &Connection) -> Result<Vec<ProjectSummary>, Reposit
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(operation_failed)?;
     let mut projects = Vec::new();
     for row in rows {
-        let (id, name, root_path, created_at_ms, updated_at_ms) = row.map_err(operation_failed)?;
+        let (id, name, root_path, canonical_path_key, display_path, created_at_ms, updated_at_ms) =
+            row.map_err(operation_failed)?;
         if name.is_empty()
             || root_path.is_empty()
+            || canonical_path_key.is_empty()
+            || display_path.is_empty()
             || created_at_ms < 0
             || updated_at_ms < created_at_ms
         {
@@ -648,11 +1617,210 @@ fn load_projects(connection: &Connection) -> Result<Vec<ProjectSummary>, Reposit
             id: ProjectId::from_str(&id).map_err(invalid_persistence)?,
             name,
             root_path,
+            canonical_path_key,
+            display_path,
             created_at_ms,
             updated_at_ms,
         });
     }
     Ok(projects)
+}
+
+fn load_project(
+    connection: &Connection,
+    project_id: ProjectId,
+) -> Result<Option<ProjectRecord>, RepositoryError> {
+    let row = connection
+        .query_row(
+            "SELECT id, name, root_path, canonical_path_key, display_path,
+                    created_at_ms, updated_at_ms
+             FROM projects WHERE id = ?1",
+            [project_id.to_string()],
+            |row| {
+                Ok(ProjectRecord {
+                    id: ProjectId::from_str(&row.get::<_, String>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    name: row.get(1)?,
+                    root_path: row.get(2)?,
+                    canonical_path_key: row.get(3)?,
+                    display_path: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                    updated_at_ms: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?;
+    match row {
+        Some(project) => {
+            validate_project(&project)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+            Ok(Some(project))
+        }
+        None => Ok(None),
+    }
+}
+
+fn load_project_identity(
+    connection: &Connection,
+    project_id: ProjectId,
+) -> Result<Option<ProjectFilesystemIdentityRecord>, RepositoryError> {
+    let row = connection
+        .query_row(
+            "SELECT project_id, root_volume_serial_hex, root_file_id_hex,
+                    repository_kind, git_common_volume_serial_hex, git_common_file_id_hex,
+                    confirmed, revision, verified_at_ms
+             FROM project_filesystem_identities WHERE project_id = ?1",
+            [project_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?;
+    row.map(
+        |(
+            project_id,
+            root_volume,
+            root_file,
+            kind,
+            common_volume,
+            common_file,
+            confirmed,
+            revision,
+            verified,
+        )| {
+            let identity = ProjectFilesystemIdentityRecord {
+                project_id: ProjectId::from_str(&project_id).map_err(invalid_persistence)?,
+                root_volume_serial_hex: root_volume,
+                root_file_id_hex: root_file,
+                repository_kind: match kind.as_str() {
+                    "Git" => RepositoryKind::Git,
+                    "NonGit" => RepositoryKind::NonGit,
+                    _ => {
+                        return Err(repository_error(
+                            RepositoryErrorCode::InvalidPersistenceState,
+                        ));
+                    }
+                },
+                git_common_volume_serial_hex: common_volume,
+                git_common_file_id_hex: common_file,
+                confirmed: match confirmed {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(repository_error(
+                            RepositoryErrorCode::InvalidPersistenceState,
+                        ));
+                    }
+                },
+                revision: u64::try_from(revision)
+                    .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+                verified_at_ms: verified,
+            };
+            validate_project_identity(&identity)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+            Ok(identity)
+        },
+    )
+    .transpose()
+}
+
+fn load_isolation(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskGitIsolation>, RepositoryError> {
+    let row = connection
+        .query_row(
+            "SELECT task_id, project_id, status, operation_id, expected_task_version,
+                    base_branch, base_commit, worktree_path, branch_created_by_app,
+                    worktree_created_by_app, created_at_ms, updated_at_ms
+             FROM task_git_isolations WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?;
+    row.map(
+        |(
+            task_id,
+            project_id,
+            status,
+            operation_id,
+            expected_task_version,
+            base_branch,
+            base_commit,
+            worktree_path,
+            branch_created_by_app,
+            worktree_created_by_app,
+            created_at_ms,
+            updated_at_ms,
+        )| {
+            if !matches!(branch_created_by_app, 0 | 1)
+                || !matches!(worktree_created_by_app, 0 | 1)
+                || expected_task_version < 0
+                || created_at_ms < 0
+                || updated_at_ms < created_at_ms
+            {
+                return Err(repository_error(
+                    RepositoryErrorCode::InvalidPersistenceState,
+                ));
+            }
+            let isolation = TaskGitIsolation {
+                task_id: TaskId::from_str(&task_id).map_err(invalid_persistence)?,
+                project_id: ProjectId::from_str(&project_id).map_err(invalid_persistence)?,
+                status: parse_isolation_status(&status)?,
+                operation_id: operation_id
+                    .as_deref()
+                    .map(GitOperationId::from_str)
+                    .transpose()
+                    .map_err(invalid_persistence)?,
+                expected_task_version: u64::try_from(expected_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+                base_branch,
+                base_commit,
+                worktree_path,
+                branch_created_by_app: branch_created_by_app == 1,
+                worktree_created_by_app: worktree_created_by_app == 1,
+                created_at_ms,
+                updated_at_ms,
+            };
+            validate_isolation_shape(&isolation)
+                .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+            Ok(isolation)
+        },
+    )
+    .transpose()
 }
 
 fn query_active_lease(connection: &Connection) -> Result<Option<ActiveLease>, RepositoryError> {
@@ -754,6 +1922,31 @@ fn state_text(state: TaskState) -> &'static str {
         TaskState::Cancelled => "Cancelled",
         TaskState::CleanupPending => "CleanupPending",
         TaskState::Archived => "Archived",
+    }
+}
+
+fn isolation_status_text(status: GitIsolationStatus) -> &'static str {
+    match status {
+        GitIsolationStatus::AwaitingGitInitApproval => "AwaitingGitInitApproval",
+        GitIsolationStatus::Ready => "Ready",
+        GitIsolationStatus::GitInitInProgress => "GitInitInProgress",
+        GitIsolationStatus::WorktreeCreating => "WorktreeCreating",
+        GitIsolationStatus::WorktreeReady => "WorktreeReady",
+        GitIsolationStatus::RecoveryRequired => "RecoveryRequired",
+    }
+}
+
+fn parse_isolation_status(value: &str) -> Result<GitIsolationStatus, RepositoryError> {
+    match value {
+        "AwaitingGitInitApproval" => Ok(GitIsolationStatus::AwaitingGitInitApproval),
+        "Ready" => Ok(GitIsolationStatus::Ready),
+        "GitInitInProgress" => Ok(GitIsolationStatus::GitInitInProgress),
+        "WorktreeCreating" => Ok(GitIsolationStatus::WorktreeCreating),
+        "WorktreeReady" => Ok(GitIsolationStatus::WorktreeReady),
+        "RecoveryRequired" => Ok(GitIsolationStatus::RecoveryRequired),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
     }
 }
 

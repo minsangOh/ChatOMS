@@ -4,5 +4,6 @@
 pub mod bootstrap;
 pub mod database;
 pub mod error;
+pub mod git;
 pub mod logging;
 pub mod redaction;

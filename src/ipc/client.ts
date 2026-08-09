@@ -9,7 +9,11 @@ import type {
   HealthDto,
   HealthState,
   LoggingStatus,
+  LegacyMigrationDiagnosticDto,
   ProjectDto,
+  ProjectCandidateDto,
+  ProjectStatusDto,
+  TaskIsolationDto,
   StorageStatus,
   SystemStatusDto,
   TaskDto,
@@ -23,7 +27,15 @@ export const IPC_COMMANDS = {
   getHealth: "get_health",
   getSystemStatus: "get_system_status",
   getBootstrapStatus: "get_bootstrap_status",
+  getLegacyMigrationDiagnostic: "get_legacy_migration_diagnostic",
   listProjects: "list_projects",
+  inspectProjectCandidate: "inspect_project_candidate",
+  registerProject: "register_project",
+  getProjectGitStatus: "get_project_git_status",
+  createIsolationTask: "create_isolation_task",
+  getTaskIsolation: "get_task_isolation",
+  approveGitInitialization: "approve_git_initialization",
+  createTaskWorktree: "create_task_worktree",
   getActiveTask: "get_active_task",
   getTask: "get_task",
   listTaskHistory: "list_task_history",
@@ -39,7 +51,15 @@ export interface IpcClient {
   getHealth(): Promise<HealthDto>;
   getSystemStatus(): Promise<SystemStatusDto>;
   getBootstrapStatus(): Promise<BootstrapStatusDto>;
+  getLegacyMigrationDiagnostic(): Promise<LegacyMigrationDiagnosticDto | null>;
   listProjects(): Promise<ProjectDto[]>;
+  inspectProjectCandidate(inputPath: string): Promise<ProjectCandidateDto>;
+  registerProject(inputPath: string, confirmationToken: string, name?: string): Promise<ProjectDto>;
+  getProjectGitStatus(projectId: string): Promise<ProjectStatusDto>;
+  createIsolationTask(projectId: string): Promise<TaskIsolationDto>;
+  getTaskIsolation(taskId: string): Promise<TaskIsolationDto>;
+  approveGitInitialization(taskId: string, expectedVersion: number): Promise<TaskIsolationDto>;
+  createTaskWorktree(taskId: string, expectedVersion: number): Promise<TaskIsolationDto>;
   getActiveTask(): Promise<ActiveTaskDto | null>;
   getTask(taskId: string): Promise<TaskDto>;
   listTaskHistory(taskId: string): Promise<TaskTransitionDto[]>;
@@ -75,7 +95,20 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
     getHealth: () => request(IPC_COMMANDS.getHealth, isHealthDto),
     getSystemStatus: () => request(IPC_COMMANDS.getSystemStatus, isSystemStatusDto),
     getBootstrapStatus: () => request(IPC_COMMANDS.getBootstrapStatus, isBootstrapStatusDto),
+    getLegacyMigrationDiagnostic: () =>
+      request(
+        IPC_COMMANDS.getLegacyMigrationDiagnostic,
+        (value): value is LegacyMigrationDiagnosticDto | null =>
+          value === null || isLegacyMigrationDiagnosticDto(value),
+      ),
     listProjects: () => request(IPC_COMMANDS.listProjects, isProjectDtoArray),
+    inspectProjectCandidate: (inputPath) => request(IPC_COMMANDS.inspectProjectCandidate, isProjectCandidateDto, { inputPath }),
+    registerProject: (inputPath, confirmationToken, name) => request(IPC_COMMANDS.registerProject, isProjectDto, { inputPath, confirmationToken, name: name ?? null }),
+    getProjectGitStatus: (projectId) => request(IPC_COMMANDS.getProjectGitStatus, isProjectStatusDto, { projectId }),
+    createIsolationTask: (projectId) => request(IPC_COMMANDS.createIsolationTask, isTaskIsolationDto, { projectId }),
+    getTaskIsolation: (taskId) => request(IPC_COMMANDS.getTaskIsolation, isTaskIsolationDto, { taskId }),
+    approveGitInitialization: (taskId, expectedVersion) => request(IPC_COMMANDS.approveGitInitialization, isTaskIsolationDto, { taskId, expectedVersion }),
+    createTaskWorktree: (taskId, expectedVersion) => request(IPC_COMMANDS.createTaskWorktree, isTaskIsolationDto, { taskId, expectedVersion }),
     getActiveTask: () => request(IPC_COMMANDS.getActiveTask, isNullableActiveTaskDto),
     getTask: (taskId) => request(IPC_COMMANDS.getTask, isTaskDto, { taskId }),
     listTaskHistory: (taskId) =>
@@ -130,6 +163,9 @@ const TASK_STATES: readonly TaskState[] = [
   "cleanupPending",
   "archived",
 ];
+const REPOSITORY_KINDS = ["git", "nonGit"] as const;
+const ISOLATION_STATUSES = ["awaitingGitInitApproval", "ready", "gitInitInProgress", "worktreeCreating", "worktreeReady", "recoveryRequired"] as const;
+const ISOLATION_BLOCKERS = ["dirtyRepository", "detachedHead", "unbornRepository", "missingCurrentBranch", "gitAuthorMissing", "gitOperationFailed", "recoveryRequired"] as const;
 
 function isVersionDto(value: unknown): value is VersionDto {
   return isRecord(value) && typeof value.version === "string";
@@ -157,6 +193,17 @@ function isBootstrapStatusDto(value: unknown): value is BootstrapStatusDto {
     isActiveTaskStatusDto(value.activeTaskStatus) &&
     typeof value.applicationVersion === "string" &&
     typeof value.ready === "boolean"
+  );
+}
+
+function isLegacyMigrationDiagnosticDto(
+  value: unknown,
+): value is LegacyMigrationDiagnosticDto {
+  return (
+    isRecord(value) &&
+    typeof value.projectId === "string" &&
+    typeof value.displayPath === "string" &&
+    typeof value.reasonCode === "string"
   );
 }
 
@@ -191,9 +238,23 @@ function isProjectDto(value: unknown): value is ProjectDto {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
+    typeof value.displayPath === "string" &&
     typeof value.createdAtMs === "number" &&
     typeof value.updatedAtMs === "number"
   );
+}
+
+function isRepositoryStatusDto(value: unknown): value is import("./types").RepositoryStatusDto {
+  return isRecord(value) && typeof value.clean === "boolean" && typeof value.detachedHead === "boolean" && isNullableString(value.currentBranch) && isNullableString(value.headCommit);
+}
+function isProjectCandidateDto(value: unknown): value is ProjectCandidateDto {
+  return isRecord(value) && typeof value.suggestedName === "string" && typeof value.displayPath === "string" && typeof value.confirmationToken === "string" && isOneOf(value.repositoryKind, REPOSITORY_KINDS) && (value.repositoryStatus === null || isRepositoryStatusDto(value.repositoryStatus));
+}
+function isProjectStatusDto(value: unknown): value is ProjectStatusDto {
+  return isRecord(value) && typeof value.projectId === "string" && isOneOf(value.repositoryKind, REPOSITORY_KINDS) && (value.repositoryStatus === null || isRepositoryStatusDto(value.repositoryStatus));
+}
+function isTaskIsolationDto(value: unknown): value is TaskIsolationDto {
+  return isRecord(value) && typeof value.taskId === "string" && typeof value.projectId === "string" && isOneOf(value.taskState, TASK_STATES) && typeof value.taskVersion === "number" && isOneOf(value.isolationStatus, ISOLATION_STATUSES) && typeof value.branchIdentity === "string" && isNullableString(value.baseBranch) && isNullableString(value.baseCommit) && (value.blocker === null || isOneOf(value.blocker, ISOLATION_BLOCKERS));
 }
 
 function isProjectDtoArray(value: unknown): value is ProjectDto[] {

@@ -78,7 +78,7 @@ it("keeps the page usable when auxiliary calls fail", async () => {
   expect(screen.getByRole("status")).toHaveTextContent("IPC_REQUEST_FAILED");
 });
 
-it("renders safe core errors and retries the same four requests", async () => {
+it("renders safe core errors and retries the same five requests", async () => {
   const getSystemStatus = vi
     .fn()
     .mockRejectedValueOnce(
@@ -93,6 +93,7 @@ it("renders safe core errors and retries the same four requests", async () => {
   const getVersion = vi.fn(async () => version);
   const getHealth = vi.fn(async () => health);
   const getBootstrapStatus = vi.fn(async () => bootstrapStatus);
+  const getLegacyMigrationDiagnostic = vi.fn(async () => null);
   render(
     <SystemPage
       client={createFakeClient({
@@ -100,6 +101,7 @@ it("renders safe core errors and retries the same four requests", async () => {
         getHealth,
         getSystemStatus,
         getBootstrapStatus,
+        getLegacyMigrationDiagnostic,
       })}
     />,
   );
@@ -111,6 +113,35 @@ it("renders safe core errors and retries the same four requests", async () => {
   expect(getVersion).toHaveBeenCalledTimes(2);
   expect(getHealth).toHaveBeenCalledTimes(2);
   expect(getBootstrapStatus).toHaveBeenCalledTimes(2);
+  expect(getLegacyMigrationDiagnostic).toHaveBeenCalledTimes(2);
+});
+
+it("renders only safe legacy migration identity diagnostics when startup is blocked", async () => {
+  render(
+    <SystemPage
+      client={createFakeClient({
+        getSystemStatus: async () => {
+          throw new FrontendError({
+            code: "APP_MIGRATION_FAILURE",
+            message: "Local database migration failed.",
+            severity: "critical",
+            retry: "never",
+          });
+        },
+        getLegacyMigrationDiagnostic: async () => ({
+          projectId: "01900000-project",
+          displayPath: "%USERPROFILE%\\repo",
+          reasonCode: "stable filesystem identity was not confirmed",
+        }),
+      })}
+    />,
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Legacy project verification stopped" }),
+  ).toBeVisible();
+  expect(screen.getByText("01900000-project")).toBeVisible();
+  expect(screen.getByText("%USERPROFILE%\\repo")).toBeVisible();
+  expect(document.body.textContent).not.toContain("C:\\private");
 });
 
 it("does not render extra source, path, SQL, SID, or secret fields", async () => {

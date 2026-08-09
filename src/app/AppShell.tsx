@@ -10,7 +10,7 @@ export function AppShell() {
           </span>
           <div>
             <strong>ChatOMS</strong>
-            <span>Phase 1</span>
+            <span>Phase 2</span>
           </div>
         </div>
         <nav className="navigation" aria-label="Primary">

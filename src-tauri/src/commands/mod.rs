@@ -1,13 +1,22 @@
+pub mod git_isolation;
 pub mod projects;
 pub mod system;
 pub mod tasks;
 
-pub const REGISTERED_HANDLERS: [&str; 8] = [
+pub const REGISTERED_HANDLERS: [&str; 16] = [
     "get_version",
     "get_health",
     "get_system_status",
     "get_bootstrap_status",
+    "get_legacy_migration_diagnostic",
     "list_projects",
+    "inspect_project_candidate",
+    "register_project",
+    "get_project_git_status",
+    "create_isolation_task",
+    "get_task_isolation",
+    "approve_git_initialization",
+    "create_task_worktree",
     "get_active_task",
     "get_task",
     "list_task_history",

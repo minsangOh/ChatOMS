@@ -42,6 +42,10 @@
 
 Phase 1에서는 이 분류를 실제 Git, CLI 또는 네트워크 실행에 사용하지 않으며 관련 port와 정책 타입만 준비한다.
 
+Phase 2에서는 의미 기반 Git allowlist만 실제 실행한다. 허용 대상은 repository/status/HEAD 조회, 승인된 local `git init`과 initial snapshot, task branch/worktree 생성·검증뿐이다. Shell 문자열, fetch, pull, push, remote 변경, 기본 브랜치 쓰기와 branch/worktree 삭제는 adapter 계약에서 제외한다.
+
+Git 초기화 승인은 project ID, task ID와 expected task version에 결합하며 승인 전에는 `.git`, 파일 또는 commit mutation을 수행하지 않는다. `.gitignore`와 Git author 설정을 자동 생성·변경하지 않는다.
+
 ## 네트워크 정책
 
 ### 읽기 허용 목록
@@ -93,6 +97,16 @@ Claude/Codex에 Context Package와 코드 문맥을 보내는 행위도 외부 �
 ### 대상 프로젝트 migration
 
 대상 프로젝트의 schema 파일 생성·변경, migration 생성·실행과 데이터 변환은 모두 사용자 별도 승인이 필요하다. ChatOMS 내부 migration의 자동 실행 정책을 대상 프로젝트에 적용하지 않는다.
+
+## Phase 2 local Git mutation 경계
+
+- Windows `DRIVE_FIXED` local directory만 지원한다. 프로젝트 입력은 첫 Git 호출 전에, app/control/worktree 경로는 첫 directory 생성 전에 nearest existing ancestor trust gate를 통과해야 한다. UNC, mapped·device network path, removable·RAM·CD-ROM·unknown drive, Cloud Files sync root·offline·recall·placeholder content와 identity를 확인할 수 없는 reparse root를 거부하며, deterministic 거부에서는 관리 directory를 만들지 않는다. 검증 뒤 ancestor replacement가 관찰되면 생성·Git 실행·완료를 중단하고 이미 생성된 앱 경로도 자동 삭제하지 않는다.
+- canonical path 문자열만 신뢰하지 않고 volume serial, directory file ID, repository kind와 Git common-dir identity를 저장·재검증한다. Mutation 중에는 directory handle guard로 일반 rename/rebind 경쟁을 차단한다.
+- Git executable은 부모 PATH에서 찾지 않는다. HKLM Git for Windows installer candidate를 final path, fixed drive, stable identity, pinned Authenticode signer와 runtime root·`cmd`/`mingw64/bin`·`libexec/git-core` boundary로 검증한다. 64-bit registry record가 있으면 그 record의 candidate 검증 실패를 32-bit record로 fallback하지 않으며, 64-bit record가 없을 때만 32-bit record를 검사한다. 서로 다른 두 valid root도 ambiguity로 거부한다. 실행 중 runtime/certificate 변경은 다른 후보로 fallback하지 않고 fail-closed다. 모든 명령은 `env_clear` 후 app-owned current directory, controlled PATH, controlled absolute `GIT_EXEC_PATH`, absolute `git -C <verified-root>`에서 실행한다.
+- Active filter attribute와 Git LFS, repository local `filter.*`/`include.*`/`includeIf.*`, linked worktree, separate git-dir와 bare repository는 Phase 2에서 지원하지 않는다. 정적 repository와 preflight 시점의 effective attributes/config가 filter process를 실행하지 못하게 차단한다. 같은 사용자 권한의 악성 동시 프로세스가 최종 검증 직후 attributes/config를 교체하는 공격은 Phase 2 threat model 밖의 accepted residual risk이며, 사후 불일치가 관찰되면 완료 대신 `RecoveryRequired`로 전이한다.
+- Git 실패·부분 성공·사후 검증 실패에서는 `worktree remove`, `--force`, `branch -D`, 자동 ref 삭제, 소유권 추정과 자동 재실행을 하지 않는다. Durable evidence와 `RecoveryRequired`를 기록하고 lease를 유지한다.
+- Git capability는 asInvoker process에서만 제공한다. Windows token이 elevated, full-elevation 또는 high-integrity이면 ACL 판정을 완화하지 않고 unavailable로 처리한다. linked limited token을 자동 사용하거나 self-de-elevation하지 않으며, 사용자는 관리자 권한 없이 다시 실행해야 한다.
+- Startup reconciliation은 읽기 전용 Git 진단과 DB 상태 확정만 수행한다. 정확한 성공 receipt가 없는 외부 효과를 성공으로 추정하지 않는다.
 
 ## 앱 데이터 경로와 Windows ACL
 

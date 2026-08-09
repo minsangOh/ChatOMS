@@ -7,7 +7,10 @@ use chatoms_domain::{
     TaskState, TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot,
 };
 use chatoms_infrastructure::database::{DatabaseConnection, SqliteFoundationRepository};
-use chatoms_ports::repository::{FoundationRepository, RepositoryError, RepositoryErrorCode};
+use chatoms_ports::repository::{
+    FoundationRepository, GitIsolationStatus, GitOperationReceiptKind, RepositoryError,
+    RepositoryErrorCode, TaskGitIsolation,
+};
 use rusqlite::params;
 
 use support::{
@@ -108,6 +111,120 @@ fn advance(
 
 fn assert_code(error: RepositoryError, code: RepositoryErrorCode) {
     assert_eq!(error.code(), code, "unexpected repository error: {error}");
+}
+
+#[test]
+fn isolation_task_intent_and_domain_transition_commit_atomically() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let mut task = Task::new(TaskId::new(), fixture.project_id, 100);
+    let initial = initial_transition(&task);
+    task.transition_to(TaskState::ProjectValidated, 101)
+        .expect("classify project");
+    let classified = transition(TaskStateTransitionId::new(), &task, TaskState::Created, 101);
+    let mut isolation = TaskGitIsolation {
+        task_id: task.id(),
+        project_id: fixture.project_id,
+        status: GitIsolationStatus::Ready,
+        operation_id: None,
+        expected_task_version: 1,
+        base_branch: None,
+        base_commit: None,
+        worktree_path: None,
+        branch_created_by_app: false,
+        worktree_created_by_app: false,
+        created_at_ms: 100,
+        updated_at_ms: 101,
+    };
+    repository
+        .create_isolation_task(&task, &initial, &classified, 100, &isolation)
+        .expect("atomic isolation task");
+    assert_eq!(
+        repository
+            .list_task_transitions(task.id())
+            .expect("history")
+            .len(),
+        2
+    );
+    assert_eq!(
+        repository.get_task_isolation(task.id()).expect("isolation"),
+        Some(isolation.clone())
+    );
+
+    let previous = task.state();
+    task.transition_to(TaskState::WorktreeCreating, 102)
+        .expect("worktree intent state");
+    let worktree_transition = transition(TaskStateTransitionId::new(), &task, previous, 102);
+    isolation.status = GitIsolationStatus::WorktreeCreating;
+    isolation.operation_id = Some(chatoms_domain::GitOperationId::new());
+    isolation.expected_task_version = task.version();
+    isolation.base_branch = Some("main".to_owned());
+    isolation.base_commit = Some("a".repeat(40));
+    isolation.worktree_path = Some("C:/managed/project/task".to_owned());
+    isolation.updated_at_ms = 102;
+    repository
+        .save_isolation_transition(1, &task, &worktree_transition, &isolation)
+        .expect("atomic Git intent transition");
+    let operation_id = isolation.operation_id.expect("operation id");
+    for kind in [
+        GitOperationReceiptKind::CommandStarted,
+        GitOperationReceiptKind::CommandSucceeded,
+        GitOperationReceiptKind::PostVerified,
+    ] {
+        repository
+            .append_git_operation_receipt(operation_id, kind, None, 102)
+            .expect("durable operation receipt");
+    }
+    assert_eq!(
+        repository.get_task(task.id()).expect("task"),
+        Some(task.clone())
+    );
+    assert_eq!(
+        repository.get_task_isolation(task.id()).expect("isolation"),
+        Some(isolation.clone())
+    );
+    assert_eq!(
+        repository
+            .list_task_transitions(task.id())
+            .expect("history")
+            .len(),
+        3
+    );
+
+    let previous = task.state();
+    task.transition_to(TaskState::WorktreeReady, 103)
+        .expect("worktree ready state");
+    let ready_transition = transition(TaskStateTransitionId::new(), &task, previous, 103);
+    isolation.status = GitIsolationStatus::WorktreeReady;
+    isolation.expected_task_version = task.version();
+    isolation.branch_created_by_app = true;
+    isolation.worktree_created_by_app = true;
+    isolation.updated_at_ms = 103;
+    repository
+        .save_worktree_completion(2, &task, &ready_transition, &isolation)
+        .expect("receipt, transition, and isolation complete atomically");
+    assert!(
+        repository
+            .list_incomplete_git_operations()
+            .expect("incomplete attempts")
+            .is_empty()
+    );
+    let receipts = repository
+        .list_git_operation_receipts(operation_id)
+        .expect("operation receipts");
+    assert_eq!(receipts.len(), 4);
+    assert_eq!(
+        receipts.last().map(|receipt| receipt.kind),
+        Some(GitOperationReceiptKind::CompletionRecorded)
+    );
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("lease")
+            .map(|lease| lease.task_id),
+        Some(task.id())
+    );
 }
 
 #[test]

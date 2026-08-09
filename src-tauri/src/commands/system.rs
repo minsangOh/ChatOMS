@@ -1,7 +1,11 @@
 use chatoms_application::system::SystemService;
+use chatoms_ports::git::GitService;
 
 use crate::{
-    dto::{BootstrapStatusDto, HealthDto, HealthStateDto, SystemStatusDto, VersionDto},
+    dto::{
+        BootstrapStatusDto, HealthDto, HealthStateDto, LegacyMigrationDiagnosticDto,
+        SystemStatusDto, VersionDto,
+    },
     error::IpcErrorDto,
     state::{ManagedRuntime, RuntimeState},
 };
@@ -45,10 +49,16 @@ pub fn handle_get_system_status(runtime: &ManagedRuntime) -> Result<SystemStatus
     match &mut *state {
         RuntimeState::Ready(ready) => {
             let mut service = SystemService::new(&ready.bootstrap_status, &mut ready.capabilities);
-            service
+            let mut status = service
                 .get_system_status()
                 .map(SystemStatusDto::from)
-                .map_err(IpcErrorDto::from)
+                .map_err(IpcErrorDto::from)?;
+            status.capabilities.git_execution = if ready.git.is_available().unwrap_or(false) {
+                crate::dto::CapabilityStatusDto::Supported
+            } else {
+                crate::dto::CapabilityStatusDto::Unavailable
+            };
+            Ok(status)
         }
         RuntimeState::Unavailable(unavailable) => Err(unavailable.error.clone().into()),
     }
@@ -66,6 +76,19 @@ pub fn handle_get_bootstrap_status(
             .map(BootstrapStatusDto::from)
             .ok_or_else(|| unavailable.error.clone().into()),
     }
+}
+
+pub fn handle_get_legacy_migration_diagnostic(
+    runtime: &ManagedRuntime,
+) -> Result<Option<LegacyMigrationDiagnosticDto>, IpcErrorDto> {
+    let state = runtime.lock()?;
+    Ok(match &*state {
+        RuntimeState::Ready(_) => None,
+        RuntimeState::Unavailable(unavailable) => unavailable
+            .migration_diagnostic
+            .clone()
+            .map(LegacyMigrationDiagnosticDto::from),
+    })
 }
 
 #[tauri::command]
@@ -90,4 +113,11 @@ pub fn get_bootstrap_status(
     state: tauri::State<'_, ManagedRuntime>,
 ) -> Result<BootstrapStatusDto, IpcErrorDto> {
     handle_get_bootstrap_status(&state)
+}
+
+#[tauri::command]
+pub fn get_legacy_migration_diagnostic(
+    state: tauri::State<'_, ManagedRuntime>,
+) -> Result<Option<LegacyMigrationDiagnosticDto>, IpcErrorDto> {
+    handle_get_legacy_migration_diagnostic(&state)
 }

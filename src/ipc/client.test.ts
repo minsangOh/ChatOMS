@@ -13,6 +13,7 @@ describe("typed IPC client", () => {
     await client.getHealth();
     await client.getSystemStatus();
     await client.getBootstrapStatus();
+    await client.getLegacyMigrationDiagnostic();
     await client.listProjects();
     await client.getActiveTask();
     await client.getTask("task-id");
@@ -23,12 +24,13 @@ describe("typed IPC client", () => {
       ["get_health", undefined],
       ["get_system_status", undefined],
       ["get_bootstrap_status", undefined],
+      ["get_legacy_migration_diagnostic", undefined],
       ["list_projects", undefined],
       ["get_active_task", undefined],
       ["get_task", { taskId: "task-id" }],
       ["list_task_history", { taskId: "task-id" }],
     ]);
-    expect(Object.values(IPC_COMMANDS)).toHaveLength(8);
+    expect(Object.values(IPC_COMMANDS)).toHaveLength(16);
   });
 
   it("returns a validated result and rejects malformed success data safely", async () => {
@@ -40,6 +42,27 @@ describe("typed IPC client", () => {
       code: "IPC_INVALID_RESPONSE",
       message: "The application returned an invalid response.",
     });
+  });
+
+  it("uses purpose-specific Phase 2 mutation commands with version-bound payloads", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.inspectProjectCandidate("C:\\repo");
+    await client.registerProject("C:\\repo", "token");
+    await client.getProjectGitStatus("project-id");
+    await client.createIsolationTask("project-id");
+    await client.getTaskIsolation("task-id");
+    await client.approveGitInitialization("task-id", 1);
+    await client.createTaskWorktree("task-id", 2);
+    expect(transport.mock.calls).toEqual([
+      ["inspect_project_candidate", { inputPath: "C:\\repo" }],
+      ["register_project", { inputPath: "C:\\repo", confirmationToken: "token", name: null }],
+      ["get_project_git_status", { projectId: "project-id" }],
+      ["create_isolation_task", { projectId: "project-id" }],
+      ["get_task_isolation", { taskId: "task-id" }],
+      ["approve_git_initialization", { taskId: "task-id", expectedVersion: 1 }],
+      ["create_task_worktree", { taskId: "task-id", expectedVersion: 2 }],
+    ]);
   });
 
   it("keeps only approved IPC error fields and masks string or unknown failures", async () => {
@@ -81,7 +104,15 @@ const responses: Record<string, unknown> = {
   get_health: health,
   get_system_status: systemStatus,
   get_bootstrap_status: bootstrapStatus,
+  get_legacy_migration_diagnostic: null,
   list_projects: [],
+  inspect_project_candidate: { suggestedName: "Repo", displayPath: "%USERPROFILE%\\repo", confirmationToken: "token", repositoryKind: "git", repositoryStatus: { clean: true, detachedHead: false, currentBranch: "main", headCommit: "a".repeat(40) } },
+  register_project: { id: "project-id", name: "Repo", displayPath: "%USERPROFILE%\\repo", createdAtMs: 1, updatedAtMs: 1 },
+  get_project_git_status: { projectId: "project-id", repositoryKind: "git", repositoryStatus: { clean: true, detachedHead: false, currentBranch: "main", headCommit: "a".repeat(40) } },
+  create_isolation_task: { taskId: "task-id", projectId: "project-id", taskState: "projectValidated", taskVersion: 1, isolationStatus: "ready", branchIdentity: "ai-task/task-id", baseBranch: null, baseCommit: null, blocker: null },
+  get_task_isolation: { taskId: "task-id", projectId: "project-id", taskState: "projectValidated", taskVersion: 1, isolationStatus: "ready", branchIdentity: "ai-task/task-id", baseBranch: null, baseCommit: null, blocker: null },
+  approve_git_initialization: { taskId: "task-id", projectId: "project-id", taskState: "gitInitialized", taskVersion: 2, isolationStatus: "ready", branchIdentity: "ai-task/task-id", baseBranch: null, baseCommit: null, blocker: null },
+  create_task_worktree: { taskId: "task-id", projectId: "project-id", taskState: "worktreeReady", taskVersion: 3, isolationStatus: "worktreeReady", branchIdentity: "ai-task/task-id", baseBranch: "main", baseCommit: "a".repeat(40), blocker: null },
   get_active_task: null,
   get_task: {
     id: "task-id",

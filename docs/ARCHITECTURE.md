@@ -27,7 +27,7 @@ flowchart TB
 - 시스템 상태, 프로젝트, 작업 진행, 승인, 결과와 복구 정보를 표시한다.
 - Git, CLI, SQLite, 파일 시스템 또는 네트워크를 직접 호출하지 않는다.
 - Rust application service가 노출한 Tauri command를 호출하고 event stream을 구독한다.
-- Phase 1 UI는 앱 셸, 기본 라우팅, 시스템 상태, 프로젝트 빈 화면과 공통 오류 표시에 한정한다.
+- Phase 2 UI는 앱 셸, 시스템 상태, 프로젝트 등록·상태 조회와 task isolation 생성·복구 상태 표시를 제공한다.
 
 ### Tauri IPC
 
@@ -49,7 +49,7 @@ flowchart TB
 
 ### Ports, adapters, infrastructure
 
-- Ports는 공급자, Git, 프로세스, 저장소, 플랫폼과 업데이트 기능의 계약을 정의한다.
+- Ports는 현재 Phase가 필요로 하는 의미 기반 공급자, Git, 저장소, 플랫폼과 업데이트 계약을 정의한다. 구현되지 않은 후속 Phase port를 선제 노출하지 않는다.
 - Adapters는 Claude CLI, Codex app-server, Git/worktree와 구조화 프로세스 실행을 구현한다.
 - Infrastructure는 SQLite repository, artifact 저장소, 로깅, 마스킹과 OS별 서비스를 구현한다.
 - Phase 1~6의 UpdateService는 추상화만 존재하며 실제 배포 채널과 설치 동작은 Phase 7 전 결정한다.
@@ -57,11 +57,13 @@ flowchart TB
 | Port | 책임 | Adapter / infrastructure 경계 |
 |---|---|---|
 | `ProviderService` | 공급자 실행, event 변환, capability 검증 | Claude CLI adapter, Codex app-server adapter |
-| `GitService` | 저장소 조회, task branch/worktree 생명주기, commit·merge | Git/worktree adapter |
-| `ProcessRunner` | 프로그램과 인수 배열 기반 실행, 출력·종료 제어 | OS별 structured process adapter |
+| `GitService` | 저장소 감지·상태 조회, 승인된 초기화, 기준 commit과 task branch/worktree 생성·검증 | `chatoms-infrastructure` Git adapter |
+| `ProcessRunner` | 프로그램과 인수 배열 기반 실행, 출력·종료 제어 | Phase 3에서 공급자 실행과 함께 추가 |
 | `ArtifactRepository` | 마스킹된 로그, diff, 결과와 첨부파일 저장·조회 | 로컬 artifact infrastructure |
 | `FilePermissionService` | 앱 데이터 경로의 사용자 전용 권한 적용·검증 | Windows/macOS platform adapter |
 | `UpdateService` | 업데이트 상태와 향후 업데이트 동작의 계약 | Phase 1~6에는 port만 정의하고 구현은 Phase 7 결정 이후 추가 |
+
+이 표는 전체 목표 경계를 설명한다. 현재 source 기준으로 repository·path·permission·bootstrap·time port와 Phase 2 의미 기반 `GitService`가 있고, `ProviderService`와 범용 `ProcessRunner`는 Phase 3, 실제 `UpdateService`는 Phase 7에서 추가한다.
 
 ## 컴파일 의존 방향
 
@@ -169,7 +171,8 @@ Windows를 우선 구현하며 WSL은 MVP 지원 범위에서 제외한다.
 ### 안전한 앱 데이터 경로
 
 - `AppPathResolver` port는 경로 계산과 layout 검증만 담당하고, `FilesystemPermissionManager` port는 ACL 적용과 재검증만 담당한다.
-- Windows 구현은 `%LOCALAPPDATA%\ChatOMS` 아래에 `data`, `logs`, `artifacts`, `temp`를 분리하며 DB는 `data\chatoms.sqlite3`에 둔다.
+- Windows 구현은 `%LOCALAPPDATA%\ChatOMS` 아래에 `data`, `logs`, `artifacts`, `temp`, `worktrees`를 분리하며 DB는 `data\chatoms.sqlite3`에 둔다.
+- Phase 2 worktree는 검증된 `worktrees\<project-id>\<task-id>` 경로에만 생성하고 프로젝트 sibling이나 `temp`에는 생성하지 않는다.
 - `SecureAppPaths`는 절대 local layout 확인, reparse point 거부, directory 생성, 권한 적용과 재검증 순서로 준비하며 `Secure`가 아닌 결과에는 validated path를 반환하지 않는다.
 - Application layer는 `SecureAppPaths`가 반환한 경로만 영구 SQLite, log와 artifact 저장에 사용한다.
 - macOS는 Phase 1에서 동일 port의 compile 구조와 `Unsupported` permission 결과만 제공하며 실제 경로·권한 검증은 macOS 환경에서 후속 수행한다.
@@ -183,7 +186,7 @@ Windows를 우선 구현하며 WSL은 MVP 지원 범위에서 제외한다.
 - Production logging은 `SecureAppPaths` 결과와 `PermissionStatus::Secure`로 만든 validated logs directory만 받고, ANSI 없는 structured JSON을 non-blocking daily rolling file로 기록한다.
 - 이 계약은 application의 stable `ApplicationError` mapping, Tauri IPC의 safe `IpcErrorDto`, frontend의 `FrontendError` safe field 표시까지 연결됐다. Read-only IPC와 `/system`, `/projects` UI가 구현됐으며 source, path, SID, SQL과 secret은 사용자 오류에 노출하지 않는다.
 
-## Phase 1 application service
+## Phase 1 application service (기반 이력)
 
 - Application은 `BootstrapService`, `SystemService`, `ProjectService`, `TaskService`로 분리하며 각 서비스는 필요한 port만 빌려 사용한다. Global singleton이나 concrete adapter service locator는 두지 않는다.
 - Bootstrap 순서는 secure storage 준비 → database bootstrap → logging bootstrap → active lease 조회다. Storage가 secure하지 않으면 뒤 단계를 호출하지 않고, database가 ready/upgraded가 아니면 logging과 lease 조회를 호출하지 않는다.
@@ -193,7 +196,7 @@ Windows를 우선 구현하며 WSL은 MVP 지원 범위에서 제외한다.
 - 정적 전이, pause 진입, `RecoveryRequired` 진입과 terminal 전이는 domain aggregate를 거쳐 repository transaction port로 저장한다. Resume/recovery target 확정은 실제 validation capability가 없으므로 Phase 1 현재 API에서 `Unsupported`로 보류하며 validation token을 임의 생성하지 않는다.
 - 시간은 `TimeProvider` port로 주입하며 production에서는 검증된 Unix epoch milliseconds를 반환하는 `SystemTimeProvider`를 Tauri composition root가 연결한다.
 
-## Phase 1 production adapter와 Tauri IPC
+## Phase 1 production adapter와 Tauri IPC (기반 이력)
 
 - Tauri composition root가 platform storage·time·capability adapter와 infrastructure database·logging·repository adapter를 구성하고 `BootstrapService`에 주입한다. Application service는 concrete adapter를 알지 못한다.
 - Production startup은 한 번만 수행한다. Secure path, 단일 SQLite connection owner와 non-blocking logging guard는 managed runtime이 공유 소유하고, command마다 bootstrap이나 connection open을 반복하지 않는다.
@@ -201,13 +204,28 @@ Windows를 우선 구현하며 WSL은 MVP 지원 범위에서 제외한다.
 - Managed runtime은 `Ready(AppRuntime)`와 `Unavailable`을 구분한다. Secure storage·database 실패는 unavailable이며 logging 실패는 raw fallback 없이 degraded ready다. Unavailable에서도 version과 health만 안전하게 조회할 수 있다.
 - Tauri command는 managed state 획득, application service 호출, application read model의 IPC DTO 변환, safe IPC error 변환만 수행한다. SQL, filesystem, ACL, migration 또는 process를 직접 호출하지 않는다.
 - IPC DTO는 camelCase와 안정적인 enum 문자열을 사용한다. UUID는 lowercase canonical 문자열, timestamp는 Unix epoch milliseconds이며 `ProjectDto`에는 전체 root path를 포함하지 않는다.
-- Phase 1 handler는 `get_version`, `get_health`, `get_system_status`, `get_bootstrap_status`, `list_projects`, `get_active_task`, `get_task`, `list_task_history`만 등록한다. Create·transition·Git·provider·updater·installer command는 공개하지 않는다.
+- Phase 1에서 도입한 read-only handler는 그대로 유지한다. Phase 2는 `inspect_project_candidate`, `register_project`, `get_project_git_status`, `create_isolation_task`, `get_task_isolation`, `approve_git_initialization`, `create_task_worktree` 목적별 handler만 추가하며 generic transition·provider·updater·installer command는 공개하지 않는다.
 
-## Phase 1 frontend
+## Phase 1 frontend (기반 이력)
 
 - React page는 Tauri `invoke`를 직접 호출하지 않는다. 중앙 typed IPC client가 승인된 command 문자열, camelCase payload, response guard와 safe frontend error 변환을 소유한다.
 - Frontend type은 Rust IPC DTO의 camelCase 필드와 안정적 enum 문자열을 그대로 반영한다. Transport 결과는 `unknown`으로 받고 DTO별 runtime guard를 통과한 값만 page state에 전달한다.
 - `/system`은 system·bootstrap status를 중심으로 version, health, storage, database, logging, active lease와 Phase 1 capability를 read-only로 표시한다. 핵심 호출 실패는 safe error state, 보조 호출 실패는 기존 application status를 변경하지 않는 partial notice로 처리한다.
-- `/projects`는 project name, canonical ID와 timestamp만 표시하며 root path를 frontend type과 render tree에 포함하지 않는다. 등록·수정·삭제 또는 task 생성 action은 제공하지 않는다.
+- Phase 2 `/projects`는 project name, ID, timestamp와 안전한 display path를 표시하고 등록·Git 상태 조회·task isolation action을 제공한다. canonical root path는 frontend type과 render tree에 포함하지 않는다.
 - Router와 page는 React local state만 사용한다. 별도 state manager, query cache, UI library 또는 CSS framework를 추가하지 않는다.
 - 공통 loading, empty, error와 status badge는 semantic role, 텍스트 label, visible focus와 retry disposition을 적용하며 raw invoke error, source, path, SQL, SID, stack 또는 secret을 표시하지 않는다.
+
+## Phase 2 프로젝트와 Git isolation
+
+- 프로젝트 후보 검사는 첫 Git probe 전에 mutation 없이 존재하는 `DRIVE_FIXED` local directory의 final path와 Windows volume serial/directory file ID를 조회한다. Git 하위 경로는 enclosing repository root를 반환하고 사용자가 확인한 뒤 root와 Git common-dir stable identity를 저장한다. app/control/worktree path는 nearest existing ancestor를 검증한 뒤 한 component씩 생성하고 매 단계 final identity를 재검증한다. canonical 문자열은 표시 보조 정보일 뿐 mutation identity가 아니다. UNC, mapped·device network path, removable·RAM·CD-ROM·unknown drive, Cloud Files sync root·placeholder, linked worktree, separate git-dir, bare repository와 확인 불가능한 reparse root/common-dir를 거부한다.
+- canonical root path는 repository와 Git adapter에만 전달한다. 일반 IPC는 사용자 홈을 `%USERPROFILE%`로 치환한 display path를 사용하고 오류·로그에는 원본 경로를 넣지 않는다.
+- Application은 `register_project`, `approve_git_initialization`, `create_task_worktree`처럼 목적별 use case만 노출한다. generic task transition은 mutation IPC가 아니다.
+- `GitService`는 raw process가 아닌 repository probe, status, init, initial snapshot과 branch/worktree 생성·검증 의미만 제공한다. 자동 보상·삭제 의미는 port에 노출하지 않는다. Adapter는 stable identity가 검증된 absolute executable과 argument 배열을 전달하고 `env_clear` 기반 최소 환경을 사용하며 shell 및 remote Git operation을 허용하지 않는다.
+- task isolation 시작은 clean tracked/untracked status, attached current branch와 기존 HEAD commit을 모두 요구한다. Dirty, detached, unborn 상태는 안전한 원인·해결 안내와 함께 차단한다.
+- 비-Git 프로젝트는 project·task·expected version·project identity revision에 묶인 일회용 승인 전에는 mutation하지 않는다. 승인 후에도 Git author가 없으면 initial snapshot을 만들지 않는다. `git add` 전 working tree attributes와 stage 후 index attributes에 active filter가 없어야 하며, snapshot receipt OID와 최종 clean HEAD가 정확히 일치할 때만 `GitInitialized`를 확정한다.
+- 기존 Git 프로젝트는 base commit의 attributes 계층과 `$GIT_DIR/info/attributes`를 검사한다. system/global attributes를 차단하고 active filter·Git LFS를 지원하지 않는다. info attributes identity 또는 내용이 preflight 후 변경되면 완료하지 않는다.
+- SQLite와 Git 효과는 원자적이지 않으므로 immutable operation intent와 command-start evidence를 먼저 commit한다. 외부 단계가 성공할 때마다 durable receipt를 추가하고 stable root/common-dir/worktree identity, 원본 checkout branch·HEAD, task branch·base commit과 clean 상태를 재검증한다. `CompletionRecorded` receipt, task transition과 isolation summary는 하나의 SQLite transaction으로 commit한다.
+- Git command의 non-zero, receipt 저장 실패, 부분 성공, 경쟁 선점 또는 사후 검증 실패에서는 자동 삭제·재실행·소유권 추정을 하지 않고 `RecoveryRequired`로 전이한다. `worktree remove`, `--force`, `branch -D`와 자동 ref 삭제는 Phase 2 실행 경로에 없다.
+- Startup reconciliation은 in-progress operation과 receipt를 읽기 전용으로 검사한다. 정확한 성공 receipt와 실제 상태가 모두 일치할 때만 완료 transaction을 재구성하고 그 밖에는 `RecoveryRequired`로 전이한다. lease는 유지하며 lease/task 불일치는 corruption으로 fail-closed한다.
+- 0001 → 0002 migration은 legacy project root의 stable identity preflight를 SQL 적용 전에 수행한다. missing root, 지원하지 않는 storage, identity 불명확 또는 stable-ID 중복이면 전체 migration을 중단하며 자동 병합·삭제하지 않는다.
+- Phase 2에는 cleanup operation이 없다. 보존 기간과 완료 작업의 일반 수명주기 정리는 Phase 6 책임이다.
