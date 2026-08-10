@@ -9,40 +9,32 @@ use chatoms_domain::ProjectId;
 use crate::{
     dto::{ProjectCandidateDto, ProjectDto, ProjectStatusDto},
     error::IpcErrorDto,
-    state::{ManagedRuntime, RuntimeState},
+    state::ManagedRuntime,
 };
 
 pub fn handle_list_projects(runtime: &ManagedRuntime) -> Result<Vec<ProjectDto>, IpcErrorDto> {
-    let mut state = runtime.lock()?;
-    match &mut *state {
-        RuntimeState::Ready(ready) => ProjectService::new(&mut ready.repository)
-            .list_projects()
-            .map(|projects| projects.into_iter().map(ProjectDto::from).collect())
-            .map_err(IpcErrorDto::from),
-        RuntimeState::Unavailable(unavailable) => Err(unavailable.error.clone().into()),
-    }
+    let mut ready = runtime.ready_snapshot()?;
+    ProjectService::new(&mut ready.repository)
+        .list_projects()
+        .map(|projects| projects.into_iter().map(ProjectDto::from).collect())
+        .map_err(IpcErrorDto::from)
 }
 
 pub fn handle_inspect_project_candidate(
     runtime: &ManagedRuntime,
     input_path: &str,
 ) -> Result<ProjectCandidateDto, IpcErrorDto> {
-    let mut state = runtime.lock()?;
-    match &mut *state {
-        RuntimeState::Ready(ready) => {
-            let mut service = ProjectMutationService::new(
-                &mut ready.repository,
-                &mut ready.git,
-                &mut ready.filesystem,
-                &mut ready.time,
-            );
-            service
-                .inspect_candidate(input_path)
-                .map(ProjectCandidateDto::from)
-                .map_err(Into::into)
-        }
-        RuntimeState::Unavailable(unavailable) => Err(unavailable.error.clone().into()),
-    }
+    let mut ready = runtime.ready_snapshot()?;
+    let mut service = ProjectMutationService::new(
+        &mut ready.repository,
+        &mut ready.git,
+        &mut ready.filesystem,
+        &mut ready.time,
+    );
+    service
+        .inspect_candidate(input_path)
+        .map(ProjectCandidateDto::from)
+        .map_err(Into::into)
 }
 
 pub fn handle_register_project(
@@ -51,26 +43,21 @@ pub fn handle_register_project(
     confirmation_token: String,
     name: Option<String>,
 ) -> Result<ProjectDto, IpcErrorDto> {
-    let mut state = runtime.lock()?;
-    match &mut *state {
-        RuntimeState::Ready(ready) => {
-            let mut service = ProjectMutationService::new(
-                &mut ready.repository,
-                &mut ready.git,
-                &mut ready.filesystem,
-                &mut ready.time,
-            );
-            service
-                .register_project(RegisterProjectRequest {
-                    input_path,
-                    confirmation_token,
-                    name,
-                })
-                .map(ProjectDto::from)
-                .map_err(Into::into)
-        }
-        RuntimeState::Unavailable(unavailable) => Err(unavailable.error.clone().into()),
-    }
+    let mut ready = runtime.ready_snapshot()?;
+    let mut service = ProjectMutationService::new(
+        &mut ready.repository,
+        &mut ready.git,
+        &mut ready.filesystem,
+        &mut ready.time,
+    );
+    service
+        .register_project(RegisterProjectRequest {
+            input_path,
+            confirmation_token,
+            name,
+        })
+        .map(ProjectDto::from)
+        .map_err(Into::into)
 }
 
 pub fn handle_get_project_git_status(
@@ -79,22 +66,17 @@ pub fn handle_get_project_git_status(
 ) -> Result<ProjectStatusDto, IpcErrorDto> {
     let project_id = ProjectId::from_str(project_id)
         .map_err(|error| IpcErrorDto::from(ApplicationError::from_domain(&error)))?;
-    let mut state = runtime.lock()?;
-    match &mut *state {
-        RuntimeState::Ready(ready) => {
-            let mut service = ProjectMutationService::new(
-                &mut ready.repository,
-                &mut ready.git,
-                &mut ready.filesystem,
-                &mut ready.time,
-            );
-            service
-                .project_status(project_id)
-                .map(ProjectStatusDto::from)
-                .map_err(Into::into)
-        }
-        RuntimeState::Unavailable(unavailable) => Err(unavailable.error.clone().into()),
-    }
+    let mut ready = runtime.ready_snapshot()?;
+    let mut service = ProjectMutationService::new(
+        &mut ready.repository,
+        &mut ready.git,
+        &mut ready.filesystem,
+        &mut ready.time,
+    );
+    service
+        .project_status(project_id)
+        .map(ProjectStatusDto::from)
+        .map_err(Into::into)
 }
 
 #[tauri::command]

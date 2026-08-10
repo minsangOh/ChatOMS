@@ -193,7 +193,7 @@ Windows를 우선 구현하며 WSL은 MVP 지원 범위에서 제외한다.
 - Logging unavailable은 raw fallback 없이 degraded 상태로 처리한다. Secure storage와 database가 준비됐다면 application bootstrap 자체는 ready이며 system health는 `Degraded`다.
 - System/project/task 결과는 Tauri 및 serde와 독립적인 application read model이다. IPC DTO는 Tauri 계층에서 별도로 정의하며 `ProjectDto`와 frontend에는 root path를 노출하지 않는다.
 - Task 생성 시 application이 UUIDv7 Task ID와 branch identity, 최초 `Created` transition을 구성하고 repository의 원자적 create boundary를 호출한다. 이후 sequence 값은 repository port가 history를 캡슐화해 제공하고 concrete repository가 transaction 안에서 재검증한다.
-- 정적 전이, pause 진입, `RecoveryRequired` 진입과 terminal 전이는 domain aggregate를 거쳐 repository transaction port로 저장한다. Resume/recovery target 확정은 실제 validation capability가 없으므로 Phase 1 현재 API에서 `Unsupported`로 보류하며 validation token을 임의 생성하지 않는다.
+- 정적 전이, pause 진입, `RecoveryRequired` 진입과 terminal 전이는 domain aggregate를 거쳐 repository transaction port로 저장한다. Resume/recovery target 확정은 실제 validation capability가 없으므로 현재 구현 API에서 `Unsupported`로 보류하며 validation token을 임의 생성하지 않는다.
 - 시간은 `TimeProvider` port로 주입하며 production에서는 검증된 Unix epoch milliseconds를 반환하는 `SystemTimeProvider`를 Tauri composition root가 연결한다.
 
 ## Phase 1 production adapter와 Tauri IPC (기반 이력)

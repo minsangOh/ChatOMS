@@ -12,11 +12,22 @@
 - 확정되지 않은 기능을 임의로 추가하지 않는다.
 - 요구사항과 구현이 충돌하면 구현 전에 사용자에게 보고한다.
 
+## 문서 우선순위
+
+1. `docs/PRODUCT_REQUIREMENTS.md`의 제품 요구사항
+2. `docs/DECISIONS.md`, `docs/SECURITY_POLICY.md`, `docs/STATE_MACHINE.md`의 확정 설계·보안·상태 불변조건
+3. `docs/PHASE_PLAN.md`의 구현 단계와 범위
+4. 이 파일의 현재 작업 규칙
+5. `README.md`의 사용자·개발자 안내
+
+같은 단계에서 충돌하거나 구현이 상위 문서와 다르면 임의로 해석하거나 구현하지 말고 사용자에게 보고한다. 이전 Phase 설명은 historical record이며 현재 작업 규칙이 아니다.
+
 ## 현재 구현 범위
 
-- 현재는 Phase 1만 구현한다.
-- Phase 1 범위 밖 기능을 선제 구현하지 않는다.
-- Phase 1에서는 실제 Git 명령, Claude/Codex 실행, 네트워크 요청, 업데이트 구현, branch/worktree 생성과 병합을 금지한다.
+- Phase 1과 Phase 2는 완료되었고, Phase 3이 다음 승인된 구현 범위다.
+- Phase 4 이상 기능을 선제 구현하지 않는다.
+- Phase 2의 목적별 local Git 격리는 유지한다. remote Git, 기본 브랜치 mutation, branch/worktree 삭제·정리와 병합은 여전히 구현 범위 밖이다.
+- Provider 실행, ProcessRunner, provider session과 Claude/Codex 연동은 Phase 3 범위이며, 별도 요구사항 승인 없이는 구현하지 않는다.
 
 ## 아키텍처
 

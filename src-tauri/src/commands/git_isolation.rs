@@ -3,11 +3,7 @@ use std::str::FromStr;
 use chatoms_application::{error::ApplicationError, git_isolation::GitIsolationService};
 use chatoms_domain::{ProjectId, TaskId};
 
-use crate::{
-    dto::TaskIsolationDto,
-    error::IpcErrorDto,
-    state::{ManagedRuntime, RuntimeState},
-};
+use crate::{dto::TaskIsolationDto, error::IpcErrorDto, state::ManagedRuntime};
 
 fn project_id(value: &str) -> Result<ProjectId, IpcErrorDto> {
     ProjectId::from_str(value).map_err(|error| ApplicationError::from_domain(&error).into())
@@ -33,22 +29,17 @@ fn with_service(
         ApplicationError,
     >,
 ) -> Result<TaskIsolationDto, IpcErrorDto> {
-    let mut state = runtime.lock()?;
-    match &mut *state {
-        RuntimeState::Ready(ready) => {
-            let mut service = GitIsolationService::new(
-                &mut ready.repository,
-                &mut ready.git,
-                &mut ready.filesystem,
-                &mut ready.worktree_paths,
-                &mut ready.time,
-            );
-            operation(&mut service)
-                .map(TaskIsolationDto::from)
-                .map_err(Into::into)
-        }
-        RuntimeState::Unavailable(unavailable) => Err(unavailable.error.clone().into()),
-    }
+    let mut ready = runtime.ready_snapshot()?;
+    let mut service = GitIsolationService::new(
+        &mut ready.repository,
+        &mut ready.git,
+        &mut ready.filesystem,
+        &mut ready.worktree_paths,
+        &mut ready.time,
+    );
+    operation(&mut service)
+        .map(TaskIsolationDto::from)
+        .map_err(Into::into)
 }
 
 pub fn handle_create_isolation_task(

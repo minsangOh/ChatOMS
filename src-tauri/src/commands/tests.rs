@@ -1,7 +1,10 @@
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
+    mpsc::{Receiver, Sender},
 };
+use std::thread;
+use std::time::Duration;
 
 use chatoms_application::{
     APPLICATION_VERSION,
@@ -176,6 +179,82 @@ impl GitService for GitCapabilityFake {
     }
 }
 
+struct BlockingGitCapabilityFake {
+    started: Sender<()>,
+    release: Receiver<()>,
+}
+
+impl GitService for BlockingGitCapabilityFake {
+    fn is_available(&mut self) -> Result<bool, PortFailure> {
+        self.started
+            .send(())
+            .map_err(|_| PortFailure::new(FailureCategory::Internal))?;
+        self.release
+            .recv()
+            .map_err(|_| PortFailure::new(FailureCategory::Internal))?;
+        Ok(true)
+    }
+
+    fn inspect_project(
+        &mut self,
+        _input: &std::path::Path,
+    ) -> Result<ProjectInspection, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn repository_status(
+        &mut self,
+        _root: &std::path::Path,
+    ) -> Result<RepositoryStatus, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn validate_non_git_source(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn validate_repository_source(
+        &mut self,
+        _root: &std::path::Path,
+        _base_commit: &str,
+    ) -> Result<RepositorySafetyToken, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn initialize_repository(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn has_commit_author(&mut self, _root: &std::path::Path) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn create_initial_snapshot(&mut self, _root: &std::path::Path) -> Result<String, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn create_task_worktree(
+        &mut self,
+        _root: &std::path::Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &std::path::Path,
+        _safety: &RepositorySafetyToken,
+    ) -> Result<WorktreeCreationOutcome, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn verify_task_worktree(
+        &mut self,
+        _root: &std::path::Path,
+        _branch: &str,
+        _base_commit: &str,
+        _worktree: &std::path::Path,
+    ) -> Result<bool, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+}
+
 fn ready_runtime(calls: Arc<CallCounts>) -> ManagedRuntime {
     ready_runtime_with_git(calls, Ok(true))
 }
@@ -210,6 +289,40 @@ fn ready_runtime_with_git(
     ))
 }
 
+fn ready_runtime_with_blocking_git(
+    calls: Arc<CallCounts>,
+    started: Sender<()>,
+    release: Receiver<()>,
+) -> ManagedRuntime {
+    ManagedRuntime::ready(AppRuntime::new(
+        BootstrapStatus {
+            storage_status: StorageStatus::Ready,
+            database_status: DatabaseStatus::Ready,
+            logging_status: LoggingStatus::Ready,
+            active_task_status: ActiveTaskStatus::None,
+            application_version: APPLICATION_VERSION,
+            ready: true,
+        },
+        RuntimePorts {
+            repository: RepositoryHandle::new(RepositoryFake { calls }),
+            time: TimeProviderHandle::new(TimeFake),
+            capabilities: CapabilityHandle::new(CapabilityFake),
+            git: crate::state::GitServiceHandle::new(BlockingGitCapabilityFake {
+                started,
+                release,
+            }),
+            filesystem: crate::state::FilesystemIdentityHandle::new(
+                chatoms_platform::filesystem::WindowsFilesystemIdentity,
+            ),
+            worktree_paths: crate::state::WorktreePathHandle::new(
+                chatoms_platform::ManagedWorktreePaths::windows_from_environment()
+                    .expect("test worktree paths"),
+            ),
+        },
+        RuntimeResources::default(),
+    ))
+}
+
 #[test]
 fn system_status_exposes_only_the_verified_git_capability_result() {
     let supported = ready_runtime_with_git(Arc::new(CallCounts::default()), Ok(true));
@@ -231,6 +344,11 @@ fn system_status_exposes_only_the_verified_git_capability_result() {
                 .capabilities
                 .git_execution,
             crate::dto::CapabilityStatusDto::Unavailable
+        );
+        assert!(
+            projects::handle_list_projects(&runtime)
+                .expect("Git capability does not block project list")
+                .is_empty()
         );
     }
 }
@@ -273,6 +391,49 @@ fn ready_system_and_empty_foundation_commands_use_services_once() {
     );
     assert_eq!(calls.projects.load(Ordering::SeqCst), 1);
     assert_eq!(calls.active.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn read_only_project_list_remains_available_while_git_capability_probe_is_running() {
+    let (started_send, started_receive) = std::sync::mpsc::channel();
+    let (release_send, release_receive) = std::sync::mpsc::channel();
+    let calls = Arc::new(CallCounts::default());
+    let runtime = Arc::new(ready_runtime_with_blocking_git(
+        calls.clone(),
+        started_send,
+        release_receive,
+    ));
+    let probing_runtime = runtime.clone();
+    let probe = thread::spawn(move || system::handle_get_system_status(&probing_runtime));
+
+    started_receive
+        .recv()
+        .expect("Git capability probe started");
+    let (list_send, list_receive) = std::sync::mpsc::channel();
+    let list_runtime = runtime.clone();
+    let list = thread::spawn(move || list_send.send(projects::handle_list_projects(&list_runtime)));
+    let list_result = list_receive.recv_timeout(Duration::from_secs(1));
+
+    release_send.send(()).expect("release Git capability probe");
+    assert_eq!(
+        probe
+            .join()
+            .expect("capability probe thread")
+            .expect("system status")
+            .capabilities
+            .git_execution,
+        crate::dto::CapabilityStatusDto::Supported
+    );
+    list.join()
+        .expect("project list thread")
+        .expect("project list result sent");
+    assert!(
+        list_result
+            .expect("project list must not wait for a Git capability probe")
+            .expect("project list remains read-only available")
+            .is_empty()
+    );
+    assert_eq!(calls.projects.load(Ordering::SeqCst), 1);
 }
 
 #[test]

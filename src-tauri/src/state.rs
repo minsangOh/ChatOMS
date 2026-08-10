@@ -1,4 +1,4 @@
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chatoms_application::{bootstrap::BootstrapStatus, error::ApplicationError};
 use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition};
@@ -23,21 +23,32 @@ use chatoms_ports::{
 
 use crate::error::IpcErrorDto;
 
+#[derive(Clone)]
 pub struct RepositoryHandle {
-    inner: Box<dyn FoundationRepository + Send>,
+    inner: Arc<Mutex<Box<dyn FoundationRepository + Send>>>,
 }
 
 impl RepositoryHandle {
     pub fn new(repository: impl FoundationRepository + Send + 'static) -> Self {
         Self {
-            inner: Box::new(repository),
+            inner: Arc::new(Mutex::new(Box::new(repository))),
         }
+    }
+
+    fn with_inner<T>(
+        &self,
+        operation: impl FnOnce(&mut dyn FoundationRepository) -> Result<T, RepositoryError>,
+    ) -> Result<T, RepositoryError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            RepositoryError::new(chatoms_ports::repository::RepositoryErrorCode::OperationFailed)
+        })?;
+        operation(inner.as_mut())
     }
 }
 
 impl FoundationRepository for RepositoryHandle {
     fn create_project(&mut self, project: &ProjectRecord) -> Result<(), RepositoryError> {
-        self.inner.create_project(project)
+        self.with_inner(|inner| inner.create_project(project))
     }
 
     fn create_project_with_identity(
@@ -45,28 +56,28 @@ impl FoundationRepository for RepositoryHandle {
         project: &ProjectRecord,
         identity: &ProjectFilesystemIdentityRecord,
     ) -> Result<(), RepositoryError> {
-        self.inner.create_project_with_identity(project, identity)
+        self.with_inner(|inner| inner.create_project_with_identity(project, identity))
     }
 
     fn get_project_identity(
         &mut self,
         project_id: ProjectId,
     ) -> Result<Option<ProjectFilesystemIdentityRecord>, RepositoryError> {
-        self.inner.get_project_identity(project_id)
+        self.with_inner(|inner| inner.get_project_identity(project_id))
     }
 
     fn update_project_identity(
         &mut self,
         identity: &ProjectFilesystemIdentityRecord,
     ) -> Result<(), RepositoryError> {
-        self.inner.update_project_identity(identity)
+        self.with_inner(|inner| inner.update_project_identity(identity))
     }
 
     fn get_project(
         &mut self,
         project_id: ProjectId,
     ) -> Result<Option<ProjectRecord>, RepositoryError> {
-        self.inner.get_project(project_id)
+        self.with_inner(|inner| inner.get_project(project_id))
     }
 
     fn create_task(
@@ -75,12 +86,11 @@ impl FoundationRepository for RepositoryHandle {
         initial_transition: &TaskStateTransition,
         lease_acquired_at_ms: i64,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .create_task(task, initial_transition, lease_acquired_at_ms)
+        self.with_inner(|inner| inner.create_task(task, initial_transition, lease_acquired_at_ms))
     }
 
     fn get_task(&mut self, task_id: TaskId) -> Result<Option<Task>, RepositoryError> {
-        self.inner.get_task(task_id)
+        self.with_inner(|inner| inner.get_task(task_id))
     }
 
     fn save_transition(
@@ -89,8 +99,7 @@ impl FoundationRepository for RepositoryHandle {
         task: &Task,
         transition: &TaskStateTransition,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .save_transition(expected_version, task, transition)
+        self.with_inner(|inner| inner.save_transition(expected_version, task, transition))
     }
 
     fn save_recovery_target(
@@ -98,7 +107,7 @@ impl FoundationRepository for RepositoryHandle {
         expected_version: u64,
         task: &Task,
     ) -> Result<(), RepositoryError> {
-        self.inner.save_recovery_target(expected_version, task)
+        self.with_inner(|inner| inner.save_recovery_target(expected_version, task))
     }
 
     fn terminate_task(
@@ -107,23 +116,22 @@ impl FoundationRepository for RepositoryHandle {
         task: &Task,
         transition: &TaskStateTransition,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .terminate_task(expected_version, task, transition)
+        self.with_inner(|inner| inner.terminate_task(expected_version, task, transition))
     }
 
     fn list_task_transitions(
         &mut self,
         task_id: TaskId,
     ) -> Result<Vec<TaskStateTransition>, RepositoryError> {
-        self.inner.list_task_transitions(task_id)
+        self.with_inner(|inner| inner.list_task_transitions(task_id))
     }
 
     fn list_projects(&mut self) -> Result<Vec<ProjectSummary>, RepositoryError> {
-        self.inner.list_projects()
+        self.with_inner(|inner| inner.list_projects())
     }
 
     fn active_lease(&mut self) -> Result<Option<ActiveLease>, RepositoryError> {
-        self.inner.active_lease()
+        self.with_inner(|inner| inner.active_lease())
     }
 
     fn create_isolation_task(
@@ -134,20 +142,22 @@ impl FoundationRepository for RepositoryHandle {
         lease_acquired_at_ms: i64,
         isolation: &TaskGitIsolation,
     ) -> Result<(), RepositoryError> {
-        self.inner.create_isolation_task(
-            task,
-            initial_transition,
-            classified_transition,
-            lease_acquired_at_ms,
-            isolation,
-        )
+        self.with_inner(|inner| {
+            inner.create_isolation_task(
+                task,
+                initial_transition,
+                classified_transition,
+                lease_acquired_at_ms,
+                isolation,
+            )
+        })
     }
 
     fn get_task_isolation(
         &mut self,
         task_id: TaskId,
     ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
-        self.inner.get_task_isolation(task_id)
+        self.with_inner(|inner| inner.get_task_isolation(task_id))
     }
 
     fn begin_git_initialization(
@@ -156,8 +166,9 @@ impl FoundationRepository for RepositoryHandle {
         isolation: &TaskGitIsolation,
         approval: &GitInitApproval,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .begin_git_initialization(expected_version, isolation, approval)
+        self.with_inner(|inner| {
+            inner.begin_git_initialization(expected_version, isolation, approval)
+        })
     }
 
     fn save_isolation_intent(
@@ -165,8 +176,7 @@ impl FoundationRepository for RepositoryHandle {
         expected_version: u64,
         isolation: &TaskGitIsolation,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .save_isolation_intent(expected_version, isolation)
+        self.with_inner(|inner| inner.save_isolation_intent(expected_version, isolation))
     }
 
     fn append_git_operation_receipt(
@@ -176,21 +186,22 @@ impl FoundationRepository for RepositoryHandle {
         evidence: Option<&str>,
         recorded_at_ms: i64,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .append_git_operation_receipt(operation_id, kind, evidence, recorded_at_ms)
+        self.with_inner(|inner| {
+            inner.append_git_operation_receipt(operation_id, kind, evidence, recorded_at_ms)
+        })
     }
 
     fn list_git_operation_receipts(
         &mut self,
         operation_id: chatoms_domain::GitOperationId,
     ) -> Result<Vec<GitOperationReceipt>, RepositoryError> {
-        self.inner.list_git_operation_receipts(operation_id)
+        self.with_inner(|inner| inner.list_git_operation_receipts(operation_id))
     }
 
     fn list_incomplete_git_operations(
         &mut self,
     ) -> Result<Vec<GitOperationAttempt>, RepositoryError> {
-        self.inner.list_incomplete_git_operations()
+        self.with_inner(|inner| inner.list_incomplete_git_operations())
     }
 
     fn save_isolation_transition(
@@ -200,8 +211,9 @@ impl FoundationRepository for RepositoryHandle {
         transition: &TaskStateTransition,
         isolation: &TaskGitIsolation,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .save_isolation_transition(expected_version, task, transition, isolation)
+        self.with_inner(|inner| {
+            inner.save_isolation_transition(expected_version, task, transition, isolation)
+        })
     }
 
     fn save_git_initialization_completion(
@@ -212,13 +224,15 @@ impl FoundationRepository for RepositoryHandle {
         isolation: &TaskGitIsolation,
         identity: &ProjectFilesystemIdentityRecord,
     ) -> Result<(), RepositoryError> {
-        self.inner.save_git_initialization_completion(
-            expected_version,
-            task,
-            transition,
-            isolation,
-            identity,
-        )
+        self.with_inner(|inner| {
+            inner.save_git_initialization_completion(
+                expected_version,
+                task,
+                transition,
+                isolation,
+                identity,
+            )
+        })
     }
 
     fn save_worktree_completion(
@@ -228,8 +242,9 @@ impl FoundationRepository for RepositoryHandle {
         transition: &TaskStateTransition,
         isolation: &TaskGitIsolation,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .save_worktree_completion(expected_version, task, transition, isolation)
+        self.with_inner(|inner| {
+            inner.save_worktree_completion(expected_version, task, transition, isolation)
+        })
     }
 
     fn terminate_isolation_task(
@@ -239,57 +254,70 @@ impl FoundationRepository for RepositoryHandle {
         transition: &TaskStateTransition,
         isolation: &TaskGitIsolation,
     ) -> Result<(), RepositoryError> {
-        self.inner
-            .terminate_isolation_task(expected_version, task, transition, isolation)
+        self.with_inner(|inner| {
+            inner.terminate_isolation_task(expected_version, task, transition, isolation)
+        })
     }
 }
 
+#[derive(Clone)]
 pub struct GitServiceHandle {
-    inner: Box<dyn GitService + Send>,
+    inner: Arc<Mutex<Box<dyn GitService + Send>>>,
 }
 
 impl GitServiceHandle {
     pub fn new(service: impl GitService + Send + 'static) -> Self {
         Self {
-            inner: Box::new(service),
+            inner: Arc::new(Mutex::new(Box::new(service))),
         }
+    }
+
+    fn with_inner<T>(
+        &self,
+        operation: impl FnOnce(&mut dyn GitService) -> Result<T, PortFailure>,
+    ) -> Result<T, PortFailure> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PortFailure::new(chatoms_ports::error::FailureCategory::Internal))?;
+        operation(inner.as_mut())
     }
 }
 
 impl GitService for GitServiceHandle {
     fn is_available(&mut self) -> Result<bool, PortFailure> {
-        self.inner.is_available()
+        self.with_inner(|inner| inner.is_available())
     }
     fn inspect_project(
         &mut self,
         input: &std::path::Path,
     ) -> Result<ProjectInspection, PortFailure> {
-        self.inner.inspect_project(input)
+        self.with_inner(|inner| inner.inspect_project(input))
     }
     fn repository_status(
         &mut self,
         root: &std::path::Path,
     ) -> Result<RepositoryStatus, PortFailure> {
-        self.inner.repository_status(root)
+        self.with_inner(|inner| inner.repository_status(root))
     }
     fn validate_non_git_source(&mut self, root: &std::path::Path) -> Result<(), PortFailure> {
-        self.inner.validate_non_git_source(root)
+        self.with_inner(|inner| inner.validate_non_git_source(root))
     }
     fn validate_repository_source(
         &mut self,
         root: &std::path::Path,
         base_commit: &str,
     ) -> Result<RepositorySafetyToken, PortFailure> {
-        self.inner.validate_repository_source(root, base_commit)
+        self.with_inner(|inner| inner.validate_repository_source(root, base_commit))
     }
     fn initialize_repository(&mut self, root: &std::path::Path) -> Result<(), PortFailure> {
-        self.inner.initialize_repository(root)
+        self.with_inner(|inner| inner.initialize_repository(root))
     }
     fn has_commit_author(&mut self, root: &std::path::Path) -> Result<bool, PortFailure> {
-        self.inner.has_commit_author(root)
+        self.with_inner(|inner| inner.has_commit_author(root))
     }
     fn create_initial_snapshot(&mut self, root: &std::path::Path) -> Result<String, PortFailure> {
-        self.inner.create_initial_snapshot(root)
+        self.with_inner(|inner| inner.create_initial_snapshot(root))
     }
     fn create_task_worktree(
         &mut self,
@@ -299,8 +327,9 @@ impl GitService for GitServiceHandle {
         worktree: &std::path::Path,
         safety: &RepositorySafetyToken,
     ) -> Result<WorktreeCreationOutcome, PortFailure> {
-        self.inner
-            .create_task_worktree(root, branch, base_commit, worktree, safety)
+        self.with_inner(|inner| {
+            inner.create_task_worktree(root, branch, base_commit, worktree, safety)
+        })
     }
     fn verify_task_worktree(
         &mut self,
@@ -309,24 +338,36 @@ impl GitService for GitServiceHandle {
         base_commit: &str,
         worktree: &std::path::Path,
     ) -> Result<bool, PortFailure> {
-        self.inner
-            .verify_task_worktree(root, branch, base_commit, worktree)
+        self.with_inner(|inner| inner.verify_task_worktree(root, branch, base_commit, worktree))
     }
 }
 
+#[derive(Clone)]
 pub struct WorktreePathHandle {
-    inner: Box<dyn WorktreePathProvider + Send>,
+    inner: Arc<Mutex<Box<dyn WorktreePathProvider + Send>>>,
 }
 
+#[derive(Clone)]
 pub struct FilesystemIdentityHandle {
-    inner: Box<dyn FilesystemIdentityPort + Send>,
+    inner: Arc<Mutex<Box<dyn FilesystemIdentityPort + Send>>>,
 }
 
 impl FilesystemIdentityHandle {
     pub fn new(port: impl FilesystemIdentityPort + Send + 'static) -> Self {
         Self {
-            inner: Box::new(port),
+            inner: Arc::new(Mutex::new(Box::new(port))),
         }
+    }
+
+    fn with_inner<T>(
+        &self,
+        operation: impl FnOnce(&mut dyn FilesystemIdentityPort) -> Result<T, PortFailure>,
+    ) -> Result<T, PortFailure> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PortFailure::new(chatoms_ports::error::FailureCategory::Internal))?;
+        operation(inner.as_mut())
     }
 }
 
@@ -335,11 +376,11 @@ impl FilesystemIdentityPort for FilesystemIdentityHandle {
         &mut self,
         path: &std::path::Path,
     ) -> Result<DirectoryIdentity, PortFailure> {
-        self.inner.inspect_supported_directory(path)
+        self.with_inner(|inner| inner.inspect_supported_directory(path))
     }
 
     fn verify_local_tree(&mut self, root: &std::path::Path) -> Result<(), PortFailure> {
-        self.inner.verify_local_tree(root)
+        self.with_inner(|inner| inner.verify_local_tree(root))
     }
 
     fn acquire_guard(
@@ -347,15 +388,26 @@ impl FilesystemIdentityPort for FilesystemIdentityHandle {
         path: &std::path::Path,
         expected: &DirectoryIdentity,
     ) -> Result<Box<dyn DirectoryIdentityGuard>, PortFailure> {
-        self.inner.acquire_guard(path, expected)
+        self.with_inner(|inner| inner.acquire_guard(path, expected))
     }
 }
 
 impl WorktreePathHandle {
     pub fn new(provider: impl WorktreePathProvider + Send + 'static) -> Self {
         Self {
-            inner: Box::new(provider),
+            inner: Arc::new(Mutex::new(Box::new(provider))),
         }
+    }
+
+    fn with_inner<T>(
+        &self,
+        operation: impl FnOnce(&mut dyn WorktreePathProvider) -> Result<T, PortFailure>,
+    ) -> Result<T, PortFailure> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PortFailure::new(chatoms_ports::error::FailureCategory::Internal))?;
+        operation(inner.as_mut())
     }
 }
 
@@ -365,43 +417,67 @@ impl WorktreePathProvider for WorktreePathHandle {
         project_id: ProjectId,
         task_id: TaskId,
     ) -> Result<std::path::PathBuf, PortFailure> {
-        self.inner.prepare_worktree_path(project_id, task_id)
+        self.with_inner(|inner| inner.prepare_worktree_path(project_id, task_id))
     }
 }
 
+#[derive(Clone)]
 pub struct TimeProviderHandle {
-    inner: Box<dyn TimeProvider + Send>,
+    inner: Arc<Mutex<Box<dyn TimeProvider + Send>>>,
 }
 
 impl TimeProviderHandle {
     pub fn new(provider: impl TimeProvider + Send + 'static) -> Self {
         Self {
-            inner: Box::new(provider),
+            inner: Arc::new(Mutex::new(Box::new(provider))),
         }
+    }
+
+    fn with_inner<T>(
+        &self,
+        operation: impl FnOnce(&mut dyn TimeProvider) -> Result<T, PortFailure>,
+    ) -> Result<T, PortFailure> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PortFailure::new(chatoms_ports::error::FailureCategory::Internal))?;
+        operation(inner.as_mut())
     }
 }
 
 impl TimeProvider for TimeProviderHandle {
     fn now_ms(&mut self) -> Result<i64, PortFailure> {
-        self.inner.now_ms()
+        self.with_inner(|inner| inner.now_ms())
     }
 }
 
+#[derive(Clone)]
 pub struct CapabilityHandle {
-    inner: Box<dyn PlatformCapabilityPort + Send>,
+    inner: Arc<Mutex<Box<dyn PlatformCapabilityPort + Send>>>,
 }
 
 impl CapabilityHandle {
     pub fn new(adapter: impl PlatformCapabilityPort + Send + 'static) -> Self {
         Self {
-            inner: Box::new(adapter),
+            inner: Arc::new(Mutex::new(Box::new(adapter))),
         }
+    }
+
+    fn with_inner<T>(
+        &self,
+        operation: impl FnOnce(&mut dyn PlatformCapabilityPort) -> Result<T, PortFailure>,
+    ) -> Result<T, PortFailure> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PortFailure::new(chatoms_ports::error::FailureCategory::Internal))?;
+        operation(inner.as_mut())
     }
 }
 
 impl PlatformCapabilityPort for CapabilityHandle {
     fn platform_capabilities(&mut self) -> Result<PlatformCapabilities, PortFailure> {
-        self.inner.platform_capabilities()
+        self.with_inner(|inner| inner.platform_capabilities())
     }
 }
 
@@ -412,6 +488,7 @@ pub struct RuntimeResources {
     pub logging_guard: SharedLoggingGuard,
 }
 
+#[derive(Clone)]
 pub struct AppRuntime {
     pub bootstrap_status: BootstrapStatus,
     pub repository: RepositoryHandle,
@@ -481,6 +558,15 @@ pub enum RuntimeState {
     Unavailable(UnavailableRuntime),
 }
 
+pub enum RuntimeSnapshot {
+    Ready(AppRuntime),
+    Unavailable {
+        error: ApplicationError,
+        bootstrap_status: Option<BootstrapStatus>,
+        migration_diagnostic: Option<LegacyMigrationDiagnostic>,
+    },
+}
+
 pub struct ManagedRuntime {
     inner: Mutex<RuntimeState>,
 }
@@ -521,6 +607,25 @@ impl ManagedRuntime {
 
     pub fn lock(&self) -> Result<MutexGuard<'_, RuntimeState>, IpcErrorDto> {
         self.inner.lock().map_err(|_| IpcErrorDto::internal())
+    }
+
+    pub fn snapshot(&self) -> Result<RuntimeSnapshot, IpcErrorDto> {
+        let state = self.lock()?;
+        Ok(match &*state {
+            RuntimeState::Ready(ready) => RuntimeSnapshot::Ready(ready.clone()),
+            RuntimeState::Unavailable(unavailable) => RuntimeSnapshot::Unavailable {
+                error: unavailable.error.clone(),
+                bootstrap_status: unavailable.bootstrap_status.clone(),
+                migration_diagnostic: unavailable.migration_diagnostic.clone(),
+            },
+        })
+    }
+
+    pub fn ready_snapshot(&self) -> Result<AppRuntime, IpcErrorDto> {
+        match self.snapshot()? {
+            RuntimeSnapshot::Ready(ready) => Ok(ready),
+            RuntimeSnapshot::Unavailable { error, .. } => Err(error.into()),
+        }
     }
 }
 

@@ -7,17 +7,17 @@ use crate::{
         SystemStatusDto, VersionDto,
     },
     error::IpcErrorDto,
-    state::{ManagedRuntime, RuntimeState},
+    state::{ManagedRuntime, RuntimeSnapshot},
 };
 
 pub fn handle_get_version(runtime: &ManagedRuntime) -> Result<VersionDto, IpcErrorDto> {
-    let mut state = runtime.lock()?;
-    let version = match &mut *state {
-        RuntimeState::Ready(ready) => {
+    let version = match runtime.snapshot()? {
+        RuntimeSnapshot::Ready(mut ready) => {
             SystemService::new(&ready.bootstrap_status, &mut ready.capabilities).get_version()
         }
-        RuntimeState::Unavailable(unavailable) => unavailable
-            .bootstrap_status
+        RuntimeSnapshot::Unavailable {
+            bootstrap_status, ..
+        } => bootstrap_status
             .as_ref()
             .map_or(chatoms_application::APPLICATION_VERSION, |status| {
                 status.application_version
@@ -27,9 +27,8 @@ pub fn handle_get_version(runtime: &ManagedRuntime) -> Result<VersionDto, IpcErr
 }
 
 pub fn handle_get_health(runtime: &ManagedRuntime) -> Result<HealthDto, IpcErrorDto> {
-    let mut state = runtime.lock()?;
-    match &mut *state {
-        RuntimeState::Ready(ready) => {
+    match runtime.snapshot()? {
+        RuntimeSnapshot::Ready(mut ready) => {
             let mut service = SystemService::new(&ready.bootstrap_status, &mut ready.capabilities);
             service
                 .get_health()
@@ -38,16 +37,15 @@ pub fn handle_get_health(runtime: &ManagedRuntime) -> Result<HealthDto, IpcError
                 })
                 .map_err(IpcErrorDto::from)
         }
-        RuntimeState::Unavailable(_) => Ok(HealthDto {
+        RuntimeSnapshot::Unavailable { .. } => Ok(HealthDto {
             status: HealthStateDto::Unavailable,
         }),
     }
 }
 
 pub fn handle_get_system_status(runtime: &ManagedRuntime) -> Result<SystemStatusDto, IpcErrorDto> {
-    let mut state = runtime.lock()?;
-    match &mut *state {
-        RuntimeState::Ready(ready) => {
+    match runtime.snapshot()? {
+        RuntimeSnapshot::Ready(mut ready) => {
             let mut service = SystemService::new(&ready.bootstrap_status, &mut ready.capabilities);
             let mut status = service
                 .get_system_status()
@@ -60,34 +58,35 @@ pub fn handle_get_system_status(runtime: &ManagedRuntime) -> Result<SystemStatus
             };
             Ok(status)
         }
-        RuntimeState::Unavailable(unavailable) => Err(unavailable.error.clone().into()),
+        RuntimeSnapshot::Unavailable { error, .. } => Err(error.into()),
     }
 }
 
 pub fn handle_get_bootstrap_status(
     runtime: &ManagedRuntime,
 ) -> Result<BootstrapStatusDto, IpcErrorDto> {
-    let state = runtime.lock()?;
-    match &*state {
-        RuntimeState::Ready(ready) => Ok(ready.bootstrap_status.clone().into()),
-        RuntimeState::Unavailable(unavailable) => unavailable
-            .bootstrap_status
+    match runtime.snapshot()? {
+        RuntimeSnapshot::Ready(ready) => Ok(ready.bootstrap_status.into()),
+        RuntimeSnapshot::Unavailable {
+            error,
+            bootstrap_status,
+            ..
+        } => bootstrap_status
             .clone()
             .map(BootstrapStatusDto::from)
-            .ok_or_else(|| unavailable.error.clone().into()),
+            .ok_or_else(|| error.into()),
     }
 }
 
 pub fn handle_get_legacy_migration_diagnostic(
     runtime: &ManagedRuntime,
 ) -> Result<Option<LegacyMigrationDiagnosticDto>, IpcErrorDto> {
-    let state = runtime.lock()?;
-    Ok(match &*state {
-        RuntimeState::Ready(_) => None,
-        RuntimeState::Unavailable(unavailable) => unavailable
-            .migration_diagnostic
-            .clone()
-            .map(LegacyMigrationDiagnosticDto::from),
+    Ok(match runtime.snapshot()? {
+        RuntimeSnapshot::Ready(_) => None,
+        RuntimeSnapshot::Unavailable {
+            migration_diagnostic,
+            ..
+        } => migration_diagnostic.map(LegacyMigrationDiagnosticDto::from),
     })
 }
 

@@ -29,6 +29,14 @@ use chatoms_ports::{
         WorktreeCreationOutcome, WorktreePathProvider,
     },
 };
+#[cfg(not(test))]
+use chatoms_ports::{
+    error::PortFailure,
+    git::{
+        GitService, ProjectInspection, RepositorySafetyToken, RepositoryStatus,
+        WorktreeCreationOutcome,
+    },
+};
 
 use crate::state::{
     AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle, ManagedRuntime,
@@ -58,15 +66,7 @@ where
 
     match bootstrap_result {
         Ok(status) if status.ready => {
-            let mut git = match runtime_git_adapter() {
-                Ok(git) => git,
-                Err(error) => {
-                    return ManagedRuntime::unavailable(
-                        ApplicationError::from_categorized(&error),
-                        Some(status),
-                    );
-                }
-            };
+            let mut git = runtime_git_adapter();
             #[cfg(all(windows, not(test)))]
             let mut worktree_paths = match ManagedWorktreePaths::windows_from_environment() {
                 Ok(paths) => paths,
@@ -128,13 +128,122 @@ where
 }
 
 #[cfg(not(test))]
-fn runtime_git_adapter() -> Result<GitCliAdapter, chatoms_ports::error::PortFailure> {
-    GitCliAdapter::from_environment()
+fn runtime_git_adapter() -> RuntimeGitService {
+    match GitCliAdapter::from_environment() {
+        Ok(git) => RuntimeGitService::Available(Box::new(git)),
+        Err(_) => RuntimeGitService::Unavailable,
+    }
 }
 
 #[cfg(test)]
-fn runtime_git_adapter() -> Result<TestGitService, PortFailure> {
-    Ok(TestGitService)
+fn runtime_git_adapter() -> TestGitService {
+    TestGitService
+}
+
+#[cfg(not(test))]
+enum RuntimeGitService {
+    Available(Box<GitCliAdapter>),
+    Unavailable,
+}
+
+#[cfg(not(test))]
+impl GitService for RuntimeGitService {
+    fn is_available(&mut self) -> Result<bool, PortFailure> {
+        Ok(matches!(self, Self::Available(_)))
+    }
+
+    fn inspect_project(
+        &mut self,
+        input: &std::path::Path,
+    ) -> Result<ProjectInspection, PortFailure> {
+        match self {
+            Self::Available(git) => git.inspect_project(input),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn repository_status(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Result<RepositoryStatus, PortFailure> {
+        match self {
+            Self::Available(git) => git.repository_status(root),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn validate_non_git_source(&mut self, root: &std::path::Path) -> Result<(), PortFailure> {
+        match self {
+            Self::Available(git) => git.validate_non_git_source(root),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn validate_repository_source(
+        &mut self,
+        root: &std::path::Path,
+        base_commit: &str,
+    ) -> Result<RepositorySafetyToken, PortFailure> {
+        match self {
+            Self::Available(git) => git.validate_repository_source(root, base_commit),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn initialize_repository(&mut self, root: &std::path::Path) -> Result<(), PortFailure> {
+        match self {
+            Self::Available(git) => git.initialize_repository(root),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn has_commit_author(&mut self, root: &std::path::Path) -> Result<bool, PortFailure> {
+        match self {
+            Self::Available(git) => git.has_commit_author(root),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn create_initial_snapshot(&mut self, root: &std::path::Path) -> Result<String, PortFailure> {
+        match self {
+            Self::Available(git) => git.create_initial_snapshot(root),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn create_task_worktree(
+        &mut self,
+        root: &std::path::Path,
+        branch: &str,
+        base_commit: &str,
+        worktree: &std::path::Path,
+        safety: &RepositorySafetyToken,
+    ) -> Result<WorktreeCreationOutcome, PortFailure> {
+        match self {
+            Self::Available(git) => {
+                git.create_task_worktree(root, branch, base_commit, worktree, safety)
+            }
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+
+    fn verify_task_worktree(
+        &mut self,
+        root: &std::path::Path,
+        branch: &str,
+        base_commit: &str,
+        worktree: &std::path::Path,
+    ) -> Result<bool, PortFailure> {
+        match self {
+            Self::Available(git) => git.verify_task_worktree(root, branch, base_commit, worktree),
+            Self::Unavailable => Err(unavailable_git()),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn unavailable_git() -> PortFailure {
+    PortFailure::new(FailureCategory::Unsupported)
 }
 
 #[cfg(test)]
@@ -276,21 +385,14 @@ pub fn production_runtime() -> ManagedRuntime {
 
     #[cfg(windows)]
     let database_adapter = {
-        let preflight_git = match GitCliAdapter::from_environment() {
-            Ok(git) => git,
-            Err(error) => {
-                return ManagedRuntime::unavailable(
-                    ApplicationError::from_categorized(&error),
-                    None,
-                );
-            }
-        };
-        DatabaseBootstrapAdapter::new(paths.clone(), database.clone()).with_legacy_preflight(
-            LegacyProjectPreflightAdapter::new(
-                preflight_git,
+        let adapter = DatabaseBootstrapAdapter::new(paths.clone(), database.clone());
+        match GitCliAdapter::from_environment() {
+            Ok(git) => adapter.with_legacy_preflight(LegacyProjectPreflightAdapter::new(
+                git,
                 chatoms_platform::filesystem::WindowsFilesystemIdentity,
-            ),
-        )
+            )),
+            Err(_) => adapter,
+        }
     };
     #[cfg(not(windows))]
     let database_adapter = DatabaseBootstrapAdapter::new(paths.clone(), database.clone());
