@@ -61,3 +61,6 @@ Desktop.ini
 /tmp/
 /temp/
 *.tmp
+
+# Claude Code worktrees
+.claude/worktrees/
