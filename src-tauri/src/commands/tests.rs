@@ -284,6 +284,8 @@ fn ready_runtime_with_git(
                 chatoms_platform::ManagedWorktreePaths::windows_from_environment()
                     .expect("test worktree paths"),
             ),
+            provider_capabilities: crate::state::ProviderCapabilityHandle::new(),
+            preflight_dir: None,
         },
         RuntimeResources::default(),
     ))
@@ -318,6 +320,8 @@ fn ready_runtime_with_blocking_git(
                 chatoms_platform::ManagedWorktreePaths::windows_from_environment()
                     .expect("test worktree paths"),
             ),
+            provider_capabilities: crate::state::ProviderCapabilityHandle::new(),
+            preflight_dir: None,
         },
         RuntimeResources::default(),
     ))
@@ -326,23 +330,35 @@ fn ready_runtime_with_blocking_git(
 #[test]
 fn system_status_exposes_only_the_verified_git_capability_result() {
     let supported = ready_runtime_with_git(Arc::new(CallCounts::default()), Ok(true));
+    let supported_status = system::handle_get_system_status(&supported).expect("supported status");
     assert_eq!(
-        system::handle_get_system_status(&supported)
-            .expect("supported status")
-            .capabilities
-            .git_execution,
+        supported_status.capabilities.git_execution,
         crate::dto::CapabilityStatusDto::Supported
+    );
+    assert_eq!(
+        supported_status.capabilities.claude_execution,
+        crate::dto::CapabilityStatusDto::Unavailable
+    );
+    assert_eq!(
+        supported_status.capabilities.codex_execution,
+        crate::dto::CapabilityStatusDto::Unavailable
     );
     for unavailable in [
         Ok(false),
         Err(PortFailure::new(FailureCategory::Unsupported)),
     ] {
         let runtime = ready_runtime_with_git(Arc::new(CallCounts::default()), unavailable);
+        let status = system::handle_get_system_status(&runtime).expect("unavailable status");
         assert_eq!(
-            system::handle_get_system_status(&runtime)
-                .expect("unavailable status")
-                .capabilities
-                .git_execution,
+            status.capabilities.git_execution,
+            crate::dto::CapabilityStatusDto::Unavailable
+        );
+        assert_eq!(
+            status.capabilities.claude_execution,
+            crate::dto::CapabilityStatusDto::Unavailable
+        );
+        assert_eq!(
+            status.capabilities.codex_execution,
             crate::dto::CapabilityStatusDto::Unavailable
         );
         assert!(
@@ -465,7 +481,7 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 
 #[test]
 fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 16);
+    assert_eq!(REGISTERED_HANDLERS.len(), 18);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -485,6 +501,8 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "get_active_task",
             "get_task",
             "list_task_history",
+            "set_claude_executable_path",
+            "refresh_claude_capability",
         ]
     );
     for forbidden in [
@@ -498,4 +516,173 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
     ] {
         assert!(!REGISTERED_HANDLERS.contains(&forbidden));
     }
+}
+
+#[test]
+fn provider_capability_handle_generation_and_cache_invariants() {
+    use crate::state::{CachedProviderCapabilities, ProviderCapabilityHandle, RefreshOutcome};
+    use chatoms_application::system::CapabilityStatus as AppCapabilityStatus;
+
+    let handle = ProviderCapabilityHandle::new();
+    assert_eq!(handle.generation(), 0);
+    let cached = handle.read_cache();
+    assert_eq!(cached.claude, None);
+    assert_eq!(cached.codex, None);
+
+    handle.invalidate_and_bump_generation();
+    assert_eq!(handle.generation(), 1);
+    let cached = handle.read_cache();
+    assert_eq!(cached.claude, None);
+
+    let g = handle.try_begin_refresh().expect("begin refresh");
+    assert_eq!(g, 1);
+    let result = handle.finish_refresh(
+        g,
+        CachedProviderCapabilities {
+            claude: Some(AppCapabilityStatus::Supported),
+            codex: Some(AppCapabilityStatus::Unsupported),
+        },
+    );
+    assert_eq!(result, RefreshOutcome::Completed);
+    let cached = handle.read_cache();
+    assert_eq!(cached.claude, Some(AppCapabilityStatus::Supported));
+    assert_eq!(cached.codex, Some(AppCapabilityStatus::Unsupported));
+}
+
+#[test]
+fn stale_refresh_returns_superseded_and_does_not_overwrite_cache() {
+    use crate::state::{CachedProviderCapabilities, ProviderCapabilityHandle, RefreshOutcome};
+    use chatoms_application::system::CapabilityStatus as AppCapabilityStatus;
+
+    let handle = ProviderCapabilityHandle::new();
+    let g = handle.try_begin_refresh().expect("begin refresh");
+
+    handle.invalidate_and_bump_generation();
+    assert_eq!(handle.generation(), 1);
+
+    let result = handle.finish_refresh(
+        g,
+        CachedProviderCapabilities {
+            claude: Some(AppCapabilityStatus::Supported),
+            codex: Some(AppCapabilityStatus::Unsupported),
+        },
+    );
+    assert_eq!(result, RefreshOutcome::Superseded);
+    let cached = handle.read_cache();
+    assert_eq!(
+        cached.claude, None,
+        "old Supported must not survive a generation change"
+    );
+    assert_eq!(cached.codex, None);
+}
+
+#[test]
+fn concurrent_refresh_returns_conflict_without_starting_second_probe() {
+    use crate::state::ProviderCapabilityHandle;
+
+    let handle = ProviderCapabilityHandle::new();
+    let _gen = handle.try_begin_refresh().expect("first refresh begins");
+    assert!(
+        handle.try_begin_refresh().is_none(),
+        "second concurrent refresh must be rejected"
+    );
+    handle.abort_refresh();
+    assert!(
+        handle.try_begin_refresh().is_some(),
+        "refresh available after abort"
+    );
+}
+
+#[test]
+fn get_system_status_does_not_run_provider_probe() {
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime(calls.clone());
+    let status = system::handle_get_system_status(&runtime).expect("system status");
+    assert_eq!(
+        status.capabilities.claude_execution,
+        crate::dto::CapabilityStatusDto::Unavailable,
+        "system status must report cache only, never run a provider probe"
+    );
+    assert_eq!(
+        status.capabilities.codex_execution,
+        crate::dto::CapabilityStatusDto::Unavailable,
+    );
+}
+
+#[test]
+fn refresh_during_system_status_does_not_block_project_list() {
+    let (started_send, started_receive) = std::sync::mpsc::channel();
+    let (release_send, release_receive) = std::sync::mpsc::channel();
+    let calls = Arc::new(CallCounts::default());
+    let runtime = Arc::new(ready_runtime_with_blocking_git(
+        calls.clone(),
+        started_send,
+        release_receive,
+    ));
+
+    let probing_runtime = runtime.clone();
+    let probe = thread::spawn(move || system::handle_get_system_status(&probing_runtime));
+
+    started_receive.recv().expect("probe started");
+
+    let list_runtime = runtime.clone();
+    let (list_send, list_receive) = std::sync::mpsc::channel();
+    let list = thread::spawn(move || list_send.send(projects::handle_list_projects(&list_runtime)));
+    let list_result = list_receive.recv_timeout(Duration::from_secs(1));
+
+    release_send.send(()).expect("release probe");
+    probe.join().expect("probe thread").expect("system status");
+    list.join().expect("list thread").expect("list result");
+    assert!(
+        list_result
+            .expect("project list must not block on git probe")
+            .expect("project list available")
+            .is_empty()
+    );
+}
+
+#[test]
+fn provider_dto_serialization_is_camel_case_and_path_free() {
+    use crate::dto::{
+        CapabilityStatusDto, RefreshClaudeCapabilityDto, RefreshOutcomeDto,
+        SetClaudeExecutablePathDto,
+    };
+    use tauri::ipc::{InvokeResponseBody, IpcResponse};
+
+    let set_response = SetClaudeExecutablePathDto {
+        display_path: "%USERPROFILE%\\AppData\\claude.exe".to_owned(),
+        claude_execution: CapabilityStatusDto::Unavailable,
+    };
+    let InvokeResponseBody::Json(json) = set_response.body().expect("serialized") else {
+        panic!("expected JSON");
+    };
+    assert!(json.contains("\"displayPath\":\"%USERPROFILE%"));
+    assert!(json.contains("\"claudeExecution\":\"unavailable\""));
+    assert!(!json.contains("C:\\\\"));
+
+    let refresh_response = RefreshClaudeCapabilityDto {
+        outcome: RefreshOutcomeDto::Completed,
+        claude_execution: CapabilityStatusDto::Supported,
+        codex_execution: CapabilityStatusDto::Unsupported,
+    };
+    let InvokeResponseBody::Json(json) = refresh_response.body().expect("serialized") else {
+        panic!("expected JSON");
+    };
+    assert!(json.contains("\"outcome\":\"completed\""));
+    assert!(json.contains("\"claudeExecution\":\"supported\""));
+    assert!(json.contains("\"codexExecution\":\"unsupported\""));
+}
+
+#[test]
+fn generation_only_increments_after_invalidate_not_on_read() {
+    use crate::state::ProviderCapabilityHandle;
+
+    let handle = ProviderCapabilityHandle::new();
+    assert_eq!(handle.generation(), 0);
+    handle.read_cache();
+    assert_eq!(handle.generation(), 0, "read must not change generation");
+    handle.invalidate_and_bump_generation();
+    assert_eq!(handle.generation(), 1);
+    handle.invalidate_and_bump_generation();
+    assert_eq!(handle.generation(), 2);
 }

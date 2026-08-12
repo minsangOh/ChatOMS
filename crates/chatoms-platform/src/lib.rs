@@ -13,11 +13,15 @@ use chatoms_ports::{
 use thiserror::Error;
 
 pub mod bootstrap;
+#[cfg(windows)]
+pub mod claude_trust;
 pub mod filesystem;
 #[cfg(windows)]
 pub mod git_runtime;
 pub mod path;
 pub mod permissions;
+#[cfg(windows)]
+pub mod preflight;
 
 #[derive(Debug, Error)]
 pub enum PlatformError {
@@ -113,6 +117,19 @@ impl SecureAppPaths {
         task_id: TaskId,
     ) -> Result<std::path::PathBuf, PlatformError> {
         let path = resolver.task_temp_dir(task_id)?;
+        prepare_task_directory(resolver, permissions, &path)?;
+        Ok(path)
+    }
+
+    /// Prepares the fixed, system-level Claude/Codex provider preflight
+    /// working directory. This directory is never the project root, a task
+    /// worktree, or the inherited process current directory, and it is never
+    /// combined with a profile or task identity.
+    pub fn prepare_provider_preflight_dir(
+        resolver: &impl AppPathResolver,
+        permissions: &impl FilesystemPermissionManager,
+    ) -> Result<std::path::PathBuf, PlatformError> {
+        let path = resolver.provider_preflight_dir()?;
         prepare_task_directory(resolver, permissions, &path)?;
         Ok(path)
     }

@@ -40,7 +40,8 @@ use chatoms_ports::{
 
 use crate::state::{
     AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle, ManagedRuntime,
-    RepositoryHandle, RuntimePorts, RuntimeResources, TimeProviderHandle, WorktreePathHandle,
+    ProviderCapabilityHandle, RepositoryHandle, RuntimePorts, RuntimeResources, TimeProviderHandle,
+    WorktreePathHandle,
 };
 
 pub fn compose_runtime<S, D, L, R, T, C>(
@@ -103,6 +104,7 @@ where
             {
                 return ManagedRuntime::unavailable(error, Some(status));
             }
+            let preflight_dir = prepare_preflight_directory();
             ManagedRuntime::ready(AppRuntime::new(
                 status,
                 RuntimePorts {
@@ -112,6 +114,8 @@ where
                     git: GitServiceHandle::new(git),
                     filesystem: FilesystemIdentityHandle::new(filesystem),
                     worktree_paths: WorktreePathHandle::new(worktree_paths),
+                    provider_capabilities: ProviderCapabilityHandle::new(),
+                    preflight_dir,
                 },
                 resources,
             ))
@@ -138,6 +142,22 @@ fn runtime_git_adapter() -> RuntimeGitService {
 #[cfg(test)]
 fn runtime_git_adapter() -> TestGitService {
     TestGitService
+}
+
+#[cfg(all(windows, not(test)))]
+fn prepare_preflight_directory() -> Option<crate::state::PreflightDirectory> {
+    use chatoms_platform::preflight::TrustedPreflightWorkingDirectory;
+    let resolver = match chatoms_platform::path::WindowsPathResolver::from_environment() {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    let permissions = chatoms_platform::permissions::WindowsPermissionManager;
+    TrustedPreflightWorkingDirectory::prepare(&resolver, &permissions).ok()
+}
+
+#[cfg(any(not(windows), test))]
+fn prepare_preflight_directory() -> Option<crate::state::PreflightDirectory> {
+    None
 }
 
 #[cfg(not(test))]

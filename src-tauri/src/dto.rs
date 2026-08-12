@@ -141,6 +141,29 @@ pub struct SystemStatusDto {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SetClaudeExecutablePathDto {
+    pub display_path: String,
+    pub claude_execution: CapabilityStatusDto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RefreshOutcomeDto {
+    Completed,
+    Superseded,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshClaudeCapabilityDto {
+    pub outcome: RefreshOutcomeDto,
+    pub claude_execution: CapabilityStatusDto,
+    pub codex_execution: CapabilityStatusDto,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectDto {
     pub id: String,
     pub name: String,
@@ -307,12 +330,22 @@ impl From<SystemStatus> for SystemStatusDto {
                 secure_storage: value.capabilities.secure_storage.into(),
                 native_permissions: value.capabilities.native_permissions.into(),
                 git_execution: CapabilityStatusDto::Unavailable,
-                claude_execution: CapabilityStatusDto::Unavailable,
-                codex_execution: CapabilityStatusDto::Unavailable,
+                claude_execution: provider_capability_status_dto(
+                    value.provider_capabilities.claude,
+                ),
+                codex_execution: provider_capability_status_dto(value.provider_capabilities.codex),
                 updater: CapabilityStatusDto::Unavailable,
                 installer_management: CapabilityStatusDto::Unavailable,
             },
         }
+    }
+}
+
+fn provider_capability_status_dto(status: Option<CapabilityStatus>) -> CapabilityStatusDto {
+    match status {
+        Some(CapabilityStatus::Supported) => CapabilityStatusDto::Supported,
+        Some(CapabilityStatus::Unsupported) => CapabilityStatusDto::Unsupported,
+        None => CapabilityStatusDto::Unavailable,
     }
 }
 

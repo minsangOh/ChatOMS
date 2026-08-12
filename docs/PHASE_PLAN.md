@@ -96,23 +96,23 @@ Phase 1 기반
 
 **목적:** 공식 CLI를 검증된 정책과 구조화 프로토콜로 실행한다.
 
-**포함 범위:** CLI 탐지·버전·로그인 상태, 앱 프로필 선택, 프로필별 `CODEX_HOME` binding, 구조화 `ProcessRunner`, stdout/stderr 스트리밍, 중단·종료, Codex app-server JSON Schema 또는 TypeScript schema와 capability 검증, `CLAUDE_CONFIG_DIR` 프로필 분리의 설치 버전·공식 문서 지원 여부 및 Claude 읽기 전용 실행 인수·turn 상한 검증.
+**포함 범위:** 기본 profile에 귀속된 Claude 실행파일 절대경로 지정·저장과 최소 설정 UI, 실행 직전 Claude executable trust 재검증, CLI 탐지·버전·필수 flag/tool allowlist 지원 여부·로그인 상태에 대한 정적 capability probe, 구조화 `ProcessRunner`의 one-shot 실행 계약. Codex는 trust 근거가 별도 문서 근거로 확인되고 구현계획이 승인되기 전까지 capability를 `Unsupported`로 fail-closed 보고한다. 프로필별 `CODEX_HOME` binding, `ProcessRunner` stdout/stderr 스트리밍·중단·종료, Codex app-server JSON Schema 또는 TypeScript schema와 capability 검증, Claude 설계 12 turns·리뷰 8 turns 실측 강제는 실제 provider 실행 오케스트레이션에 속하므로 Phase 4로 이관한다.
 
-**제외 범위:** 전체 하네스 상태 진행, 자동 수정, 사용자 병합.
+**제외 범위:** 전체 하네스 상태 진행, 자동 수정, 사용자 병합, profile 삭제·이름 변경·다중 profile 생성·관리, 일반 settings UI, Codex 설정 UI, 실제 설계·구현·리뷰 세션 실행, Codex app-server 세션과 `CODEX_HOME` 연동, provider 실행 이벤트 스트리밍·중단 처리.
 
-**완료 조건:** 프로필별 `CODEX_HOME`을 사용한 Codex app-server 세션과 검증된 Claude 읽기 전용 호출이 지원 버전에서 동작하고, 호환성 실패·중단·오류가 안전한 공통 provider event로 변환된다. Claude 프로필 분리의 공식 지원을 확인하지 못하면 인증 파일 복사나 세션 조작 없이 장비별 단일 로그인을 사용한다. Claude의 필수 flag·tool 제한·설계 12 turns·리뷰 8 turns 계약을 지원하지 않으면 실행을 차단하고, Codex는 `exec`로 자동 fallback하지 않는다.
+**완료 조건:** Claude 실행파일 trust 재검증과 capability probe(버전, 필수 flag/tool allowlist 지원 여부, 로그인 상태)가 지원 버전에서 fail-closed로 동작하고, 기본 profile의 Claude executable binding과 최소 설정 UI로 실행파일 경로를 지정·저장·새로고침할 수 있다. Claude 프로필 분리의 공식 지원을 확인하지 못하면 인증 파일 복사나 세션 조작 없이 장비별 단일 로그인을 사용한다. Codex executable trust 근거가 확인되기 전까지 Codex capability는 항상 `Unsupported`로 보고되며 `exec`로 자동 fallback하지 않는다. 실제 설계·리뷰 세션 실행, Claude turn 상한(설계 12/리뷰 8) 실측 강제, 프로필별 `CODEX_HOME`을 사용한 Codex app-server 세션과 호환성 실패·중단·오류의 공통 provider event 변환은 Phase 4에서 provider 선택과 실제 실행 시작 흐름 안에서 구현한다.
 
 ## Phase 4 — 하네스 워크플로
 
 **선행조건:** Phase 2와 Phase 3 완료.
 
-**목적:** Claude 설계 → Codex 구현·테스트 → Claude 리뷰의 순차 워크플로를 완성한다.
+**목적:** 설계 → 구현·테스트 → 리뷰의 순차 워크플로를 완성한다. 각 작업 종류의 provider는 사용자가 실행 시 eligible provider 중에서 선택한다.
 
-**포함 범위:** 상태 머신, Context Package revision, Claude 설계, 고위험 판별, Codex 구현, 검증 명령, 최대 2회 테스트 수정, Claude 리뷰, 최대 1회 중대 문제 재수정, 작업 성격·단계별 모델 추천, 추천 모델·이유·예상 비용 등급 또는 호출 규모 표시, 사용자 override와 프로젝트별 모델 고정.
+**포함 범위:** 상태 머신, Context Package revision, 설계 단계, 고위험 판별, 구현 단계, 검증 명령, 최대 2회 테스트 수정, 리뷰 단계, 최대 1회 중대 문제 재수정, 작업 종류·단계별 모델 추천, 추천 provider·모델·이유·예상 비용 등급 또는 호출 규모 표시, 사용자 override와 프로젝트별 모델 고정. provider 선택과 실제 실행 시작 흐름 안에서 실제 설계·리뷰 세션 실행과 Claude turn 상한(설계 12/리뷰 8) 실측 강제, 호환성 실패·중단·오류를 안전한 공통 provider event로 변환하는 처리, `ProcessRunner` stdout/stderr 스트리밍·중단·종료를 구현한다. 실제 Codex 활성화는 별도 trust 근거와 구현계획 승인 후에만 가능하며, 승인 이후 프로필별 `CODEX_HOME`을 사용한 Codex app-server 세션을 이 provider 실행 오케스트레이션에 포함한다.
 
 **제외 범위:** 기본 브랜치 병합, 보관 기간 자동 정리, 업데이트.
 
-**완료 조건:** 작업이 재시도 상한과 자동 수정 금지 조건을 지키며 `AwaitingUserDiffApproval` 또는 근거가 기록된 중단 상태에 도달한다. 모델 추천은 근거와 예상 비용 등급 또는 호출 규모를 표시하고 사용자 override와 프로젝트 고정을 우선하며, 승인 없이 더 비싼 모델로 자동 상향하지 않는다.
+**완료 조건:** 작업이 재시도 상한과 자동 수정 금지 조건을 지키며 `AwaitingUserDiffApproval` 또는 근거가 기록된 중단 상태에 도달한다. 모델 추천은 근거와 예상 비용 등급 또는 호출 규모를 표시하고 사용자 override와 프로젝트 고정을 우선하며, 승인 없이 더 비싼 모델로 자동 상향하지 않는다. Claude 설계·리뷰 세션은 turn 상한을 실측 강제하고, provider 호환성 실패·중단·오류는 공통 provider event로 안전하게 변환되며, Codex app-server 세션은 trust 승인 전까지 활성화되지 않는다.
 
 ## Phase 5 — 승인·검토·병합
 

@@ -6,11 +6,12 @@ use chatoms_domain::{
     TaskStateTransitionSnapshot,
 };
 use chatoms_ports::git::RepositoryKind;
+use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
-    ActiveLease, FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationAttempt,
-    GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
-    ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, RepositoryError,
-    RepositoryErrorCode, TaskGitIsolation,
+    ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitIsolationStatus,
+    GitOperationAttempt, GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt,
+    GitOperationReceiptKind, ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary,
+    ProviderBindingRecord, RepositoryError, RepositoryErrorCode, TaskGitIsolation,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -605,6 +606,202 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
             true,
         )?;
         transaction.commit().map_err(operation_failed)
+    }
+
+    fn ensure_default_profile_and_claude_binding(
+        &mut self,
+        profile: &AppProfileRecord,
+        binding: &ProviderBindingRecord,
+    ) -> Result<ProviderBindingRecord, RepositoryError> {
+        validate_profile_record(profile)?;
+        validate_binding_record(binding)?;
+        if binding.app_profile_id != profile.id {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        if binding.provider_kind != ProviderKind::Claude {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO app_profiles (id, name, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (name) DO NOTHING",
+                params![
+                    profile.id,
+                    profile.name,
+                    profile.created_at_ms,
+                    profile.updated_at_ms
+                ],
+            )
+            .map_err(operation_failed)?;
+        let existing_profile_id: String = transaction
+            .query_row(
+                "SELECT id FROM app_profiles WHERE name = ?1",
+                [&profile.name],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        transaction
+            .execute(
+                "INSERT INTO provider_bindings (
+                    id, app_profile_id, provider_kind, display_name,
+                    executable_path, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (app_profile_id, provider_kind) DO NOTHING",
+                params![
+                    binding.id,
+                    existing_profile_id,
+                    provider_kind_text(binding.provider_kind),
+                    binding.display_name,
+                    binding.executable_path,
+                    binding.created_at_ms,
+                    binding.updated_at_ms
+                ],
+            )
+            .map_err(operation_failed)?;
+        let result = load_binding_by_profile_and_kind(
+            &transaction,
+            &existing_profile_id,
+            ProviderKind::Claude,
+        )?
+        .ok_or_else(|| repository_error(RepositoryErrorCode::OperationFailed))?;
+        transaction.commit().map_err(operation_failed)?;
+        Ok(result)
+    }
+
+    fn get_claude_binding(
+        &mut self,
+        profile_name: &str,
+    ) -> Result<Option<ProviderBindingRecord>, RepositoryError> {
+        let profile_id: Option<String> = self
+            .database
+            .raw_mut()
+            .query_row(
+                "SELECT id FROM app_profiles WHERE name = ?1",
+                [profile_name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(operation_failed)?;
+        match profile_id {
+            Some(id) => {
+                load_binding_by_profile_and_kind(self.database.raw_mut(), &id, ProviderKind::Claude)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn update_claude_executable_path(
+        &mut self,
+        binding_id: &str,
+        executable_path: Option<&str>,
+        updated_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        if updated_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current_kind: Option<String> = transaction
+            .query_row(
+                "SELECT provider_kind FROM provider_bindings WHERE id = ?1",
+                [binding_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(operation_failed)?;
+        match current_kind {
+            None => return Err(repository_error(RepositoryErrorCode::BindingNotFound)),
+            Some(kind) if kind != "Claude" => {
+                return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+            }
+            _ => {}
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE provider_bindings
+                 SET executable_path = ?1, updated_at_ms = ?2
+                 WHERE id = ?3 AND provider_kind = 'Claude'",
+                params![executable_path, updated_at_ms, binding_id],
+            )
+            .map_err(operation_failed)?;
+        if changed != 1 {
+            return Err(repository_error(RepositoryErrorCode::OperationFailed));
+        }
+        transaction.commit().map_err(operation_failed)
+    }
+}
+
+fn validate_profile_record(profile: &AppProfileRecord) -> Result<(), RepositoryError> {
+    if profile.id.is_empty()
+        || profile.name.trim().is_empty()
+        || profile.created_at_ms < 0
+        || profile.updated_at_ms < profile.created_at_ms
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn validate_binding_record(binding: &ProviderBindingRecord) -> Result<(), RepositoryError> {
+    if binding.id.is_empty()
+        || binding.app_profile_id.is_empty()
+        || binding.display_name.trim().is_empty()
+        || binding.created_at_ms < 0
+        || binding.updated_at_ms < binding.created_at_ms
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    if binding
+        .executable_path
+        .as_deref()
+        .is_some_and(|path| path.is_empty())
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn load_binding_by_profile_and_kind(
+    connection: &Connection,
+    profile_id: &str,
+    kind: ProviderKind,
+) -> Result<Option<ProviderBindingRecord>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT id, app_profile_id, provider_kind, display_name,
+                    executable_path, created_at_ms, updated_at_ms
+             FROM provider_bindings
+             WHERE app_profile_id = ?1 AND provider_kind = ?2",
+            params![profile_id, provider_kind_text(kind)],
+            |row| {
+                Ok(ProviderBindingRecord {
+                    id: row.get(0)?,
+                    app_profile_id: row.get(1)?,
+                    provider_kind: kind,
+                    display_name: row.get(3)?,
+                    executable_path: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                    updated_at_ms: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(operation_failed)
+}
+
+const fn provider_kind_text(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Claude => "Claude",
+        ProviderKind::Codex => "Codex",
     }
 }
 

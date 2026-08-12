@@ -6,6 +6,8 @@ pub mod filesystem;
 pub mod git;
 pub mod path;
 pub mod permissions;
+pub mod process;
+pub mod provider;
 pub mod repository;
 
 use error::PortFailure;

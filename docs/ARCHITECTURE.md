@@ -87,23 +87,28 @@ adapters / infrastructure
 - model recommendation은 application layer의 정책 service가 담당하고 UI나 provider adapter가 임의로 결정하지 않는다.
 - Gajae-Code에서 참고한 workflow 개념은 외부 adapter가 아니라 내부 Harness Orchestrator/Workflow Engine이 소유한다. 외부 Gajae-Code 저장소나 protocol에는 의존하지 않는다.
 
-## Claude와 Codex의 역할
+## Provider 실행 계약과 capability
 
-### Claude
+설계·구현·리뷰는 작업 종류이며 특정 provider에 고정하지 않는다. 사용자가 각 작업 종류의 실행을 시작할 때 eligible provider를 선택한다. Eligible provider란 capability가 `Supported`이고 해당 작업 종류에 대한 승인된 실행 계약을 가진 provider다. 장기적으로 Claude Code와 Codex 모두 모든 작업 종류에 선택 가능해야 하지만, 실제 선택 가능 여부는 각 provider의 capability 상태와 승인된 실행 계약에 따라 제한된다. 실행 중 provider 자동 전환과 세션 handoff는 현재 범위에 포함하지 않는다.
 
-- 요구사항 분석, 설계, 위험 식별과 최종 리뷰를 담당한다.
-- 설계 실행은 최대 12 turns, 리뷰 실행은 최대 8 turns로 제한한다.
-- 공통 기본 계약은 `--permission-mode plan`, `Read`·`Glob`·`Grep`만 허용, `Edit`·`Write`·`NotebookEdit`·`Bash`·web·MCP 도구 차단, stream-json 출력과 최종 JSON Schema 검증이다.
-- Phase 3에서 설치된 Claude CLI 버전이 필요한 flag, tool 제한, 구조화 출력과 turn 상한을 지원하는지 런타임 검증한다.
-- 필수 정책이 지원되지 않으면 권한을 완화하거나 비구조화 출력으로 전환하지 않고 실행을 차단한다.
-- Claude는 코드를 직접 수정하지 않는다.
+### Claude — 현재 승인된 실행 계약
 
-### Codex
+- 현재 승인된 계약은 읽기 전용 설계·리뷰 계약뿐이다. 설계 실행은 최대 12 turns, 리뷰 실행은 최대 8 turns로 제한한다.
+- 읽기 전용 실행은 `--permission-mode plan`으로 파일 편집을 차단하고 `--tools "Read,Glob,Grep"` allowlist로 `Bash`를 포함한 나머지 도구를 차단하는 조합이다. 두 flag는 함께 필요하며 `--disallowedTools`가 아니라 이 allowlist를 우선 사용한다. 출력은 stream-json, 최종 결과는 JSON Schema로 검증한다.
+- Claude provider capability의 `Supported`는 executable trust, 로컬 CLI compatibility, 로그인 상태를 모두 통과했을 때만 성립한다.
+- Compatibility와 로그인 상태 검증은 모델 세션을 시작하거나 외부로 전송하지 않는 정적·로컬 preflight로 수행하며, 신뢰된 사용자 지정 executable에 대해서만 `--version`, 도움말 기반 필수 flag 확인과 `claude auth status` 종료 코드를 사용한다.
+- `claude auth status`의 표준출력·표준오류는 절대 읽지 않으며 로그인 여부는 종료 코드만으로 판정한다.
+- `--version`과 도움말 기반 필수 flag 확인의 표준출력은 compatibility 판정에 필요한 범위에서만 메모리 안에서 일시적으로 해석한 뒤 즉시 폐기한다. 표준오류는 이때도 해석·표시·저장하지 않으며, 원문은 UI, 로그, DB, artifact 어디에도 표시·저장하지 않는다.
+- 실제 모델 호출을 통한 검증은 작업 시작 시 공급자 전송 승인 이후 단계로 미룬다.
+- 신뢰·버전·필수 flag·로그인 상태 중 하나라도 실패하거나 판정이 모호하면 `Supported`가 아닌 `Unsupported`로 fail-closed 처리하며 권한을 완화하거나 비구조화 출력으로 전환하지 않는다.
+- Claude 구현(write) 실행 계약은 장기 목표에 포함되나 아직 정의되지 않았다. 정의 전까지 Claude를 구현 작업 종류에 선택할 수 없다.
 
-- 구현, 리팩터링, 테스트 작성·실행과 승인된 수정 작업을 담당한다.
-- `codex app-server`의 stdio JSONL 프로토콜을 주 제어 방식으로 사용한다.
-- 설치된 Codex에서 JSON Schema 또는 TypeScript schema를 생성한 뒤 프로토콜과 필수 capability를 검증한다.
-- 호환성 검증이 실패해도 `codex exec`로 자동 전환하지 않는다.
+### Codex — 현재 capability 상태
+
+- 구현 실행 계약이 정의되어 있으며 `codex app-server`의 stdio JSONL 프로토콜을 제어 방식으로 사용한다. 공식 문서 기준 `codex app-server`의 maturity는 Experimental이다.
+- schema/capability 검증 절차는 공식 문서 근거가 확인되고 별도 구현계획이 승인되기 전까지 구현하지 않는다.
+- Codex 실행파일의 서명 또는 동등한 신뢰 근거가 확인되기 전까지 Codex capability는 `Unsupported`로 보고되며, 호환성 검증이 실패해도 `codex exec`로 자동 전환하지 않는다.
+- Codex의 설계·리뷰 실행 계약은 아직 정의되지 않았다.
 
 ## Context Package 흐름
 
@@ -113,19 +118,21 @@ adapters / infrastructure
 sequenceDiagram
     participant User
     participant App as Application Layer
-    participant Claude
+    participant DP as 설계 Provider
     participant Store as SQLite / Artifacts
-    participant Codex
+    participant IP as 구현 Provider
+    participant RP as 리뷰 Provider
 
     User->>App: 작업 요청·완료 조건·금지 범위
-    App->>Claude: 마스킹된 설계 Context Package
-    Claude-->>App: 구조화된 설계·위험
+    User->>App: 각 작업 종류별 eligible provider 선택
+    App->>DP: 마스킹된 설계 Context Package
+    DP-->>App: 구조화된 설계·위험
     App->>Store: 결정·승인·Context revision 기록
-    App->>Codex: 승인 범위와 설계 Context Package
-    Codex-->>App: 변경·테스트·수정 결과
+    App->>IP: 승인 범위와 설계 Context Package
+    IP-->>App: 변경·테스트·수정 결과
     App->>Store: diff·로그·결과 artifact 기록
-    App->>Claude: 실제 worktree 참조와 리뷰 package
-    Claude-->>App: 구조화된 리뷰 결과
+    App->>RP: 실제 worktree 참조와 리뷰 package
+    RP-->>App: 구조화된 리뷰 결과
 ```
 
 - Package에는 작업 ID, 프로젝트/worktree, 기준 commit, 요구사항, 완료 조건, 결정, 금지 범위, 관련 파일, 테스트 결과, 수정 이력과 미해결 위험을 포함한다.

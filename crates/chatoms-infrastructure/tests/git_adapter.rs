@@ -2,6 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::RecvTimeoutError,
 };
 
 use chatoms_infrastructure::git::GitCliAdapter;
@@ -134,6 +135,55 @@ fn initialization_uses_existing_ignore_and_creates_verified_snapshot() {
             .lines()
             .any(|path| path == "ignored.txt")
     );
+}
+
+#[test]
+fn large_worktree_file_set_drains_check_attr_stdin_and_stdout_concurrently() {
+    const FILE_COUNT: usize = 5_000;
+    let project = tempfile::tempdir().expect("plain project");
+    for index in 0..FILE_COUNT {
+        fs::write(
+            project.path().join(format!("file-{index:05}.txt")),
+            b"payload\n",
+        )
+        .expect("fixture file");
+    }
+    let (_control, mut adapter) = adapter();
+    adapter
+        .initialize_repository(project.path())
+        .expect("initialize repository");
+    git(project.path(), &["config", "user.name", "ChatOMS Test"]);
+    git(
+        project.path(),
+        &["config", "user.email", "chatoms@example.invalid"],
+    );
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let snapshot_root = project.path().to_path_buf();
+    let worker = std::thread::spawn(move || {
+        let outcome = adapter.create_initial_snapshot(&snapshot_root);
+        let _ = sender.send(outcome);
+    });
+
+    match receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(outcome) => {
+            worker
+                .join()
+                .expect("snapshot worker thread must not panic");
+            let commit = outcome.expect("snapshot commit over a large file set");
+            assert_eq!(commit.len(), 40);
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            worker
+                .join()
+                .expect("snapshot worker thread panicked before sending result");
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            panic!(
+                "check-attr stdin/stdout drain deadlocked past the 30s bound for {FILE_COUNT} files"
+            )
+        }
+    }
 }
 
 #[test]

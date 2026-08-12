@@ -28,16 +28,26 @@
 
 ```text
 사용자 작업 입력
-→ Claude 요구사항 분석 및 설계
-→ Codex 구현
+→ 설계 (사용자가 eligible provider를 선택)
+→ 구현 (사용자가 eligible provider를 선택)
 → 빌드 및 테스트
-→ 테스트 실패 시 Codex 자동 수정
-→ Claude 최종 리뷰
-→ 중대 문제 발생 시 Codex 재수정
+→ 테스트 실패 시 구현 provider 자동 수정
+→ 최종 리뷰 (사용자가 eligible provider를 선택)
+→ 중대 문제 발생 시 구현 provider 재수정
 → 사용자 diff 검토
 → 기본 브랜치 병합
 → 작업 기록 보관
 ```
+
+Eligible provider란 다음 두 조건을 모두 만족하는 provider다.
+
+* 해당 시점의 provider capability가 `Supported`
+* 해당 provider가 그 작업 종류에 대한 승인된 실행 계약을 가짐
+
+현재 승인된 실행 계약은 다음과 같다.
+
+* Claude: 읽기 전용 설계·리뷰 계약만 승인됨. 구현(write) 실행 계약은 장기 목표이나 미정의·미구현이다.
+* Codex: 구현 실행 계약이 정의되어 있으나, executable trust 근거가 확인되기 전까지 capability가 `Unavailable`이므로 현재 선택할 수 없다.
 
 Gajae-Code는 인증 프록시나 모델 API 변환기로 사용하지 않는다.
 
@@ -189,24 +199,27 @@ Gajae-Code 하네스 전체 단계를 사용하지 않고 Claude 또는 Codex를
 
 복잡한 개발 자동화에 사용한다.
 
-기본 역할 순서는 다음과 같다.
+기본 작업 종류 순서는 다음과 같다.
 
 ```text
-Claude 설계
-→ Codex 구현
-→ Claude 리뷰
+설계
+→ 구현
+→ 리뷰
 ```
 
-Claude는 기본적으로 다음을 담당한다.
+설계, 구현, 리뷰는 작업 종류이며 특정 provider에 고정하지 않는다. 사용자가 각 작업 종류의 실행을 시작할 때 eligible provider 중 하나를 선택한다. 장기적으로 Claude Code와 Codex 모두 모든 작업 종류에 선택 가능해야 하지만, 실제 선택 가능 여부는 각 provider의 capability 상태와 해당 작업 종류에 대한 승인된 실행 계약에 따라 결정된다.
+
+### 작업 종류별 역할
+
+설계 단계:
 
 * 요구사항 분석
 * 코드베이스 구조 분석
 * 설계
 * 구현 계획
 * 위험 식별
-* 최종 코드 리뷰
 
-Codex는 기본적으로 다음을 담당한다.
+구현 단계:
 
 * 파일 생성 및 수정
 * 구현
@@ -216,9 +229,18 @@ Codex는 기본적으로 다음을 담당한다.
 * 빌드
 * 리뷰 지적 수정
 
-Claude는 기본적으로 읽기 전용으로 동작한다.
+리뷰 단계:
 
-Claude가 코드를 직접 수정하는 기능은 MVP에서 구현하지 않는다.
+* 최종 코드 리뷰
+
+### 현재 승인된 실행 계약
+
+| Provider | 설계 | 구현 | 리뷰 | 비고 |
+|---|---|---|---|---|
+| Claude | 읽기 전용 계약 승인됨 | 미정의 | 읽기 전용 계약 승인됨 | 구현(write) 계약은 장기 목표이나 미정의·미구현 |
+| Codex | 미정의 | 구현 계약 정의됨 | 미정의 | capability가 `Unavailable`이므로 현재 선택 불가 |
+
+실행 중 provider 자동 전환, 세션 handoff와 Context Package 구조 변경은 현재 범위에 포함하지 않는다.
 
 ---
 
@@ -232,14 +254,14 @@ Claude가 코드를 직접 수정하는 기능은 MVP에서 구현하지 않는�
 * 프로젝트 유효성 검사
 * Git 저장소 감지
 * Git이 아닌 폴더의 사용자 승인 후 초기화
-* Claude 설계 실행
+* 설계 실행 (eligible provider 선택)
 * 고위험 설계 승인
 * 작업별 Git branch 생성
 * 작업별 Git worktree 생성
-* Codex 구현
+* 구현 실행 (eligible provider 선택)
 * 빌드 및 테스트
 * 테스트 실패 자동 수정 최대 2회
-* Claude 최종 리뷰
+* 최종 리뷰 (eligible provider 선택)
 * 중대 문제 자동 재수정 최대 1회
 * 사용자 diff 검토
 * 사용자 승인 후 기본 브랜치 자동 병합
@@ -349,17 +371,16 @@ Claude의 설계가 완료되더라도 모든 작업에서 승인을 요구하�
 
 # 10. 모델 추천 정책
 
-앱은 작업 성격과 하네스 단계에 따라 Claude와 Codex 모델을 자동 추천한다.
+앱은 작업 종류와 eligible provider에 따라 모델을 자동 추천한다.
 
 작업 시작 전 다음 정보를 표시한다.
 
-* 선택된 Claude 모델
-* 선택된 Codex 모델
-* 각 모델이 담당하는 단계
+* 각 작업 종류에 대한 추천 provider와 모델
+* 해당 provider의 capability 상태
 * 선택 이유
 * 예상 비용 등급
 * 예상 호출 규모
-* 사용자가 변경할 수 있는 대안
+* 사용자가 변경할 수 있는 대안 (eligible provider 범위 내)
 
 비용 표시는 정확한 금액을 보장하지 않는다.
 
@@ -385,7 +406,7 @@ Claude의 설계가 완료되더라도 모든 작업에서 승인을 요구하�
 
 ## 10.2 프로젝트별 고정
 
-프로젝트별 Claude 및 Codex 모델 고정 설정을 지원한다.
+프로젝트별 provider 및 모델 고정 설정을 지원한다.
 
 프로젝트 고정 설정은 자동 추천보다 우선한다.
 
@@ -591,7 +612,7 @@ Context Package의 생성, 수정, 전달 내용은 작업 기록에 저장한�
 
 # 15. 테스트 및 자동 수정 정책
 
-Codex 구현 후 프로젝트에서 사용 가능한 검증 명령을 식별해 실행한다.
+구현 provider의 작업이 완료되면 프로젝트에서 사용 가능한 검증 명령을 식별해 실행한다.
 
 가능한 검증 항목:
 
@@ -605,7 +626,7 @@ Codex 구현 후 프로젝트에서 사용 가능한 검증 명령을 식별해 
 
 ## 15.1 테스트 실패 자동 수정
 
-테스트가 실패하면 Codex가 원인을 분석하고 최대 2회까지 자동 수정 및 재실행한다.
+테스트가 실패하면 구현 provider가 원인을 분석하고 최대 2회까지 자동 수정 및 재실행한다.
 
 각 시도는 이전 시도와 다른 원인 가설을 가져야 한다.
 
@@ -654,11 +675,11 @@ Codex 구현 후 프로젝트에서 사용 가능한 검증 명령을 식별해 
 
 ---
 
-# 16. Claude 최종 리뷰 정책
+# 16. 최종 리뷰 정책
 
-Codex 구현과 테스트가 완료되면 Claude가 최종 리뷰를 수행한다.
+구현과 테스트가 완료되면 리뷰 작업 종류에 대해 사용자가 선택한 eligible provider가 최종 리뷰를 수행한다.
 
-Claude는 실제 worktree의 파일과 Git diff를 직접 확인한다.
+리뷰 provider는 실제 worktree의 파일과 Git diff를 직접 확인한다.
 
 리뷰 항목:
 
@@ -688,9 +709,9 @@ Claude는 실제 worktree의 파일과 Git diff를 직접 확인한다.
 
 Critical 또는 Major 문제만 자동 재수정 대상으로 한다.
 
-Claude는 코드를 직접 수정하지 않는다.
+읽기 전용 실행 계약으로 리뷰하는 provider는 코드를 직접 수정하지 않는다.
 
-Claude가 다음 구조로 Codex에 수정 요청을 전달한다.
+리뷰 provider가 다음 구조로 구현 provider에 수정 요청을 전달한다.
 
 ```text
 문제 위치
@@ -703,9 +724,9 @@ Claude가 다음 구조로 Codex에 수정 요청을 전달한다.
 필수 재검증 항목
 ```
 
-Codex의 자동 재수정은 최대 1회다.
+구현 provider의 자동 재수정은 최대 1회다.
 
-재수정 후 관련 테스트와 회귀 테스트를 다시 실행하고 Claude가 재검토한다.
+재수정 후 관련 테스트와 회귀 테스트를 다시 실행하고 리뷰 provider가 재검토한다.
 
 다음 변경이 필요하면 자동 재수정하지 않는다.
 
@@ -1060,8 +1081,7 @@ MVP의 주요 화면은 다음과 같다.
 * 작업 요청 입력
 * 완료 조건 입력
 * 변경 금지 사항 입력
-* Claude 모델 추천
-* Codex 모델 추천
+* 작업 종류별 eligible provider와 모델 추천
 * 선택 이유
 * 예상 비용 등급
 * 하네스 실행 시작
@@ -1070,7 +1090,7 @@ MVP의 주요 화면은 다음과 같다.
 
 * 현재 단계
 * 전체 상태 전이
-* Claude·Codex 실행 상태
+* 선택된 provider 실행 상태
 * 현재 모델
 * worktree 경로
 * 실행 중인 명령
@@ -1135,12 +1155,12 @@ AwaitingGitInitApproval
 GitInitialized
 WorktreeCreating
 WorktreeReady
-PlanningWithClaude
+Planning
 AwaitingDesignApproval
-ImplementingWithCodex
+Implementing
 Testing
 AutoFixing
-ReviewingWithClaude
+Reviewing
 ReviewFixing
 AwaitingUserDiffApproval
 Merging
@@ -1155,6 +1175,8 @@ Cancelled
 CleanupPending
 Archived
 ```
+
+상태 이름은 작업 종류를 나타내며 provider를 내장하지 않는다. 각 실행 상태에는 사용자가 선택한 provider가 기록된다.
 
 각 상태에서 허용되는 명령과 다음 상태를 정의한다.
 
@@ -1255,12 +1277,12 @@ UI보다 도메인 로직과 안전성을 먼저 구현한다.
 ## Phase 4 — 하네스
 
 * 작업 상태 머신
-* Claude 설계 단계
+* 설계 단계 (사용자가 eligible provider 선택)
 * Context Package
-* Codex 구현 단계
+* 구현 단계 (사용자가 eligible provider 선택)
 * 테스트 실행
 * 자동 수정
-* Claude 리뷰
+* 리뷰 단계 (사용자가 eligible provider 선택)
 * 리뷰 재수정
 
 ## Phase 5 — 승인 및 병합

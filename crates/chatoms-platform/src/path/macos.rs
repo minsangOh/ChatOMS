@@ -39,6 +39,9 @@ impl AppPathResolver for MacOsPathResolver {
     ) -> Result<PathBuf, PathError> {
         unsupported()
     }
+    fn provider_preflight_dir(&self) -> Result<PathBuf, PathError> {
+        unsupported()
+    }
     fn validate_layout(&self) -> Result<ResolvedAppPaths, PathError> {
         unsupported()
     }
