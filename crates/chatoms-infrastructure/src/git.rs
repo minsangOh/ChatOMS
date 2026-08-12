@@ -5,6 +5,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    thread,
 };
 
 #[cfg(windows)]
@@ -141,15 +142,26 @@ impl GitCliAdapter {
             .stderr(Stdio::piped());
         configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
         let mut child = command.spawn().map_err(map_spawn_error)?;
-        if let Some(input) = input {
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| PortFailure::new(FailureCategory::Internal))?
-                .write_all(input)
-                .map_err(map_io_error)?;
-        }
-        child.wait_with_output().map_err(map_io_error)
+        let Some(input) = input else {
+            return child.wait_with_output().map_err(map_io_error);
+        };
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PortFailure::new(FailureCategory::Internal))?;
+        // The writer runs on its own thread so stdout/stderr draining below
+        // starts immediately instead of waiting for the full stdin write;
+        // otherwise a child that emits output before consuming all of stdin
+        // (e.g. `git check-attr --stdin`) can deadlock both pipes.
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(input));
+            let output = child.wait_with_output().map_err(map_io_error);
+            match writer.join() {
+                Ok(Ok(())) => output,
+                Ok(Err(write_error)) => Err(map_io_error(write_error)),
+                Err(_) => Err(PortFailure::new(FailureCategory::Internal)),
+            }
+        })
     }
 
     fn author_output(
