@@ -25,6 +25,26 @@ pub struct CapabilitySummary {
     pub native_permissions: CapabilityStatus,
 }
 
+/// Provider execution capability, kept separate from `CapabilitySummary` so
+/// platform and provider capability are never mixed. `None` means no
+/// `ProviderCapabilityPort` adapter is wired yet; callers must treat that
+/// the same as an unsupported capability rather than assuming success.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderCapabilitySummary {
+    pub claude: Option<CapabilityStatus>,
+    pub codex: Option<CapabilityStatus>,
+}
+
+impl ProviderCapabilitySummary {
+    #[must_use]
+    pub const fn not_yet_probed() -> Self {
+        Self {
+            claude: None,
+            codex: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SystemStatus {
     pub application_version: &'static str,
@@ -34,6 +54,7 @@ pub struct SystemStatus {
     pub logging_status: LoggingStatus,
     pub active_task_status: ActiveTaskStatus,
     pub capabilities: CapabilitySummary,
+    pub provider_capabilities: ProviderCapabilitySummary,
 }
 
 pub struct SystemService<'a, C> {
@@ -77,6 +98,7 @@ where
             logging_status: self.bootstrap.logging_status,
             active_task_status: self.bootstrap.active_task_status,
             capabilities,
+            provider_capabilities: ProviderCapabilitySummary::not_yet_probed(),
         })
     }
 }

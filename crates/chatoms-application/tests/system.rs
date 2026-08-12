@@ -106,6 +106,21 @@ fn insecure_storage_or_unavailable_database_is_unavailable() {
 }
 
 #[test]
+fn provider_capability_placeholder_is_fail_closed_and_does_not_affect_health() {
+    let bootstrap = bootstrap(
+        StorageStatus::Ready,
+        DatabaseStatus::Ready,
+        LoggingStatus::Ready,
+    );
+    let mut capability = CapabilityFake(Ok(capabilities(PlatformCapabilityStatus::Supported)));
+    let mut service = SystemService::new(&bootstrap, &mut capability);
+    let status = service.get_system_status().expect("system status");
+    assert_eq!(status.health, HealthStatus::Healthy);
+    assert_eq!(status.provider_capabilities.claude, None);
+    assert_eq!(status.provider_capabilities.codex, None);
+}
+
+#[test]
 fn capability_failure_maps_to_safe_application_error() {
     let bootstrap = bootstrap(
         StorageStatus::Ready,

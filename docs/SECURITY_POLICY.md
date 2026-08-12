@@ -108,6 +108,18 @@ Claude/Codex에 Context Package와 코드 문맥을 보내는 행위도 외부 �
 - Git capability는 asInvoker process에서만 제공한다. Windows token이 elevated, full-elevation 또는 high-integrity이면 ACL 판정을 완화하지 않고 unavailable로 처리한다. linked limited token을 자동 사용하거나 self-de-elevation하지 않으며, 사용자는 관리자 권한 없이 다시 실행해야 한다.
 - Startup reconciliation은 읽기 전용 Git 진단과 DB 상태 확정만 수행한다. 정확한 성공 receipt가 없는 외부 효과를 성공으로 추정하지 않는다.
 
+## Phase 3 provider(Claude/Codex) 실행파일 신뢰 경계
+
+- Claude와 Codex 실행파일은 프로필별로 사용자가 지정한 절대경로만 사용한다. PATH 탐색과 고정 후보 경로의 자동 스캔은 수행하지 않는다.
+- Claude 실행파일은 실행 직전마다 Windows Authenticode signer가 `Anthropic, PBC`인지 재검증한다. 서명을 확인할 수 없거나 검증에 실패하면 해당 provider capability를 `Unavailable`로 fail-closed 처리한다.
+- Codex 실행파일의 서명 또는 동등한 신뢰 근거가 공식 문서로 확인되고 별도 구현계획이 사용자 승인을 받기 전까지 Codex capability는 항상 `Unavailable`이다. 사용자가 실행파일 경로를 직접 지정했더라도 이 조건에 예외를 두지 않으며, `codex app-server` 연결 실패 시 `codex exec`로 자동 전환하지 않는다.
+- Claude와 Codex의 로그인 상태 확인 명령이 표준출력·표준오류로 반환하는 내용은 비신뢰 데이터로 취급한다. 로그인 여부 판정에는 검증된 종료 코드만 사용하며, 표준출력·표준오류 원문과 계정 이메일, 조직명, plan, 로그인 만료 시각, API key 일부 문자열은 UI, 로그, SQLite, artifact 어디에도 표시하거나 저장하지 않는다.
+- Claude/Codex local preflight 및 향후 provider 실행은 project root, task worktree, 상속된 process current directory를 working directory로 쓰지 않는다.
+- 검증·준비된 app-owned `temp` 하위 directory만 사용한다.
+- 실행 직전 non-reparse, secure, stable identity를 재검증한다.
+- 재검증 실패·불일치면 실행하지 않고 capability를 `Unavailable`로 fail-closed 처리한다.
+- 이 directory는 profile·task와 결합하지 않는 시스템 수준 preflight 경계다.
+
 ## 앱 데이터 경로와 Windows ACL
 
 - 영구 SQLite, log와 artifact 저장 전에 `SecureAppPaths`의 경로·권한 검증을 통과해야 한다. `Degraded`, `Insecure`, `Unsupported`, `Unknown`은 모두 저장 차단 상태다.

@@ -87,6 +87,9 @@ pub trait AppPathResolver {
         project_id: ProjectId,
         task_id: TaskId,
     ) -> Result<PathBuf, PathError>;
+    /// Fixed, system-level Claude/Codex provider preflight working directory
+    /// under `temp_dir`. Never bound to a project, task, or profile.
+    fn provider_preflight_dir(&self) -> Result<PathBuf, PathError>;
     fn validate_layout(&self) -> Result<ResolvedAppPaths, PathError>;
     fn validate_managed_path(&self, path: &std::path::Path) -> Result<(), PathError>;
 }

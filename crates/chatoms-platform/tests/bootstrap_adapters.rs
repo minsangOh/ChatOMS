@@ -126,6 +126,9 @@ impl AppPathResolver for TempResolver {
             .join(project_id.to_string())
             .join(task_id.to_string()))
     }
+    fn provider_preflight_dir(&self) -> Result<PathBuf, PathError> {
+        Ok(self.paths.temp_dir.join("provider-preflight"))
+    }
     fn validate_layout(&self) -> Result<ResolvedAppPaths, PathError> {
         if self.reject_layout {
             Err(PathError::new(PathErrorCode::ReparsePointRejected))

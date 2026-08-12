@@ -115,6 +115,10 @@ impl AppPathResolver for WindowsPathResolver {
         Ok(child)
     }
 
+    fn provider_preflight_dir(&self) -> Result<PathBuf, PathError> {
+        Ok(self.paths.temp_dir.join("provider-preflight"))
+    }
+
     fn validate_layout(&self) -> Result<ResolvedAppPaths, PathError> {
         validate_syntactic_layout(&self.paths)?;
         self.validate_existing_layout()?;
