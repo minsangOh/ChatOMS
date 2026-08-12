@@ -1,5 +1,7 @@
 pub(crate) const FOUNDATION_SQL: &str = include_str!("../../migrations/0001_foundation.sql");
 pub(crate) const GIT_ISOLATION_SQL: &str = include_str!("../../migrations/0002_git_isolation.sql");
+pub(crate) const PROVIDER_BINDING_SQL: &str =
+    include_str!("../../migrations/0003_provider_binding.sql");
 
 pub(crate) const METADATA_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (

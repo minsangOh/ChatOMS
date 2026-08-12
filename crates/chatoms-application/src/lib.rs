@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod error;
 pub mod git_isolation;
 pub mod projects;
+pub mod provider;
 pub mod system;
 pub mod tasks;
 

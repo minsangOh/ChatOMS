@@ -50,9 +50,10 @@ impl Migration {
     }
 }
 
-pub static FOUNDATION_MIGRATION: [Migration; 2] = [
+pub static FOUNDATION_MIGRATION: [Migration; 3] = [
     Migration::new(1, "foundation", schema::FOUNDATION_SQL),
     Migration::new(2, "git_isolation", schema::GIT_ISOLATION_SQL),
+    Migration::new(3, "provider_binding", schema::PROVIDER_BINDING_SQL),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

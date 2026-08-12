@@ -3,6 +3,7 @@ use std::{error::Error, fmt};
 use chatoms_domain::{GitOperationId, ProjectId, Task, TaskId, TaskStateTransition};
 
 use crate::git::RepositoryKind;
+use crate::provider::ProviderKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryErrorCode {
@@ -11,6 +12,7 @@ pub enum RepositoryErrorCode {
     TaskNotFound,
     DuplicateTask,
     IsolationNotFound,
+    BindingNotFound,
     DuplicateIsolation,
     VersionConflict,
     TransitionSequenceConflict,
@@ -198,6 +200,25 @@ pub struct ActiveLease {
     pub acquired_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppProfileRecord {
+    pub id: String,
+    pub name: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderBindingRecord {
+    pub id: String,
+    pub app_profile_id: String,
+    pub provider_kind: ProviderKind,
+    pub display_name: String,
+    pub executable_path: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 pub trait FoundationRepository {
     fn create_project(&mut self, _project: &ProjectRecord) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
@@ -375,6 +396,30 @@ pub trait FoundationRepository {
         _task: &Task,
         _transition: &TaskStateTransition,
         _isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn ensure_default_profile_and_claude_binding(
+        &mut self,
+        _profile: &AppProfileRecord,
+        _binding: &ProviderBindingRecord,
+    ) -> Result<ProviderBindingRecord, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn get_claude_binding(
+        &mut self,
+        _profile_name: &str,
+    ) -> Result<Option<ProviderBindingRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn update_claude_executable_path(
+        &mut self,
+        _binding_id: &str,
+        _executable_path: Option<&str>,
+        _updated_at_ms: i64,
     ) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }

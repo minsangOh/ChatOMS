@@ -233,7 +233,8 @@ impl CategorizedFailure for RepositoryError {
         match self.code() {
             RepositoryErrorCode::ProjectNotFound
             | RepositoryErrorCode::TaskNotFound
-            | RepositoryErrorCode::IsolationNotFound => FailureCategory::NotFound,
+            | RepositoryErrorCode::IsolationNotFound
+            | RepositoryErrorCode::BindingNotFound => FailureCategory::NotFound,
             RepositoryErrorCode::DuplicateProject
             | RepositoryErrorCode::DuplicateTask
             | RepositoryErrorCode::DuplicateIsolation => FailureCategory::AlreadyExists,

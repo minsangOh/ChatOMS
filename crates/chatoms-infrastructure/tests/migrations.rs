@@ -36,11 +36,13 @@ fn run_registry(
 
 #[test]
 fn production_registry_and_checksum_policy_are_valid() {
-    assert_eq!(FOUNDATION_MIGRATION.len(), 2);
+    assert_eq!(FOUNDATION_MIGRATION.len(), 3);
     assert_eq!(FOUNDATION_MIGRATION[0].version, 1);
     assert_eq!(FOUNDATION_MIGRATION[0].name, "foundation");
     assert_eq!(FOUNDATION_MIGRATION[1].version, 2);
     assert_eq!(FOUNDATION_MIGRATION[1].name, "git_isolation");
+    assert_eq!(FOUNDATION_MIGRATION[2].version, 3);
+    assert_eq!(FOUNDATION_MIGRATION[2].name, "provider_binding");
     validate_registry(&FOUNDATION_MIGRATION).expect("production registry must be valid");
 
     let checksum = FOUNDATION_MIGRATION[0].checksum_sha256();
@@ -545,21 +547,21 @@ fn registry_rejects_zero_non_one_start_duplicates_order_and_empty_fields() {
 fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     let database = TestDatabase::empty();
     let first = run_registry(&database, &FOUNDATION_MIGRATION).expect("first migration run");
-    assert_eq!(first.schema_version, 2);
-    assert_eq!(first.applied_count, 2);
+    assert_eq!(first.schema_version, 3);
+    assert_eq!(first.applied_count, 3);
 
     let connection = database.open_raw();
     let metadata: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations WHERE version = 2",
+             FROM schema_migrations WHERE version = 3",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("read migration metadata");
-    assert_eq!(metadata.0, 2);
-    assert_eq!(metadata.1, "git_isolation");
-    assert_eq!(metadata.2, FOUNDATION_MIGRATION[1].checksum_sha256());
+    assert_eq!(metadata.0, 3);
+    assert_eq!(metadata.1, "provider_binding");
+    assert_eq!(metadata.2, FOUNDATION_MIGRATION[2].checksum_sha256());
     assert!(metadata.3 >= 0);
     let schema_before: String = connection
         .query_row(
@@ -572,7 +574,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     drop(connection);
 
     let second = run_registry(&database, &FOUNDATION_MIGRATION).expect("second migration run");
-    assert_eq!(second.schema_version, 2);
+    assert_eq!(second.schema_version, 3);
     assert_eq!(second.applied_count, 0);
     let connection = database.open_raw();
     let schema_after: String = connection
@@ -584,11 +586,11 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
         )
         .expect("read schema snapshot after reopen");
     assert_eq!(schema_after, schema_before);
-    assert_eq!(count_rows(&connection, "schema_migrations"), 2);
+    assert_eq!(count_rows(&connection, "schema_migrations"), 3);
     let metadata_after: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations WHERE version = 2",
+             FROM schema_migrations WHERE version = 3",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
