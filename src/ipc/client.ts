@@ -5,7 +5,6 @@ import type {
   ActiveTaskStatusDto,
   BootstrapStatusDto,
   CapabilityDto,
-  CapabilityStatus,
   DatabaseStatus,
   HealthDto,
   HealthState,
