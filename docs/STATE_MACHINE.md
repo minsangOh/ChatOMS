@@ -22,14 +22,14 @@
 | `AwaitingGitInitApproval` | 대상 폴더가 Git 저장소가 아니며 초기화 설명이 준비됨 | `GitInitialized`, `RecoveryRequired`, `Cancelled`, `Paused` | `GitInitialized` 전이 필요 | 가능 |
 | `GitInitialized` | 승인된 Git 초기화와 초기 snapshot 완료 | `WorktreeCreating`, `Failed` | 완료된 승인 필요 | 가능 |
 | `WorktreeCreating` | 기준 commit을 고정하고 예약된 task branch를 실제 생성한 뒤 worktree 생성 중 | `WorktreeReady`, `RecoveryRequired`, `Failed`, `Cancelled` | 없음 | 조건부 |
-| `WorktreeReady` | 작업 전용 branch와 worktree 검증 완료 | `PlanningWithClaude`, `Paused`, `Cancelled` | 공급자 전송 동의 필요 | 가능 |
-| `PlanningWithClaude` | Claude가 읽기 전용으로 요구사항·설계 분석 중 | `AwaitingDesignApproval`, `ImplementingWithCodex`, `Paused`, `Failed`, `RecoveryRequired` | 고위험 설계일 때만 필요 | 가능 |
-| `AwaitingDesignApproval` | 고위험 설계와 영향 설명이 준비됨 | `ImplementingWithCodex`, `Paused`, `Cancelled` | 구현 전 필요 | 가능 |
-| `ImplementingWithCodex` | Codex가 승인 범위 안에서 worktree를 수정 중 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 범위 밖 동작은 별도 승인 | 가능 |
-| `Testing` | 선택된 format/lint/type/test/build 검증 실행 중 | `AutoFixing`, `ReviewingWithClaude`, `Paused`, `Failed`, `RecoveryRequired` | 승인 대상 명령이면 필요 | 가능 |
+| `WorktreeReady` | 작업 전용 branch와 worktree 검증 완료 | `Planning`, `Paused`, `Cancelled` | 공급자 전송 동의 필요 | 가능 |
+| `Planning` | 사용자가 선택한 eligible provider가 요구사항·설계 분석 중 | `AwaitingDesignApproval`, `Implementing`, `Paused`, `Failed`, `RecoveryRequired` | 고위험 설계일 때만 필요 | 가능 |
+| `AwaitingDesignApproval` | 고위험 설계와 영향 설명이 준비됨 | `Implementing`, `Paused`, `Cancelled` | 구현 전 필요 | 가능 |
+| `Implementing` | 사용자가 선택한 eligible provider가 승인 범위 안에서 worktree를 수정 중 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 범위 밖 동작은 별도 승인 | 가능 |
+| `Testing` | 선택된 format/lint/type/test/build 검증 실행 중 | `AutoFixing`, `Reviewing`, `Paused`, `Failed`, `RecoveryRequired` | 승인 대상 명령이면 필요 | 가능 |
 | `AutoFixing` | 서로 다른 가설로 테스트 실패 수정 중, 최대 2회 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 금지 범위 변경은 자동 전이 불가 | 가능 |
-| `ReviewingWithClaude` | Claude가 실제 파일, diff와 검증 결과를 읽기 전용 리뷰 중 | `ReviewFixing`, `AwaitingUserDiffApproval`, `Paused`, `Failed`, `RecoveryRequired` | 없음 | 가능 |
-| `ReviewFixing` | Codex가 Critical/Major 지적을 수정 중, 최대 1회 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 승인 범위 확대 시 필요 | 가능 |
+| `Reviewing` | 사용자가 선택한 eligible provider가 실제 파일, diff와 검증 결과를 리뷰 중 | `ReviewFixing`, `AwaitingUserDiffApproval`, `Paused`, `Failed`, `RecoveryRequired` | 없음 | 가능 |
+| `ReviewFixing` | 구현 provider가 Critical/Major 지적을 수정 중, 최대 1회 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 승인 범위 확대 시 필요 | 가능 |
 | `AwaitingUserDiffApproval` | 최종 diff, 테스트와 리뷰 결과가 준비됨 | `Merging`, `Paused`, `Cancelled` | `Merging` 전이 필요 | 가능 |
 | `Merging` | 승인된 단일 작업 commit을 기본 브랜치에 `--no-ff` 병합 중 | `PostMergeTesting`, `MergeConflict`, `RecoveryRequired`, `Failed` | 사전 diff 승인 필요 | 조건부 |
 | `MergeConflict` | Git이 자동 병합하지 못한 충돌이 존재함 | `Merging`, `Paused`, `Cancelled`, `Failed` | 의미 판단·수동 해결은 필요 | 가능 |
@@ -43,6 +43,8 @@
 | `CleanupPending` | 종료 결과가 확정된 뒤 보존 기간·안전 조건을 기다리거나 정리 재시도를 대기함 | `Archived` | 보존 표시가 있으면 자동 정리 금지 | 정리만 재시도 |
 | `Archived` | 적용 가능한 보존·정리 조건을 완료하여 실행·복구 대상이 아님 | 없음 | 없음 | 불가 |
 
+상태 이름은 작업 종류를 나타내며 provider를 내장하지 않는다. `Planning`, `Implementing`, `Reviewing` 등 실행 상태에는 사용자가 선택한 provider가 기록된다. 이 문서의 상태 이름 변경은 provider-neutral 목표 모델이며, Rust enum·SQLite 저장 값·TypeScript type의 실제 rename은 별도 구현 Unit으로 수행한다.
+
 `Completed`, `Failed`, `Cancelled`에서 정리 대상이 하나라도 있으면 반드시 `CleanupPending`을 거친다. 정리 대상이 전혀 없을 때만 `Archived`로 직접 이동할 수 있다. Task 기록과 artifact에는 [90일 보존 정책](PRODUCT_REQUIREMENTS.md#185-보관-기간)을, 병합된 branch와 worktree에는 [최소 7일 및 안전 조건](PRODUCT_REQUIREMENTS.md#20-병합-후-worktree-정리)을 적용하며 조건 충족 전에는 `Archived`로 이동하지 않는다.
 
 ## Operation class
@@ -53,7 +55,7 @@
 |---|---|
 | `ReadOnly` | 로컬 상태, 파일, Git 상태·diff와 저장된 기록 조회 |
 | `ProviderRead` | 코드 변경 권한이 없는 공급자 설계·리뷰 호출 |
-| `ProviderWrite` | 승인 범위에서 worktree 변경을 수행하는 Codex 공급자 호출 |
+| `ProviderWrite` | 승인 범위에서 worktree 변경을 수행하는 구현·수정 권한을 가진 공급자 호출 |
 | `GitIsolation` | 승인된 Git 초기화, task branch와 worktree 생성·검증 |
 | `WorktreeWrite` | task worktree 내부 파일 변경과 허용된 충돌 정리 |
 | `Validation` | format, lint, typecheck, test와 build 검증 |
@@ -71,12 +73,12 @@
 | `GitInitialized` | `ReadOnly`, `GitIsolation` |
 | `WorktreeCreating` | `ReadOnly`, `GitIsolation` |
 | `WorktreeReady` | `ReadOnly`, `ApprovalDecision` |
-| `PlanningWithClaude` | `ReadOnly`, `ProviderRead` |
+| `Planning` | `ReadOnly`, `ProviderRead` |
 | `AwaitingDesignApproval` | `ReadOnly`, `ApprovalDecision` |
-| `ImplementingWithCodex` | `ReadOnly`, `ProviderWrite`, `WorktreeWrite` |
+| `Implementing` | `ReadOnly`, `ProviderWrite`, `WorktreeWrite` |
 | `Testing` | `ReadOnly`, `Validation` |
 | `AutoFixing` | `ReadOnly`, `ProviderWrite`, `WorktreeWrite`, `Validation` |
-| `ReviewingWithClaude` | `ReadOnly`, `ProviderRead` |
+| `Reviewing` | `ReadOnly`, `ProviderRead` |
 | `ReviewFixing` | `ReadOnly`, `ProviderWrite`, `WorktreeWrite`, `Validation` |
 | `AwaitingUserDiffApproval` | `ReadOnly`, `ApprovalDecision` |
 | `Merging` | `ReadOnly`, `Commit`, `Merge` |
@@ -98,8 +100,8 @@
 ## 사용자 승인이 필요한 주요 전이
 
 - `AwaitingGitInitApproval → GitInitialized`
-- `WorktreeReady → PlanningWithClaude`: 작업별 공급자 전송 1회 동의
-- `AwaitingDesignApproval → ImplementingWithCodex`
+- `WorktreeReady → Planning`: 작업별 공급자 전송 1회 동의
+- `AwaitingDesignApproval → Implementing`
 - 승인 범위를 확대하는 구현·테스트·리뷰 수정
 - `AwaitingUserDiffApproval → Merging`
 - 의미 판단이 필요한 `MergeConflict → Merging`

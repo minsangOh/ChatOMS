@@ -6,9 +6,9 @@
 |---|---|---|
 | 기술 스택 | 확정 | Tauri 2 + React + TypeScript strict + Rust + SQLite를 사용한다. |
 | 플랫폼 | 확정 | Windows Native를 우선 지원하고 macOS를 지원한다. WSL은 MVP에서 제외한다. |
-| Codex 제어 | 확정 | 설치된 Codex에서 생성한 JSON Schema 또는 TypeScript schema와 capability를 검증한 뒤 `codex app-server`를 주 제어 인터페이스로 사용한다. |
+| Codex 제어 | 확정 | `codex app-server`를 제어 인터페이스로 사용한다. 공식 문서 기준 app-server의 maturity는 Experimental이며, schema/capability 검증 절차는 공식 문서 근거가 확인되고 별도 구현계획이 승인되기 전까지 구현하지 않는다. |
 | Codex fallback | 확정 | app-server 호환 실패 시 `codex exec`로 자동 전환하지 않는다. |
-| 공급자 역할 | 확정 | Claude 설계 → Codex 구현·테스트 → Claude 리뷰 순서로 실행하며 Claude는 코드를 직접 수정하지 않는다. |
+| 작업 종류와 provider 분리 | 확정 | 설계·구현·리뷰는 작업 종류이며 특정 provider에 고정하지 않는다. 사용자가 각 작업 종류의 실행을 시작할 때 capability가 `Supported`이고 해당 작업 종류에 대한 승인된 실행 계약을 가진 eligible provider 중 하나를 선택한다. 장기적으로 Claude Code와 Codex 모두 모든 작업 종류에 선택 가능해야 하지만, 실제 선택 가능 여부는 provider별 capability 상태와 승인된 실행 계약에 따라 제한된다. 실행 중 provider 자동 전환, 세션 handoff와 Context Package 구조 변경은 현재 범위에 포함하지 않는다. |
 | 모델 간 문맥 | 확정 | 전체 대화 대신 작업별로 versioned Context Package를 생성·마스킹·기록해 전달한다. |
 | 공급자 외부 전송 | 확정 | 작업 시작 시 공급자와 데이터 범위를 한 번 승인하고 해당 작업의 후속 호출에만 재사용한다. |
 | 격리 수준 | 확정 | ChatOMS application policy와 공식 CLI 권한·sandbox를 조합하며 OS 전체 수준의 완전 격리를 보장하지 않는다. |
@@ -30,8 +30,10 @@
 | 작업 격리 cardinality | 확정 | 한 `Task`는 하나의 프로젝트, 정확히 하나의 task branch와 최대 하나의 worktree만 가진다. |
 | 동시성과 lease | 확정 | 여러 프로젝트를 등록할 수 있지만 앱 전체의 활성 작업은 하나다. `Paused`, `RecoveryRequired`, `UnknownExternalEffect`를 포함한 모든 실행 비종료 상태가 `ActiveTaskLease`를 유지하고 `Completed`, `Failed`, `Cancelled` 진입 시에만 해제한다. |
 | Migration 경계 | 확정 | 검증된 ChatOMS 내부 SQLite forward migration과 사용자 대상 프로젝트의 schema·migration·데이터 변환 정책을 분리하며, 후자는 별도 사용자 승인이 필요하다. |
-| Claude 읽기 전용 계약 | 확정 | 설계 최대 12 turns, 리뷰 최대 8 turns를 적용한다. 필수 flag·tool 제한·구조화 출력 지원은 Phase 3에서 설치 버전으로 검증하고, 지원 실패 시 권한 완화 없이 실행을 차단한다. |
-| 프로필 연동 구현 시점 | 확정 | Phase 1은 `AppProfile`·`ProviderBinding` 모델만 정의한다. Phase 3에서 프로필 선택, 프로필별 `CODEX_HOME`과 Claude 프로필 분리의 공식 지원 여부를 검증한다. 미지원 시 Claude는 장비별 단일 로그인을 사용한다. |
+| Claude 읽기 전용 설계·리뷰 계약 | 확정 | Claude를 설계 또는 리뷰 작업 종류에 사용할 때의 현재 승인된 실행 계약이다. 설계 최대 12 turns, 리뷰 최대 8 turns를 적용한다. 읽기 전용 실행은 `--permission-mode plan`으로 편집을 차단하고 `--tools "Read,Glob,Grep"` allowlist로 `Bash`를 포함한 나머지 도구를 차단하는 조합으로 구성하며, `--disallowedTools`가 아니라 이 allowlist를 우선 사용한다. Claude provider capability의 `Supported`는 executable trust, 로컬 CLI compatibility, 로그인 상태를 모두 통과했을 때만 성립하며, 실제 모델 세션을 시작하지 않는 정적·로컬 preflight로 검증한다. `claude auth status`의 표준출력·표준오류는 절대 읽지 않고 종료 코드만으로 로그인 여부를 판정한다. `--version`과 도움말 기반 필수 flag 확인의 표준출력은 compatibility 판정에 필요한 범위에서만 메모리 안에서 일시적으로 해석한 뒤 즉시 폐기하며, 표준오류는 이때도 해석·표시·저장하지 않는다. 원문은 UI, 로그, DB, artifact 어디에도 표시·저장하지 않는다. 신뢰·버전·필수 flag·로그인 상태 중 하나라도 실패하거나 판정이 모호하면 `Supported`가 아닌 `Unsupported`로 fail-closed 처리한다. Claude 구현(write) 실행 계약은 장기 목표에 포함되나 아직 정의되지 않았다. 정의 전까지 Claude를 구현 작업 종류에 선택할 수 없다. |
+| Claude executable trust | 확정 | 프로필별 사용자 지정 절대경로만 사용하며 PATH 탐색과 고정 후보 경로 자동 스캔을 하지 않는다. Windows Authenticode signer `Anthropic, PBC`를 실행 직전마다 재검증하고, 서명을 확인할 수 없거나 검증에 실패하면 capability를 `Unavailable`로 fail-closed 처리한다. |
+| Codex executable trust | 확정 | 서명 또는 동등한 신뢰 근거가 공식 문서로 확인되고 별도 구현계획이 승인되기 전까지 Codex capability는 `Unavailable`로 고정한다. 사용자 지정 경로에도 예외를 두지 않으며 `codex exec` 자동 fallback을 추가하지 않는다. |
+| 프로필 연동 구현 시점 | 확정 | Phase 1은 `AppProfile`·`ProviderBinding` 모델만 정의한다. Phase 3은 Claude provider enablement를 우선하여 기본 profile에 귀속된 Claude 실행파일 절대경로 지정·저장과 Claude capability 새로고침만 구현하며 profile 선택 UI는 후속 Phase로 미룬다. 이는 역할 고정이 아니라 provider enablement 우선순위 결정이다. 프로필별 `CODEX_HOME`과 Claude 프로필 분리의 공식 지원 여부 검증은 이번 Phase 3에서 구현하지 않으며, 그때까지 Codex capability는 「Codex executable trust」에 따라 `Unavailable`로 고정한다. Claude 프로필 분리의 공식 지원을 확인하지 못하면 Claude는 장비별 단일 로그인을 사용한다. |
 | 모델 추천 구현 시점 | 확정 | model recommendation은 application layer 정책 service로 두고 Phase 4에서 추천 근거·비용 정보, 사용자 override와 프로젝트별 고정을 구현한다. 승인 없는 고비용 모델 자동 상향은 금지한다. |
 | 보존 기간 | 확정 | 완료·중단 작업 기록은 90일, 병합된 worktree와 작업 branch는 안전 조건 충족 시까지 최소 7일 보존한다. |
 | 업데이트 배포 | Phase 7 전 결정 | 배포 채널, 릴리스 저장소, 서명키 보관 주체와 플랫폼별 rollback 방식을 Phase 7 시작 전에 확정한다. GitHub Releases와 CI 서명키는 후보일 뿐 현재 결정이 아니다. |
@@ -60,4 +62,4 @@
 | IPC DTO 및 경로 정책 | 확정 | Application read model과 serde DTO를 분리하고 camelCase를 사용한다. `ProjectDto`에는 전체 root path를 포함하지 않으며 IPC error에는 source, path, SQL, SID, stack 또는 secret을 포함하지 않는다. |
 | Frontend IPC boundary | 확정 | Page는 `invoke`를 직접 호출하지 않고 중앙 typed client의 read-only API만 사용한다. Response는 `unknown`에서 DTO guard로 검증하고 오류는 승인된 code·message·severity·retry만 render한다. |
 | Frontend state 관리 | 확정 | Phase 1 `/system`과 `/projects`는 React local component state를 사용한다. 별도 state management 또는 query/cache package를 추가하지 않는다. |
-| Frontend mutation 범위 | 확정 | Project root path와 task mutation UI는 노출하지 않는다. Task 생성·전이, Git/provider, settings, updater와 installer UI는 해당 후속 Phase까지 구현하지 않는다. |
+| Frontend mutation 범위 | 확정 | Project root path와 task mutation UI는 노출하지 않는다. Task 생성·전이, Git/provider, settings, updater와 installer UI는 해당 후속 Phase까지 구현하지 않는다. 유일한 예외로 Phase 3은 기본 profile의 Claude 실행파일 사용자 지정 절대경로 선택·저장과 Claude capability 새로고침만 수행하는 최소 UI를 허용한다. 이 예외에서도 PATH 미탐색, 실행 직전 trust 재검증과 capability fail-closed 정책은 「Claude executable trust」·「Claude 읽기 전용 설계·리뷰 계약」 결정을 그대로 따른다. 예외를 일반 settings UI, profile 관리 UI, Codex 설정 UI로 확장하지 않으며 profile 삭제, 이름 변경과 다중 profile 생성·관리는 이번 범위 밖으로 후속 Phase에 둔다. |

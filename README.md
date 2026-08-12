@@ -13,13 +13,13 @@ corepack pnpm build
 
 Tauri uses the same `corepack pnpm build` entrypoint before its Rust build.
 
-ChatOMS는 공식 Claude Code CLI와 공식 Codex CLI를 로컬에서 조율하는 크로스플랫폼 데스크톱 AI 코딩 하네스다. Claude가 요구사항 분석·설계·최종 리뷰를 담당하고, Codex가 격리된 Git worktree에서 구현·테스트·수정을 수행하는 순차 워크플로를 GUI로 제공하는 것이 목표다.
+ChatOMS는 공식 Claude Code CLI와 공식 Codex CLI를 로컬에서 조율하는 크로스플랫폼 데스크톱 AI 코딩 하네스다. 설계·구현·리뷰의 순차 워크플로를 GUI로 제공하며, 각 작업 종류의 실행 시 사용자가 capability와 실행 계약 조건을 만족하는 eligible provider를 선택한다.
 
 ## MVP 범위
 
 - 여러 로컬 프로젝트를 목록에 등록할 수 있다.
 - 전체 앱에서 활성 작업은 최대 하나이며, 한 작업은 하나의 프로젝트, 정확히 하나의 task branch와 최대 하나의 worktree만 사용한다.
-- 작업 흐름은 Claude 설계 → Codex 구현·테스트 → Claude 리뷰 → 사용자 diff 승인 → 기본 브랜치 병합 순서다.
+- 작업 흐름은 설계 → 구현·테스트 → 리뷰 → 사용자 diff 승인 → 기본 브랜치 병합 순서다. 각 작업 종류에서 사용자가 eligible provider를 선택한다.
 - 테스트 실패 자동 수정은 최대 2회, 중대 리뷰 문제 재수정은 최대 1회다.
 - 로컬 기록, 민감정보 마스킹, 비정상 종료 복구와 보존 정책을 포함한다.
 - 병렬 작업, 원격 Git 쓰기, 자동 push/PR/배포, 팀 기능, 클라우드 동기화와 중앙 서버는 제외한다.
