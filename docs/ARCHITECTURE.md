@@ -107,7 +107,7 @@ adapters / infrastructure
 
 - 구현 실행 계약이 정의되어 있으며 `codex app-server`의 stdio JSONL 프로토콜을 제어 방식으로 사용한다. 공식 문서 기준 `codex app-server`의 maturity는 Experimental이다.
 - schema/capability 검증 절차는 공식 문서 근거가 확인되고 별도 구현계획이 승인되기 전까지 구현하지 않는다.
-- Codex 실행파일의 서명 또는 동등한 신뢰 근거가 확인되기 전까지 Codex capability는 `Unavailable`이며, 호환성 검증이 실패해도 `codex exec`로 자동 전환하지 않는다.
+- Codex 실행파일의 서명 또는 동등한 신뢰 근거가 확인되기 전까지 Codex capability는 `Unsupported`로 보고되며, 호환성 검증이 실패해도 `codex exec`로 자동 전환하지 않는다.
 - Codex의 설계·리뷰 실행 계약은 아직 정의되지 않았다.
 
 ## Context Package 흐름
