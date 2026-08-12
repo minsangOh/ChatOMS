@@ -1,3 +1,4 @@
+import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
@@ -6,8 +7,10 @@ import { toFrontendError, type FrontendError } from "../ipc/errors";
 import type { IpcClient } from "../ipc/client";
 import type {
   BootstrapStatusDto,
+  CapabilityStatus,
   HealthState,
   LegacyMigrationDiagnosticDto,
+  RefreshOutcome,
   SystemStatusDto,
 } from "../ipc/types";
 
@@ -182,6 +185,8 @@ export function SystemPage({ client }: SystemPageProps) {
         )}
       </section>
 
+      <ProviderSection client={client} initialClaudeStatus={system.capabilities.claudeExecution} />
+
       <section className="content-card" aria-labelledby="capabilities-heading">
         <div className="section-heading">
           <div>
@@ -226,6 +231,99 @@ function Capability({ label, status }: { label: string; status: string }) {
         <StatusBadge status={status} />
       </dd>
     </div>
+  );
+}
+
+interface ProviderSectionProps {
+  client: IpcClient;
+  initialClaudeStatus: CapabilityStatus;
+}
+
+function ProviderSection({ client, initialClaudeStatus }: ProviderSectionProps) {
+  const [displayPath, setDisplayPath] = useState<string | null>(null);
+  const [claudeStatus, setClaudeStatus] = useState<CapabilityStatus>(initialClaudeStatus);
+  const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [saveError, setSaveError] = useState<FrontendError | null>(null);
+  const [refreshError, setRefreshError] = useState<FrontendError | null>(null);
+  const [refreshOutcome, setRefreshOutcome] = useState<RefreshOutcome | null>(null);
+
+  const handleChoose = useCallback(async () => {
+    setSaveError(null);
+    setRefreshOutcome(null);
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      title: "Choose Claude executable",
+    });
+    if (selected === null) return;
+    setSaving(true);
+    try {
+      const result = await client.setClaudeExecutablePath(selected);
+      setDisplayPath(result.displayPath);
+      setClaudeStatus(result.claudeExecution);
+    } catch (error: unknown) {
+      setSaveError(toFrontendError(error));
+    } finally {
+      setSaving(false);
+    }
+  }, [client]);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshError(null);
+    setRefreshOutcome(null);
+    setRefreshing(true);
+    try {
+      const result = await client.refreshClaudeCapability();
+      setRefreshOutcome(result.outcome);
+      setClaudeStatus(result.claudeExecution);
+    } catch (error: unknown) {
+      setRefreshError(toFrontendError(error));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [client]);
+
+  return (
+    <section className="content-card" aria-labelledby="provider-heading">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Provider configuration</p>
+          <h2 id="provider-heading">Claude executable</h2>
+        </div>
+        <StatusBadge status={claudeStatus} />
+      </div>
+      <dl className="detail-list">
+        <div>
+          <dt>Executable path</dt>
+          <dd>{displayPath ?? "Not configured"}</dd>
+        </div>
+      </dl>
+      <div className="action-row">
+        <button type="button" onClick={handleChoose} disabled={saving || refreshing}>
+          {saving ? "Saving…" : "Choose Claude executable"}
+        </button>
+        <button type="button" onClick={handleRefresh} disabled={saving || refreshing}>
+          {refreshing ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+      {saveError ? (
+        <p className="inline-error" role="alert">{saveError.message}</p>
+      ) : null}
+      {refreshError ? (
+        <p className="inline-error" role="alert">{refreshError.message}</p>
+      ) : null}
+      {refreshOutcome === "conflict" ? (
+        <p className="inline-notice" role="status">
+          다른 새로고침이 진행 중입니다. 잠시 후 다시 시도하세요.
+        </p>
+      ) : null}
+      {refreshOutcome === "superseded" ? (
+        <p className="inline-notice" role="status">
+          실행 파일 경로가 변경되어 결과를 적용하지 않았습니다. 새로고침을 다시 실행하세요.
+        </p>
+      ) : null}
+    </section>
   );
 }
 

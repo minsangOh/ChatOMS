@@ -56,9 +56,26 @@ pub fn handle_get_system_status(runtime: &ManagedRuntime) -> Result<SystemStatus
             } else {
                 crate::dto::CapabilityStatusDto::Unavailable
             };
+            let cached = ready.provider_capabilities.read_cache();
+            status.capabilities.claude_execution = cached_to_dto(cached.claude);
+            status.capabilities.codex_execution = cached_to_dto(cached.codex);
             Ok(status)
         }
         RuntimeSnapshot::Unavailable { error, .. } => Err(error.into()),
+    }
+}
+
+fn cached_to_dto(
+    status: Option<chatoms_application::system::CapabilityStatus>,
+) -> crate::dto::CapabilityStatusDto {
+    match status {
+        Some(chatoms_application::system::CapabilityStatus::Supported) => {
+            crate::dto::CapabilityStatusDto::Supported
+        }
+        Some(chatoms_application::system::CapabilityStatus::Unsupported) => {
+            crate::dto::CapabilityStatusDto::Unsupported
+        }
+        None => crate::dto::CapabilityStatusDto::Unavailable,
     }
 }
 

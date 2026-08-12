@@ -130,6 +130,19 @@ export interface TaskTransitionDto {
   occurredAtMs: number;
 }
 
+export interface SetClaudeExecutablePathDto {
+  displayPath: string;
+  claudeExecution: CapabilityStatus;
+}
+
+export type RefreshOutcome = "completed" | "superseded" | "conflict";
+
+export interface RefreshClaudeCapabilityDto {
+  outcome: RefreshOutcome;
+  claudeExecution: CapabilityStatus;
+  codexExecution: CapabilityStatus;
+}
+
 export interface IpcErrorDto {
   code: string;
   message: string;

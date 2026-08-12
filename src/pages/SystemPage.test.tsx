@@ -2,7 +2,11 @@ import "../test/setup";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 import { FrontendError } from "../ipc/errors";
-import type { SystemStatusDto } from "../ipc/types";
+import type { RefreshClaudeCapabilityDto, SetClaudeExecutablePathDto, SystemStatusDto } from "../ipc/types";
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn(async () => null),
+}));
 import {
   bootstrapStatus,
   createFakeClient,
@@ -165,4 +169,100 @@ it("does not render extra source, path, SQL, SID, or secret fields", async () =>
   );
   expect(await screen.findByText("An internal error occurred.")).toBeVisible();
   expect(document.body.textContent).not.toMatch(/SELECT|C:\\private|S-1-5-21|secret/);
+});
+
+it("renders provider section with Not configured when no path is set", async () => {
+  render(<SystemPage client={createFakeClient()} />);
+  expect(await screen.findByRole("heading", { name: "Claude executable" })).toBeVisible();
+  expect(screen.getByText("Not configured")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Choose Claude executable" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+});
+
+it("shows masked path after file selection and save", async () => {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  vi.mocked(open).mockResolvedValueOnce("C:\\Users\\test\\claude.exe");
+  const setClaudeExecutablePath = vi.fn<(path: string) => Promise<SetClaudeExecutablePathDto>>(
+    async () => ({
+      displayPath: "%USERPROFILE%\\claude.exe",
+      claudeExecution: "unavailable",
+    }),
+  );
+  render(<SystemPage client={createFakeClient({ setClaudeExecutablePath })} />);
+  await screen.findByRole("heading", { name: "Claude executable" });
+  fireEvent.click(screen.getByRole("button", { name: "Choose Claude executable" }));
+  await waitFor(() => expect(setClaudeExecutablePath).toHaveBeenCalledWith("C:\\Users\\test\\claude.exe"));
+  expect(await screen.findByText("%USERPROFILE%\\claude.exe")).toBeVisible();
+  expect(document.body.textContent).not.toContain("C:\\Users\\test");
+});
+
+it("does not call save when file selection is cancelled", async () => {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  vi.mocked(open).mockResolvedValueOnce(null);
+  const setClaudeExecutablePath = vi.fn();
+  render(<SystemPage client={createFakeClient({ setClaudeExecutablePath })} />);
+  await screen.findByRole("heading", { name: "Claude executable" });
+  fireEvent.click(screen.getByRole("button", { name: "Choose Claude executable" }));
+  await waitFor(() => expect(open).toHaveBeenCalled());
+  expect(setClaudeExecutablePath).not.toHaveBeenCalled();
+});
+
+it("shows Conflict message when refresh returns conflict outcome", async () => {
+  const refreshClaudeCapability = vi.fn<() => Promise<RefreshClaudeCapabilityDto>>(
+    async () => ({
+      outcome: "conflict",
+      claudeExecution: "unavailable",
+      codexExecution: "unsupported",
+    }),
+  );
+  render(<SystemPage client={createFakeClient({ refreshClaudeCapability })} />);
+  await screen.findByRole("heading", { name: "Claude executable" });
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  expect(await screen.findByText(/다른 새로고침이 진행 중입니다/)).toBeVisible();
+});
+
+it("shows Superseded message when refresh returns superseded outcome", async () => {
+  const refreshClaudeCapability = vi.fn<() => Promise<RefreshClaudeCapabilityDto>>(
+    async () => ({
+      outcome: "superseded",
+      claudeExecution: "unavailable",
+      codexExecution: "unsupported",
+    }),
+  );
+  render(<SystemPage client={createFakeClient({ refreshClaudeCapability })} />);
+  await screen.findByRole("heading", { name: "Claude executable" });
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  expect(await screen.findByText(/실행 파일 경로가 변경되어/)).toBeVisible();
+});
+
+it("shows save error when set_claude_executable_path fails", async () => {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  vi.mocked(open).mockResolvedValueOnce("C:\\claude.exe");
+  const setClaudeExecutablePath = vi.fn(async () => {
+    throw new FrontendError({
+      code: "APP_INVALID_INPUT",
+      message: "The supplied data is invalid.",
+      severity: "warning",
+      retry: "afterUserAction",
+    });
+  });
+  render(<SystemPage client={createFakeClient({ setClaudeExecutablePath })} />);
+  await screen.findByRole("heading", { name: "Claude executable" });
+  fireEvent.click(screen.getByRole("button", { name: "Choose Claude executable" }));
+  expect(await screen.findByText("The supplied data is invalid.")).toBeVisible();
+});
+
+it("shows refresh error when refresh_claude_capability fails", async () => {
+  const refreshClaudeCapability = vi.fn(async () => {
+    throw new FrontendError({
+      code: "APP_INTERNAL",
+      message: "An internal error occurred.",
+      severity: "critical",
+      retry: "never",
+    });
+  });
+  render(<SystemPage client={createFakeClient({ refreshClaudeCapability })} />);
+  await screen.findByRole("heading", { name: "Claude executable" });
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  expect(await screen.findByText("An internal error occurred.")).toBeVisible();
 });

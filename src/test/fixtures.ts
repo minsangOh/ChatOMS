@@ -55,6 +55,8 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
       throw new Error("not implemented in frontend tests");
     },
     listTaskHistory: async () => [],
+    setClaudeExecutablePath: async () => ({ displayPath: "%USERPROFILE%\\claude.exe", claudeExecution: "unavailable" as const }),
+    refreshClaudeCapability: async () => ({ outcome: "completed" as const, claudeExecution: "unavailable" as const, codexExecution: "unsupported" as const }),
     ...overrides,
   };
 }

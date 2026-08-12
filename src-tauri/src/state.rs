@@ -1,11 +1,34 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
+use chatoms_application::system::CapabilityStatus as AppCapabilityStatus;
 use chatoms_application::{bootstrap::BootstrapStatus, error::ApplicationError};
 use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition};
 use chatoms_infrastructure::bootstrap::{
     LegacyMigrationDiagnostic, SharedDatabase, SharedFoundationRepository, SharedLoggingGuard,
     SharedResolvedAppPaths,
 };
+#[cfg(windows)]
+pub type PreflightDirectory = chatoms_platform::preflight::TrustedPreflightWorkingDirectory;
+
+#[cfg(not(windows))]
+#[derive(Clone, Debug)]
+pub struct PreflightDirectory;
+
+#[cfg(not(windows))]
+impl PreflightDirectory {
+    pub fn revalidate(&self) -> Result<(), chatoms_ports::error::PortFailure> {
+        Err(chatoms_ports::error::PortFailure::new(
+            chatoms_ports::error::FailureCategory::Unsupported,
+        ))
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        std::path::Path::new(".")
+    }
+}
 use chatoms_ports::{
     PlatformCapabilities, PlatformCapabilityPort, TimeProvider,
     error::PortFailure,
@@ -481,6 +504,106 @@ impl PlatformCapabilityPort for CapabilityHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CachedProviderCapabilities {
+    pub claude: Option<AppCapabilityStatus>,
+    pub codex: Option<AppCapabilityStatus>,
+}
+
+impl CachedProviderCapabilities {
+    const NOT_YET_PROBED: Self = Self {
+        claude: None,
+        codex: None,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshOutcome {
+    Completed,
+    Superseded,
+    Conflict,
+}
+
+#[derive(Clone)]
+pub struct ProviderCapabilityHandle {
+    generation: Arc<AtomicU64>,
+    cache: Arc<RwLock<CachedProviderCapabilities>>,
+    refreshing: Arc<Mutex<bool>>,
+}
+
+impl Default for ProviderCapabilityHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderCapabilityHandle {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            cache: Arc::new(RwLock::new(CachedProviderCapabilities::NOT_YET_PROBED)),
+            refreshing: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn read_cache(&self) -> CachedProviderCapabilities {
+        self.cache
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or(CachedProviderCapabilities::NOT_YET_PROBED)
+    }
+
+    pub fn invalidate_and_bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut cache) = self.cache.write() {
+            *cache = CachedProviderCapabilities::NOT_YET_PROBED;
+        }
+    }
+
+    pub fn try_begin_refresh(&self) -> Option<u64> {
+        let mut refreshing = self.refreshing.lock().ok()?;
+        if *refreshing {
+            return None;
+        }
+        *refreshing = true;
+        Some(self.generation.load(Ordering::Acquire))
+    }
+
+    pub fn finish_refresh(
+        &self,
+        captured_generation: u64,
+        capabilities: CachedProviderCapabilities,
+    ) -> RefreshOutcome {
+        let result = {
+            let current_generation = self.generation.load(Ordering::Acquire);
+            if current_generation != captured_generation {
+                RefreshOutcome::Superseded
+            } else if let Ok(mut cache) = self.cache.write() {
+                *cache = capabilities;
+                RefreshOutcome::Completed
+            } else {
+                RefreshOutcome::Superseded
+            }
+        };
+        if let Ok(mut refreshing) = self.refreshing.lock() {
+            *refreshing = false;
+        }
+        result
+    }
+
+    pub fn abort_refresh(&self) {
+        if let Ok(mut refreshing) = self.refreshing.lock() {
+            *refreshing = false;
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct RuntimeResources {
     pub paths: SharedResolvedAppPaths,
@@ -497,6 +620,8 @@ pub struct AppRuntime {
     pub git: GitServiceHandle,
     pub filesystem: FilesystemIdentityHandle,
     pub worktree_paths: WorktreePathHandle,
+    pub provider_capabilities: ProviderCapabilityHandle,
+    pub preflight_dir: Option<PreflightDirectory>,
     resources: RuntimeResources,
 }
 
@@ -507,6 +632,8 @@ pub struct RuntimePorts {
     pub git: GitServiceHandle,
     pub filesystem: FilesystemIdentityHandle,
     pub worktree_paths: WorktreePathHandle,
+    pub provider_capabilities: ProviderCapabilityHandle,
+    pub preflight_dir: Option<PreflightDirectory>,
 }
 
 impl AppRuntime {
@@ -523,6 +650,8 @@ impl AppRuntime {
             git: ports.git,
             filesystem: ports.filesystem,
             worktree_paths: ports.worktree_paths,
+            provider_capabilities: ports.provider_capabilities,
+            preflight_dir: ports.preflight_dir,
             resources,
         }
     }

@@ -30,7 +30,7 @@ describe("typed IPC client", () => {
       ["get_task", { taskId: "task-id" }],
       ["list_task_history", { taskId: "task-id" }],
     ]);
-    expect(Object.values(IPC_COMMANDS)).toHaveLength(16);
+    expect(Object.values(IPC_COMMANDS)).toHaveLength(18);
   });
 
   it("returns a validated result and rejects malformed success data safely", async () => {
@@ -39,6 +39,18 @@ describe("typed IPC client", () => {
 
     const malformed = createIpcClient(async () => ({ version: 1, source: "C:\\private" }));
     await expect(malformed.getVersion()).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+      message: "The application returned an invalid response.",
+    });
+  });
+
+  it("rejects a system status payload with an unrecognized provider capability value", async () => {
+    const malformedCapabilities = {
+      ...systemStatus,
+      capabilities: { ...systemStatus.capabilities, claudeExecution: "unknown" },
+    };
+    const client = createIpcClient(async () => malformedCapabilities);
+    await expect(client.getSystemStatus()).rejects.toMatchObject({
       code: "IPC_INVALID_RESPONSE",
       message: "The application returned an invalid response.",
     });
@@ -63,6 +75,34 @@ describe("typed IPC client", () => {
       ["approve_git_initialization", { taskId: "task-id", expectedVersion: 1 }],
       ["create_task_worktree", { taskId: "task-id", expectedVersion: 2 }],
     ]);
+  });
+
+  it("uses provider-specific command names and payload shapes", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.setClaudeExecutablePath("C:\\claude.exe");
+    await client.refreshClaudeCapability();
+    expect(transport.mock.calls).toEqual([
+      ["set_claude_executable_path", { path: "C:\\claude.exe" }],
+      ["refresh_claude_capability", undefined],
+    ]);
+  });
+
+  it("validates provider response shapes and rejects malformed data", async () => {
+    const valid = createIpcClient(async () => responses.set_claude_executable_path);
+    await expect(valid.setClaudeExecutablePath("path")).resolves.toMatchObject({
+      displayPath: "%USERPROFILE%\\claude.exe",
+      claudeExecution: "unavailable",
+    });
+
+    const malformedRefresh = createIpcClient(async () => ({
+      outcome: "invalid",
+      claudeExecution: "supported",
+      codexExecution: "unsupported",
+    }));
+    await expect(malformedRefresh.refreshClaudeCapability()).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
   });
 
   it("keeps only approved IPC error fields and masks string or unknown failures", async () => {
@@ -126,4 +166,6 @@ const responses: Record<string, unknown> = {
     terminalAtMs: null,
   },
   list_task_history: [],
+  set_claude_executable_path: { displayPath: "%USERPROFILE%\\claude.exe", claudeExecution: "unavailable" },
+  refresh_claude_capability: { outcome: "completed", claudeExecution: "supported", codexExecution: "unsupported" },
 };

@@ -5,6 +5,7 @@ import type {
   ActiveTaskStatusDto,
   BootstrapStatusDto,
   CapabilityDto,
+  CapabilityStatus,
   DatabaseStatus,
   HealthDto,
   HealthState,
@@ -13,6 +14,9 @@ import type {
   ProjectDto,
   ProjectCandidateDto,
   ProjectStatusDto,
+  RefreshClaudeCapabilityDto,
+  RefreshOutcome,
+  SetClaudeExecutablePathDto,
   TaskIsolationDto,
   StorageStatus,
   SystemStatusDto,
@@ -39,6 +43,8 @@ export const IPC_COMMANDS = {
   getActiveTask: "get_active_task",
   getTask: "get_task",
   listTaskHistory: "list_task_history",
+  setClaudeExecutablePath: "set_claude_executable_path",
+  refreshClaudeCapability: "refresh_claude_capability",
 } as const;
 
 export type InvokeTransport = (
@@ -63,6 +69,8 @@ export interface IpcClient {
   getActiveTask(): Promise<ActiveTaskDto | null>;
   getTask(taskId: string): Promise<TaskDto>;
   listTaskHistory(taskId: string): Promise<TaskTransitionDto[]>;
+  setClaudeExecutablePath(path: string): Promise<SetClaudeExecutablePathDto>;
+  refreshClaudeCapability(): Promise<RefreshClaudeCapabilityDto>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -113,6 +121,10 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
     getTask: (taskId) => request(IPC_COMMANDS.getTask, isTaskDto, { taskId }),
     listTaskHistory: (taskId) =>
       request(IPC_COMMANDS.listTaskHistory, isTaskTransitionDtoArray, { taskId }),
+    setClaudeExecutablePath: (path) =>
+      request(IPC_COMMANDS.setClaudeExecutablePath, isSetClaudeExecutablePathDto, { path }),
+    refreshClaudeCapability: () =>
+      request(IPC_COMMANDS.refreshClaudeCapability, isRefreshClaudeCapabilityDto),
   };
 }
 
@@ -166,6 +178,7 @@ const TASK_STATES: readonly TaskState[] = [
 const REPOSITORY_KINDS = ["git", "nonGit"] as const;
 const ISOLATION_STATUSES = ["awaitingGitInitApproval", "ready", "gitInitInProgress", "worktreeCreating", "worktreeReady", "recoveryRequired"] as const;
 const ISOLATION_BLOCKERS = ["dirtyRepository", "detachedHead", "unbornRepository", "missingCurrentBranch", "gitAuthorMissing", "gitOperationFailed", "recoveryRequired"] as const;
+const REFRESH_OUTCOMES: readonly RefreshOutcome[] = ["completed", "superseded", "conflict"];
 
 function isVersionDto(value: unknown): value is VersionDto {
   return isRecord(value) && typeof value.version === "string";
@@ -297,6 +310,27 @@ function isTaskTransitionDto(value: unknown): value is TaskTransitionDto {
 
 function isTaskTransitionDtoArray(value: unknown): value is TaskTransitionDto[] {
   return Array.isArray(value) && value.every(isTaskTransitionDto);
+}
+
+function isSetClaudeExecutablePathDto(
+  value: unknown,
+): value is SetClaudeExecutablePathDto {
+  return (
+    isRecord(value) &&
+    typeof value.displayPath === "string" &&
+    isOneOf(value.claudeExecution, CAPABILITY_STATUSES)
+  );
+}
+
+function isRefreshClaudeCapabilityDto(
+  value: unknown,
+): value is RefreshClaudeCapabilityDto {
+  return (
+    isRecord(value) &&
+    isOneOf(value.outcome, REFRESH_OUTCOMES) &&
+    isOneOf(value.claudeExecution, CAPABILITY_STATUSES) &&
+    isOneOf(value.codexExecution, CAPABILITY_STATUSES)
+  );
 }
 
 function isOneOf<T extends string>(value: unknown, allowed: readonly T[]): value is T {
