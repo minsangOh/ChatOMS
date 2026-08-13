@@ -19,12 +19,14 @@ use chatoms_ports::{
         GitService, ProjectInspection, RepositorySafetyToken, RepositoryStatus,
         WorktreeCreationOutcome,
     },
+    provider::ProviderKind,
     repository::{
-        ActiveLease, FoundationRepository, ProjectSummary, RepositoryError, RepositoryErrorCode,
+        ActiveLease, FoundationRepository, ProjectSummary, ProviderBindingRecord, RepositoryError,
+        RepositoryErrorCode, TaskPlanningResultRecord,
     },
 };
 
-use super::{REGISTERED_HANDLERS, projects, system, tasks};
+use super::{REGISTERED_HANDLERS, planning, projects, provider_eligibility, system, tasks};
 use crate::{
     dto::HealthStateDto,
     state::{
@@ -42,6 +44,9 @@ struct CallCounts {
 
 struct RepositoryFake {
     calls: Arc<CallCounts>,
+    claude_binding: Option<ProviderBindingRecord>,
+    task: Option<Task>,
+    planning_result: Option<TaskPlanningResultRecord>,
 }
 
 impl FoundationRepository for RepositoryFake {
@@ -55,6 +60,18 @@ impl FoundationRepository for RepositoryFake {
     }
     fn get_task(&mut self, _task_id: TaskId) -> Result<Option<Task>, RepositoryError> {
         self.calls.task.fetch_add(1, Ordering::SeqCst);
+        Ok(self.task.clone())
+    }
+    fn get_task_planning_result(
+        &mut self,
+        _task_id: TaskId,
+    ) -> Result<Option<TaskPlanningResultRecord>, RepositoryError> {
+        Ok(self.planning_result.clone())
+    }
+    fn get_task_brief(
+        &mut self,
+        _task_id: TaskId,
+    ) -> Result<Option<chatoms_ports::repository::TaskBriefRecord>, RepositoryError> {
         Ok(None)
     }
     fn save_transition(
@@ -93,6 +110,12 @@ impl FoundationRepository for RepositoryFake {
     fn active_lease(&mut self) -> Result<Option<ActiveLease>, RepositoryError> {
         self.calls.active.fetch_add(1, Ordering::SeqCst);
         Ok(None)
+    }
+    fn get_claude_binding(
+        &mut self,
+        _profile_name: &str,
+    ) -> Result<Option<ProviderBindingRecord>, RepositoryError> {
+        Ok(self.claude_binding.clone())
     }
 }
 
@@ -263,6 +286,14 @@ fn ready_runtime_with_git(
     calls: Arc<CallCounts>,
     available: Result<bool, PortFailure>,
 ) -> ManagedRuntime {
+    ready_runtime_with_git_and_claude_binding(calls, available, None)
+}
+
+fn ready_runtime_with_git_and_claude_binding(
+    calls: Arc<CallCounts>,
+    available: Result<bool, PortFailure>,
+    claude_binding: Option<ProviderBindingRecord>,
+) -> ManagedRuntime {
     ManagedRuntime::ready(AppRuntime::new(
         BootstrapStatus {
             storage_status: StorageStatus::Ready,
@@ -273,7 +304,12 @@ fn ready_runtime_with_git(
             ready: true,
         },
         RuntimePorts {
-            repository: RepositoryHandle::new(RepositoryFake { calls }),
+            repository: RepositoryHandle::new(RepositoryFake {
+                calls,
+                claude_binding,
+                task: None,
+                planning_result: None,
+            }),
             time: TimeProviderHandle::new(TimeFake),
             capabilities: CapabilityHandle::new(CapabilityFake),
             git: crate::state::GitServiceHandle::new(GitCapabilityFake { available }),
@@ -286,6 +322,48 @@ fn ready_runtime_with_git(
             ),
             provider_capabilities: crate::state::ProviderCapabilityHandle::new(),
             preflight_dir: None,
+            planning_runs: crate::state::PlanningRunRegistry::new(),
+        },
+        RuntimeResources::default(),
+    ))
+}
+
+fn ready_runtime_with_task(
+    calls: Arc<CallCounts>,
+    task: Option<Task>,
+    planning_result: Option<TaskPlanningResultRecord>,
+) -> ManagedRuntime {
+    ManagedRuntime::ready(AppRuntime::new(
+        BootstrapStatus {
+            storage_status: StorageStatus::Ready,
+            database_status: DatabaseStatus::Ready,
+            logging_status: LoggingStatus::Ready,
+            active_task_status: ActiveTaskStatus::None,
+            application_version: APPLICATION_VERSION,
+            ready: true,
+        },
+        RuntimePorts {
+            repository: RepositoryHandle::new(RepositoryFake {
+                calls,
+                claude_binding: None,
+                task,
+                planning_result,
+            }),
+            time: TimeProviderHandle::new(TimeFake),
+            capabilities: CapabilityHandle::new(CapabilityFake),
+            git: crate::state::GitServiceHandle::new(GitCapabilityFake {
+                available: Ok(true),
+            }),
+            filesystem: crate::state::FilesystemIdentityHandle::new(
+                chatoms_platform::filesystem::WindowsFilesystemIdentity,
+            ),
+            worktree_paths: crate::state::WorktreePathHandle::new(
+                chatoms_platform::ManagedWorktreePaths::windows_from_environment()
+                    .expect("test worktree paths"),
+            ),
+            provider_capabilities: crate::state::ProviderCapabilityHandle::new(),
+            preflight_dir: None,
+            planning_runs: crate::state::PlanningRunRegistry::new(),
         },
         RuntimeResources::default(),
     ))
@@ -306,7 +384,12 @@ fn ready_runtime_with_blocking_git(
             ready: true,
         },
         RuntimePorts {
-            repository: RepositoryHandle::new(RepositoryFake { calls }),
+            repository: RepositoryHandle::new(RepositoryFake {
+                calls,
+                claude_binding: None,
+                task: None,
+                planning_result: None,
+            }),
             time: TimeProviderHandle::new(TimeFake),
             capabilities: CapabilityHandle::new(CapabilityFake),
             git: crate::state::GitServiceHandle::new(BlockingGitCapabilityFake {
@@ -322,6 +405,7 @@ fn ready_runtime_with_blocking_git(
             ),
             provider_capabilities: crate::state::ProviderCapabilityHandle::new(),
             preflight_dir: None,
+            planning_runs: crate::state::PlanningRunRegistry::new(),
         },
         RuntimeResources::default(),
     ))
@@ -463,6 +547,12 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
     assert!(!error.to_string().contains("SELECT"));
     assert!(!error.to_string().contains("C:\\"));
 
+    let error = provider_eligibility::handle_get_provider_eligibility(&runtime, &task_id)
+        .expect_err("missing task eligibility");
+    assert_eq!(error.code, "APP_NOT_FOUND");
+    assert_eq!(calls.task.load(Ordering::SeqCst), 2);
+    assert!(!error.to_string().contains("SELECT"));
+
     let runtime = unavailable_runtime();
     assert_eq!(
         system::handle_get_health(&runtime)
@@ -481,7 +571,7 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 
 #[test]
 fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 18);
+    assert_eq!(REGISTERED_HANDLERS.len(), 22);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -501,8 +591,12 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "get_active_task",
             "get_task",
             "list_task_history",
+            "get_provider_eligibility",
             "set_claude_executable_path",
             "refresh_claude_capability",
+            "start_claude_planning",
+            "cancel_claude_planning",
+            "get_planning_result",
         ]
     );
     for forbidden in [
@@ -685,4 +779,154 @@ fn generation_only_increments_after_invalidate_not_on_read() {
     assert_eq!(handle.generation(), 1);
     handle.invalidate_and_bump_generation();
     assert_eq!(handle.generation(), 2);
+}
+
+#[test]
+fn start_claude_planning_without_a_configured_executable_is_unsupported_and_starts_nothing() {
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), None);
+
+    let error = planning::handle_start_claude_planning(&runtime, &TaskId::new().to_string(), 1)
+        .expect_err("no executable path is configured");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+}
+
+#[test]
+fn start_claude_planning_without_a_preflight_directory_is_unsupported_and_starts_nothing() {
+    let calls = Arc::new(CallCounts::default());
+    let binding = ProviderBindingRecord {
+        id: "binding-1".to_owned(),
+        app_profile_id: "profile-1".to_owned(),
+        provider_kind: ProviderKind::Claude,
+        display_name: "Claude Code".to_owned(),
+        executable_path: Some("C:\\trusted\\claude.exe".to_owned()),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), Some(binding));
+
+    let error = planning::handle_start_claude_planning(&runtime, &TaskId::new().to_string(), 1)
+        .expect_err("no preflight directory is available in this test runtime");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+}
+
+#[test]
+fn cancel_claude_planning_reports_whether_a_matching_run_was_found() {
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime(calls);
+    let task_id = TaskId::new();
+
+    let none_found = planning::handle_cancel_claude_planning(&runtime, &task_id.to_string())
+        .expect("cancel never fails, even with nothing to cancel");
+    assert!(!none_found.requested);
+
+    let ready = runtime.ready_snapshot().expect("ready runtime");
+    let _signal = ready
+        .planning_runs
+        .register(task_id)
+        .expect("first registration for this task id");
+    let found = planning::handle_cancel_claude_planning(&runtime, &task_id.to_string())
+        .expect("cancel a registered run");
+    assert!(found.requested);
+}
+
+fn task_in_state(state: chatoms_domain::TaskState) -> Task {
+    use chatoms_domain::{TaskBranchIdentity, TaskSnapshot};
+    let id = TaskId::new();
+    Task::restore(TaskSnapshot {
+        id,
+        project_id: chatoms_domain::ProjectId::new(),
+        state,
+        version: 1,
+        task_branch_identity: TaskBranchIdentity::for_task(id),
+        resume_target_state: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        terminal_at_ms: None,
+    })
+    .expect("test task must satisfy domain invariants")
+}
+
+fn planning_result_record(task_id: TaskId, plan_text: &str) -> TaskPlanningResultRecord {
+    TaskPlanningResultRecord {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: chatoms_domain::WorkKind::Planning,
+        outcome: chatoms_ports::repository::PlanningResultOutcome::Completed,
+        exit_code: Some(0),
+        turn_count: Some(2),
+        started_at_ms: 10,
+        completed_at_ms: 20,
+        plan_text: Some(plan_text.to_owned()),
+    }
+}
+
+#[test]
+fn get_planning_result_returns_the_stored_result_only_in_awaiting_design_approval() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let record = planning_result_record(task.id(), "Add a CSV export button.");
+    let runtime = ready_runtime_with_task(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        Some(record),
+    );
+
+    let result = planning::handle_get_planning_result(&runtime, &task.id().to_string())
+        .expect("planning result lookup succeeds")
+        .expect("a result was recorded for this task");
+    assert_eq!(
+        result.plan_text.as_deref(),
+        Some("Add a CSV export button.")
+    );
+    assert_eq!(result.outcome, crate::dto::PlanningOutcomeDto::Completed);
+}
+
+#[test]
+fn get_planning_result_is_hidden_outside_awaiting_design_approval() {
+    let task = task_in_state(chatoms_domain::TaskState::Planning);
+    let record = planning_result_record(task.id(), "Should never surface.");
+    let runtime = ready_runtime_with_task(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        Some(record),
+    );
+
+    let result = planning::handle_get_planning_result(&runtime, &task.id().to_string())
+        .expect("planning result lookup succeeds");
+    assert!(
+        result.is_none(),
+        "a task outside AwaitingDesignApproval must never expose its planning result"
+    );
+}
+
+#[test]
+fn get_planning_result_reports_no_result_when_none_is_recorded_yet() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let result = planning::handle_get_planning_result(&runtime, &task.id().to_string())
+        .expect("planning result lookup succeeds");
+    assert!(result.is_none());
+}
+
+#[test]
+fn get_planning_result_for_a_missing_task_is_a_safe_not_found_error() {
+    let runtime = ready_runtime_with_task(Arc::new(CallCounts::default()), None, None);
+
+    let error = planning::handle_get_planning_result(&runtime, &TaskId::new().to_string())
+        .expect_err("missing task");
+    assert_eq!(error.code, "APP_NOT_FOUND");
 }

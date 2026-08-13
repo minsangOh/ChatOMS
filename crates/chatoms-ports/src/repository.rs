@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use chatoms_domain::{GitOperationId, ProjectId, Task, TaskId, TaskStateTransition};
+use chatoms_domain::{GitOperationId, ProjectId, Task, TaskId, TaskStateTransition, WorkKind};
 
 use crate::git::RepositoryKind;
 use crate::provider::ProviderKind;
@@ -126,6 +126,15 @@ pub enum GitIsolationStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskBriefRecord {
+    pub task_id: TaskId,
+    pub requirements: String,
+    pub completion_criteria: String,
+    pub prohibited_scope: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskGitIsolation {
     pub task_id: TaskId,
     pub project_id: ProjectId,
@@ -139,6 +148,51 @@ pub struct TaskGitIsolation {
     pub worktree_created_by_app: bool,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// Immutable evidence that the user granted one-time provider-transmission
+/// consent for a specific `(task, provider, work_kind, task_version)`
+/// combination. A new row is required whenever the task version changes
+/// (e.g. after a resume); existing rows are never updated or reused across
+/// versions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderConsent {
+    pub task_id: TaskId,
+    pub provider: ProviderKind,
+    pub work_kind: WorkKind,
+    pub approved_task_version: u64,
+    pub consented_at_ms: i64,
+}
+
+/// Terminal classification of a Claude Planning attempt, already reduced
+/// from the provider-specific streaming/exit-code/output-schema details to
+/// the small vocabulary the Task state machine understands. `Completed` is
+/// the only variant that carries a `plan_text`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanningResultOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    RecoveryRequired,
+}
+
+/// Immutable, 1:1-per-task record of a Claude Planning attempt's safe final
+/// result. `plan_text` is masked and size-bounded by the caller before this
+/// record is built (see `chatoms_infrastructure::redaction::SecretRedactor`)
+/// and is `Some` only when `outcome` is `Completed`; every other outcome
+/// carries `None`. Never carries raw stdout/stderr, transcript, tool I/O,
+/// login output, or an executable path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskPlanningResultRecord {
+    pub task_id: TaskId,
+    pub provider: ProviderKind,
+    pub work_kind: WorkKind,
+    pub outcome: PlanningResultOutcome,
+    pub exit_code: Option<i32>,
+    pub turn_count: Option<u32>,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub plan_text: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,6 +362,7 @@ pub trait FoundationRepository {
         _classified_transition: &TaskStateTransition,
         _lease_acquired_at_ms: i64,
         _isolation: &TaskGitIsolation,
+        _brief: Option<&TaskBriefRecord>,
     ) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
@@ -316,6 +371,25 @@ pub trait FoundationRepository {
         &mut self,
         _task_id: TaskId,
     ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn get_task_brief(
+        &mut self,
+        _task_id: TaskId,
+    ) -> Result<Option<TaskBriefRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Reads back the immutable, already-safe Claude Planning result row for
+    /// `task_id` (see [`TaskPlanningResultRecord`] for the safety
+    /// guarantees). Returns `None` when no attempt has been recorded yet.
+    /// Never re-derives or re-parses provider output — this is a read of
+    /// exactly what [`Self::save_planning_result`] persisted.
+    fn get_task_planning_result(
+        &mut self,
+        _task_id: TaskId,
+    ) -> Result<Option<TaskPlanningResultRecord>, RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
 
@@ -396,6 +470,47 @@ pub trait FoundationRepository {
         _task: &Task,
         _transition: &TaskStateTransition,
         _isolation: &TaskGitIsolation,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn get_provider_consent(
+        &mut self,
+        _task_id: TaskId,
+        _provider: ProviderKind,
+        _work_kind: WorkKind,
+        _approved_task_version: u64,
+    ) -> Result<Option<ProviderConsent>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically persists the `WorktreeReady -> Planning` state update and
+    /// its transition history record, along with `consent` when a new
+    /// consent grant must be recorded. Pass `None` when an already-valid
+    /// consent for the same task version is being reused: no consent row is
+    /// written, but the state/history write remains atomic on its own.
+    fn save_planning_transition(
+        &mut self,
+        _expected_version: u64,
+        _task: &Task,
+        _transition: &TaskStateTransition,
+        _consent: Option<&ProviderConsent>,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically persists a Claude Planning attempt's safe final result,
+    /// the resulting state update away from `Planning`, and its transition
+    /// history record. `terminal` must equal `task.state().is_terminal()`;
+    /// implementations cross-check this and release the `ActiveTaskLease`
+    /// only when it is `true` (matching `terminate_task`'s lease handling).
+    fn save_planning_result(
+        &mut self,
+        _expected_version: u64,
+        _task: &Task,
+        _transition: &TaskStateTransition,
+        _result: &TaskPlanningResultRecord,
+        _terminal: bool,
     ) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }

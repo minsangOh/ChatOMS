@@ -4,12 +4,14 @@ use std::str::FromStr;
 
 use chatoms_domain::{
     ActorKind, ProjectId, ReasonCode, RecoveryValidation, ResumeValidation, Task, TaskId,
-    TaskState, TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot,
+    TaskState, TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot, WorkKind,
 };
 use chatoms_infrastructure::database::{DatabaseConnection, SqliteFoundationRepository};
+use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
-    FoundationRepository, GitIsolationStatus, GitOperationReceiptKind, RepositoryError,
-    RepositoryErrorCode, TaskGitIsolation,
+    FoundationRepository, GitIsolationStatus, GitOperationReceiptKind, PlanningResultOutcome,
+    ProviderConsent, RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
+    TaskPlanningResultRecord,
 };
 use rusqlite::params;
 
@@ -113,6 +115,31 @@ fn assert_code(error: RepositoryError, code: RepositoryErrorCode) {
     assert_eq!(error.code(), code, "unexpected repository error: {error}");
 }
 
+fn advance_to_worktree_ready(repository: &mut impl FoundationRepository, task: &mut Task) {
+    advance(repository, task, TaskState::ProjectValidated, 110);
+    advance(repository, task, TaskState::WorktreeCreating, 120);
+    advance(repository, task, TaskState::WorktreeReady, 130);
+}
+
+fn advance_to_planning(repository: &mut impl FoundationRepository, task: &mut Task) {
+    advance_to_worktree_ready(repository, task);
+    advance(repository, task, TaskState::Planning, 140);
+}
+
+fn completed_planning_result(task_id: TaskId, plan_text: &str) -> TaskPlanningResultRecord {
+    TaskPlanningResultRecord {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        outcome: PlanningResultOutcome::Completed,
+        exit_code: Some(0),
+        turn_count: Some(5),
+        started_at_ms: 135,
+        completed_at_ms: 150,
+        plan_text: Some(plan_text.to_owned()),
+    }
+}
+
 #[test]
 fn isolation_task_intent_and_domain_transition_commit_atomically() {
     let fixture = Fixture::new();
@@ -138,7 +165,7 @@ fn isolation_task_intent_and_domain_transition_commit_atomically() {
         updated_at_ms: 101,
     };
     repository
-        .create_isolation_task(&task, &initial, &classified, 100, &isolation)
+        .create_isolation_task(&task, &initial, &classified, 100, &isolation, None)
         .expect("atomic isolation task");
     assert_eq!(
         repository
@@ -225,6 +252,126 @@ fn isolation_task_intent_and_domain_transition_commit_atomically() {
             .map(|lease| lease.task_id),
         Some(task.id())
     );
+}
+
+#[test]
+fn task_brief_persists_atomically_with_task_creation_and_is_immutable() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let task = Task::new(TaskId::new(), fixture.project_id, 100);
+    let initial = initial_transition(&task);
+    let mut classified_task = task.clone();
+    classified_task
+        .transition_to(TaskState::ProjectValidated, 101)
+        .expect("classify project");
+    let classified = transition(
+        TaskStateTransitionId::new(),
+        &classified_task,
+        TaskState::Created,
+        101,
+    );
+    let isolation = TaskGitIsolation {
+        task_id: task.id(),
+        project_id: fixture.project_id,
+        status: GitIsolationStatus::Ready,
+        operation_id: None,
+        expected_task_version: 1,
+        base_branch: None,
+        base_commit: None,
+        worktree_path: None,
+        branch_created_by_app: false,
+        worktree_created_by_app: false,
+        created_at_ms: 100,
+        updated_at_ms: 101,
+    };
+    let brief = TaskBriefRecord {
+        task_id: task.id(),
+        requirements: "Add CSV export".to_owned(),
+        completion_criteria: "Export button downloads a CSV".to_owned(),
+        prohibited_scope: "Do not touch the import pipeline".to_owned(),
+        created_at_ms: 100,
+    };
+    repository
+        .create_isolation_task(
+            &classified_task,
+            &initial,
+            &classified,
+            100,
+            &isolation,
+            Some(&brief),
+        )
+        .expect("atomic isolation task with brief");
+
+    assert_eq!(
+        repository.get_task_brief(task.id()).expect("brief"),
+        Some(brief)
+    );
+
+    let raw = fixture.database.open_raw();
+    let update_error = raw
+        .execute(
+            "UPDATE task_briefs SET requirements = 'changed' WHERE task_id = ?1",
+            [task.id().to_string()],
+        )
+        .expect_err("task_briefs must be immutable");
+    assert!(is_constraint_error(&update_error));
+    let delete_error = raw
+        .execute(
+            "DELETE FROM task_briefs WHERE task_id = ?1",
+            [task.id().to_string()],
+        )
+        .expect_err("task_briefs rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+}
+
+#[test]
+fn task_creation_without_brief_leaves_no_task_brief_row() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let task = Task::new(TaskId::new(), fixture.project_id, 100);
+    let initial = initial_transition(&task);
+    let mut classified_task = task.clone();
+    classified_task
+        .transition_to(TaskState::ProjectValidated, 101)
+        .expect("classify project");
+    let classified = transition(
+        TaskStateTransitionId::new(),
+        &classified_task,
+        TaskState::Created,
+        101,
+    );
+    let isolation = TaskGitIsolation {
+        task_id: task.id(),
+        project_id: fixture.project_id,
+        status: GitIsolationStatus::Ready,
+        operation_id: None,
+        expected_task_version: 1,
+        base_branch: None,
+        base_commit: None,
+        worktree_path: None,
+        branch_created_by_app: false,
+        worktree_created_by_app: false,
+        created_at_ms: 100,
+        updated_at_ms: 101,
+    };
+    repository
+        .create_isolation_task(
+            &classified_task,
+            &initial,
+            &classified,
+            100,
+            &isolation,
+            None,
+        )
+        .expect("atomic isolation task without brief");
+
+    assert_eq!(
+        repository.get_task_brief(task.id()).expect("no brief"),
+        None
+    );
+    assert_eq!(count_rows(&fixture.database.open_raw(), "task_briefs"), 0);
 }
 
 #[test]
@@ -413,6 +560,470 @@ fn general_transition_updates_version_sequence_and_round_trips() {
 }
 
 #[test]
+fn save_planning_transition_persists_consent_state_and_history_atomically() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_worktree_ready(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    let consent = ProviderConsent {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        approved_task_version: expected_version,
+        consented_at_ms: 140,
+    };
+    let previous_state = task.state();
+    task.transition_to(TaskState::Planning, 140)
+        .expect("WorktreeReady -> Planning");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 140);
+
+    repository
+        .save_planning_transition(expected_version, &task, &record, Some(&consent))
+        .expect("atomic planning transition");
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("get task"),
+        Some(task.clone())
+    );
+    assert_eq!(
+        repository
+            .list_task_transitions(task.id())
+            .expect("history")
+            .last()
+            .expect("latest transition"),
+        &record
+    );
+    let stored = repository
+        .get_provider_consent(
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            expected_version,
+        )
+        .expect("read consent")
+        .expect("consent persisted");
+    assert_eq!(stored, consent);
+}
+
+#[test]
+fn save_planning_transition_without_a_consent_writes_no_consent_row() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_worktree_ready(&mut repository, &mut task);
+    let expected_version = task.version();
+    let previous_state = task.state();
+    task.transition_to(TaskState::Planning, 140)
+        .expect("WorktreeReady -> Planning");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 140);
+
+    repository
+        .save_planning_transition(expected_version, &task, &record, None)
+        .expect("reused-consent planning transition");
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("get task"),
+        Some(task.clone())
+    );
+    assert_eq!(
+        repository
+            .get_provider_consent(
+                task.id(),
+                ProviderKind::Claude,
+                WorkKind::Planning,
+                expected_version,
+            )
+            .expect("read consent"),
+        None,
+        "no consent row must be written when reusing an existing grant"
+    );
+}
+
+#[test]
+fn save_planning_transition_rolls_back_consent_when_history_insert_fails() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, initial) = create_task(&mut repository, fixture.project_id);
+    advance_to_worktree_ready(&mut repository, &mut task);
+    let expected_version = task.version();
+    let before = task.clone();
+
+    let consent = ProviderConsent {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        approved_task_version: expected_version,
+        consented_at_ms: 140,
+    };
+    let previous_state = task.state();
+    task.transition_to(TaskState::Planning, 140)
+        .expect("WorktreeReady -> Planning");
+    // Reusing an already-persisted transition id forces the final history
+    // insert to fail on its primary key after the consent row has already
+    // been written inside the same transaction, proving the whole write
+    // rolls back together rather than leaving the consent behind.
+    let duplicate_id_record = transition(initial.id(), &task, previous_state, 140);
+
+    assert_code(
+        repository
+            .save_planning_transition(
+                expected_version,
+                &task,
+                &duplicate_id_record,
+                Some(&consent),
+            )
+            .expect_err("duplicate transition id must fail"),
+        RepositoryErrorCode::OperationFailed,
+    );
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("task after rollback"),
+        Some(before)
+    );
+    assert_eq!(
+        repository
+            .get_provider_consent(
+                task.id(),
+                ProviderKind::Claude,
+                WorkKind::Planning,
+                expected_version,
+            )
+            .expect("read consent after rollback"),
+        None,
+        "consent insert must roll back with the rest of the transaction"
+    );
+}
+
+#[test]
+fn save_planning_transition_rejects_version_mismatch_without_touching_consent() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_worktree_ready(&mut repository, &mut task);
+    let before = task.clone();
+    let stale_expected_version = before.version() + 41;
+
+    // The caller-declared expected_version and the consent's
+    // approved_task_version agree with each other (as a real caller would
+    // build them), but both are stale relative to the task's actual
+    // persisted version, so the mismatch must be caught against the
+    // database, not against the consent argument itself.
+    let consent = ProviderConsent {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        approved_task_version: stale_expected_version,
+        consented_at_ms: 140,
+    };
+    let previous_state = task.state();
+    task.transition_to(TaskState::Planning, 140)
+        .expect("WorktreeReady -> Planning");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 140);
+
+    assert_code(
+        repository
+            .save_planning_transition(stale_expected_version, &task, &record, Some(&consent))
+            .expect_err("stale expected_version must be rejected"),
+        RepositoryErrorCode::VersionConflict,
+    );
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("task unchanged"),
+        Some(before)
+    );
+    assert_eq!(
+        repository
+            .get_provider_consent(
+                task.id(),
+                ProviderKind::Claude,
+                WorkKind::Planning,
+                consent.approved_task_version,
+            )
+            .expect("read consent"),
+        None
+    );
+}
+
+#[test]
+fn save_planning_result_persists_completed_result_transition_and_history_atomically() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_planning(&mut repository, &mut task);
+    let expected_version = task.version();
+    let result = completed_planning_result(task.id(), "the masked plan");
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::AwaitingDesignApproval, 150)
+        .expect("Planning -> AwaitingDesignApproval");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 150);
+
+    repository
+        .save_planning_result(expected_version, &task, &record, &result, false)
+        .expect("atomic planning result");
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("get task"),
+        Some(task.clone())
+    );
+    assert_eq!(
+        repository
+            .list_task_transitions(task.id())
+            .expect("history")
+            .last()
+            .expect("latest transition"),
+        &record
+    );
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("lease")
+            .map(|lease| lease.task_id),
+        Some(task.id()),
+        "AwaitingDesignApproval is not terminal and must keep the lease"
+    );
+    let raw = fixture.database.open_raw();
+    let stored: (String, String, String, i64, i64, i64, i64, String) = raw
+        .query_row(
+            "SELECT provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms, plan_text
+             FROM task_planning_results WHERE task_id = ?1",
+            [task.id().to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .expect("read stored planning result");
+    assert_eq!(stored.0, "Claude");
+    assert_eq!(stored.1, "Planning");
+    assert_eq!(stored.2, "Completed");
+    assert_eq!(stored.3, 0);
+    assert_eq!(stored.4, 5);
+    assert_eq!(stored.5, 135);
+    assert_eq!(stored.6, 150);
+    assert_eq!(stored.7, "the masked plan");
+
+    let loaded = repository
+        .get_task_planning_result(task.id())
+        .expect("read back planning result")
+        .expect("a result row exists");
+    assert_eq!(loaded, result);
+}
+
+#[test]
+fn get_task_planning_result_returns_none_when_no_attempt_has_been_recorded() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (task, _) = create_task(&mut repository, fixture.project_id);
+
+    assert_eq!(
+        repository
+            .get_task_planning_result(task.id())
+            .expect("lookup succeeds"),
+        None
+    );
+}
+
+#[test]
+fn save_planning_result_terminal_outcome_releases_the_active_lease() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_planning(&mut repository, &mut task);
+    let expected_version = task.version();
+    let mut result = completed_planning_result(task.id(), "unused");
+    result.outcome = PlanningResultOutcome::Failed;
+    result.plan_text = None;
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Failed, 150)
+        .expect("Planning -> Failed");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 150);
+
+    repository
+        .save_planning_result(expected_version, &task, &record, &result, true)
+        .expect("atomic terminal planning result");
+
+    assert_eq!(
+        repository.active_lease().expect("lease query"),
+        None,
+        "a terminal outcome must release the active lease"
+    );
+    assert_eq!(
+        repository
+            .get_task(task.id())
+            .expect("get task")
+            .expect("task exists")
+            .state(),
+        TaskState::Failed
+    );
+}
+
+fn cancelled_planning_result(task_id: TaskId) -> TaskPlanningResultRecord {
+    TaskPlanningResultRecord {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        outcome: PlanningResultOutcome::Cancelled,
+        exit_code: None,
+        turn_count: None,
+        started_at_ms: 135,
+        completed_at_ms: 150,
+        plan_text: None,
+    }
+}
+
+#[test]
+fn save_planning_result_cancelled_outcome_transitions_and_releases_the_active_lease_atomically() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_planning(&mut repository, &mut task);
+    let expected_version = task.version();
+    let result = cancelled_planning_result(task.id());
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Cancelled, 150)
+        .expect("Planning -> Cancelled");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 150);
+
+    repository
+        .save_planning_result(expected_version, &task, &record, &result, true)
+        .expect("atomic confirmed-cancellation planning result");
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("get task"),
+        Some(task.clone()),
+        "the task's Cancelled state must be persisted"
+    );
+    assert_eq!(
+        repository
+            .list_task_transitions(task.id())
+            .expect("history")
+            .last()
+            .expect("latest transition"),
+        &record,
+        "the Planning -> Cancelled transition must be recorded in history"
+    );
+    assert_eq!(
+        repository.active_lease().expect("lease query"),
+        None,
+        "a confirmed cancellation must release the active lease in the same transaction"
+    );
+    let raw = fixture.database.open_raw();
+    let stored_outcome: String = raw
+        .query_row(
+            "SELECT outcome FROM task_planning_results WHERE task_id = ?1",
+            [task.id().to_string()],
+            |row| row.get(0),
+        )
+        .expect("read stored planning result");
+    assert_eq!(stored_outcome, "Cancelled");
+}
+
+#[test]
+fn save_planning_result_rolls_back_everything_when_history_insert_fails() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, initial) = create_task(&mut repository, fixture.project_id);
+    advance_to_planning(&mut repository, &mut task);
+    let expected_version = task.version();
+    let before = task.clone();
+    let result = completed_planning_result(task.id(), "should not survive rollback");
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::AwaitingDesignApproval, 150)
+        .expect("Planning -> AwaitingDesignApproval");
+    // Reusing an already-persisted transition id forces the final history
+    // insert to fail on its primary key after the planning-result row has
+    // already been written inside the same transaction.
+    let duplicate_id_record = transition(initial.id(), &task, previous_state, 150);
+
+    assert_code(
+        repository
+            .save_planning_result(
+                expected_version,
+                &task,
+                &duplicate_id_record,
+                &result,
+                false,
+            )
+            .expect_err("duplicate transition id must fail"),
+        RepositoryErrorCode::OperationFailed,
+    );
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("task after rollback"),
+        Some(before)
+    );
+    assert_eq!(
+        count_rows(&fixture.database.open_raw(), "task_planning_results"),
+        0
+    );
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("lease after rollback")
+            .map(|lease| lease.task_id),
+        Some(task.id()),
+        "a rolled-back terminal-shaped write must not have released the lease"
+    );
+}
+
+#[test]
+fn save_planning_result_rejects_version_mismatch_without_writing_a_result_row() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_planning(&mut repository, &mut task);
+    let before = task.clone();
+    let stale_expected_version = before.version() + 41;
+    let result = completed_planning_result(task.id(), "must not be persisted");
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::AwaitingDesignApproval, 150)
+        .expect("Planning -> AwaitingDesignApproval");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 150);
+
+    assert_code(
+        repository
+            .save_planning_result(stale_expected_version, &task, &record, &result, false)
+            .expect_err("stale expected_version must be rejected"),
+        RepositoryErrorCode::VersionConflict,
+    );
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("task unchanged"),
+        Some(before)
+    );
+    assert_eq!(
+        count_rows(&fixture.database.open_raw(), "task_planning_results"),
+        0
+    );
+}
+
+#[test]
 fn version_sequence_transition_and_immutable_field_conflicts_rollback() {
     let fixture = Fixture::new();
     let other_project = ProjectId::new();
@@ -554,10 +1165,10 @@ fn drive_to_post_merge_testing(repository: &mut impl FoundationRepository, task:
         TaskState::ProjectValidated,
         TaskState::WorktreeCreating,
         TaskState::WorktreeReady,
-        TaskState::PlanningWithClaude,
-        TaskState::ImplementingWithCodex,
+        TaskState::Planning,
+        TaskState::Implementing,
         TaskState::Testing,
-        TaskState::ReviewingWithClaude,
+        TaskState::Reviewing,
         TaskState::AwaitingUserDiffApproval,
         TaskState::Merging,
         TaskState::PostMergeTesting,
@@ -737,16 +1348,11 @@ fn pause_resume_and_recovery_context_are_persisted_consistently() {
         .expect("persist resume");
     assert_eq!(task.resume_target_state(), None);
 
-    advance(
-        &mut repository,
-        &mut task,
-        TaskState::PlanningWithClaude,
-        160,
-    );
+    advance(&mut repository, &mut task, TaskState::Planning, 160);
     advance(&mut repository, &mut task, TaskState::RecoveryRequired, 170);
     assert_eq!(task.resume_target_state(), None);
     task.set_recovery_target(
-        TaskState::PlanningWithClaude,
+        TaskState::Planning,
         RecoveryValidation::from_completed_checks(),
     )
     .expect("set recovery target");
@@ -759,7 +1365,7 @@ fn pause_resume_and_recovery_context_are_persisted_consistently() {
             .expect("read recovery")
             .expect("recovery task")
             .resume_target_state(),
-        Some(TaskState::PlanningWithClaude)
+        Some(TaskState::Planning)
     );
 
     let expected = task.version();
@@ -774,14 +1380,11 @@ fn pause_resume_and_recovery_context_are_persisted_consistently() {
     repository
         .save_transition(expected, &task, &recovery_pause)
         .expect("persist recovery pause");
-    assert_eq!(
-        task.resume_target_state(),
-        Some(TaskState::PlanningWithClaude)
-    );
+    assert_eq!(task.resume_target_state(), Some(TaskState::Planning));
 
     let expected = task.version();
     task.resume_from_pause(
-        TaskState::PlanningWithClaude,
+        TaskState::Planning,
         ResumeValidation::from_completed_checks(),
         190,
     )

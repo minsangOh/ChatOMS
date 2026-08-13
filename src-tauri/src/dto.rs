@@ -1,16 +1,25 @@
+mod planning_result;
+mod provider_eligibility;
+
+pub use planning_result::{PlanningOutcomeDto, PlanningResultDto};
+pub use provider_eligibility::{
+    ContractStatusDto, EligibilityBlockingReasonDto, ProviderEligibilityDto, ProviderKindDto,
+    WorkKindDto,
+};
+
 use chatoms_application::{
     bootstrap::{ActiveTaskStatus, BootstrapStatus, DatabaseStatus, LoggingStatus, StorageStatus},
-    git_isolation::{IsolationBlocker, TaskIsolationView},
+    git_isolation::{IsolationBlocker, TaskBriefDraft, TaskIsolationView},
     projects::{ProjectCandidateView, ProjectStatusView, ProjectView},
     system::{CapabilityStatus, HealthStatus, SystemStatus},
-    tasks::{ActiveTaskView, TaskTransitionView, TaskView},
+    tasks::{ActiveTaskView, TaskBriefView, TaskTransitionView, TaskView},
 };
 use chatoms_domain::TaskState;
 use chatoms_ports::{
     git::{RepositoryKind, RepositoryStatus},
     repository::GitIsolationStatus,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -252,12 +261,12 @@ pub enum TaskStateDto {
     GitInitialized,
     WorktreeCreating,
     WorktreeReady,
-    PlanningWithClaude,
+    Planning,
     AwaitingDesignApproval,
-    ImplementingWithCodex,
+    Implementing,
     Testing,
     AutoFixing,
-    ReviewingWithClaude,
+    Reviewing,
     ReviewFixing,
     AwaitingUserDiffApproval,
     Merging,
@@ -282,6 +291,36 @@ pub struct ActiveTaskDto {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskBriefDto {
+    pub requirements: String,
+    pub completion_criteria: String,
+    pub prohibited_scope: String,
+    pub created_at_ms: i64,
+}
+
+/// Raw task brief input for `create_isolation_task`. Deliberately grouped
+/// into one struct (rather than three independent optional fields) so a
+/// caller can only supply all three fields together or none at all.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskBriefInputDto {
+    pub requirements: String,
+    pub completion_criteria: String,
+    pub prohibited_scope: String,
+}
+
+impl From<TaskBriefInputDto> for TaskBriefDraft {
+    fn from(value: TaskBriefInputDto) -> Self {
+        Self {
+            requirements: value.requirements,
+            completion_criteria: value.completion_criteria,
+            prohibited_scope: value.prohibited_scope,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskDto {
     pub id: String,
     pub project_id: String,
@@ -292,6 +331,13 @@ pub struct TaskDto {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub terminal_at_ms: Option<i64>,
+    pub brief: Option<TaskBriefDto>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelPlanningDto {
+    pub requested: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -461,6 +507,18 @@ impl From<TaskView> for TaskDto {
             created_at_ms: value.created_at_ms,
             updated_at_ms: value.updated_at_ms,
             terminal_at_ms: value.terminal_at_ms,
+            brief: value.brief.map(TaskBriefDto::from),
+        }
+    }
+}
+
+impl From<TaskBriefView> for TaskBriefDto {
+    fn from(value: TaskBriefView) -> Self {
+        Self {
+            requirements: value.requirements,
+            completion_criteria: value.completion_criteria,
+            prohibited_scope: value.prohibited_scope,
+            created_at_ms: value.created_at_ms,
         }
     }
 }
@@ -564,12 +622,12 @@ impl From<TaskState> for TaskStateDto {
             TaskState::GitInitialized => Self::GitInitialized,
             TaskState::WorktreeCreating => Self::WorktreeCreating,
             TaskState::WorktreeReady => Self::WorktreeReady,
-            TaskState::PlanningWithClaude => Self::PlanningWithClaude,
+            TaskState::Planning => Self::Planning,
             TaskState::AwaitingDesignApproval => Self::AwaitingDesignApproval,
-            TaskState::ImplementingWithCodex => Self::ImplementingWithCodex,
+            TaskState::Implementing => Self::Implementing,
             TaskState::Testing => Self::Testing,
             TaskState::AutoFixing => Self::AutoFixing,
-            TaskState::ReviewingWithClaude => Self::ReviewingWithClaude,
+            TaskState::Reviewing => Self::Reviewing,
             TaskState::ReviewFixing => Self::ReviewFixing,
             TaskState::AwaitingUserDiffApproval => Self::AwaitingUserDiffApproval,
             TaskState::Merging => Self::Merging,
@@ -636,11 +694,38 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_000,
             terminal_at_ms: None,
+            brief: None,
         };
         let serialized = json(task);
         assert!(serialized.contains("\"state\":\"created\""));
         assert!(serialized.contains("\"resumeTargetState\":null"));
         assert!(serialized.contains("\"terminalAtMs\":null"));
+        assert!(serialized.contains("\"brief\":null"));
         assert!(serialized.contains("1700000000000"));
+    }
+
+    #[test]
+    fn task_brief_dto_serializes_all_three_fields_camel_case() {
+        let dto = TaskBriefDto {
+            requirements: "Add CSV export".to_owned(),
+            completion_criteria: "Export button downloads a CSV".to_owned(),
+            prohibited_scope: "Do not touch the import pipeline".to_owned(),
+            created_at_ms: 100,
+        };
+        let serialized = json(dto);
+        assert_eq!(
+            serialized,
+            "{\"requirements\":\"Add CSV export\",\"completionCriteria\":\"Export button downloads a CSV\",\"prohibitedScope\":\"Do not touch the import pipeline\",\"createdAtMs\":100}"
+        );
+    }
+    #[test]
+    fn provider_neutral_task_states_serialize_as_camel_case() {
+        for (state, expected) in [
+            (TaskStateDto::Planning, "\"planning\""),
+            (TaskStateDto::Implementing, "\"implementing\""),
+            (TaskStateDto::Reviewing, "\"reviewing\""),
+        ] {
+            assert_eq!(json(state), expected);
+        }
     }
 }

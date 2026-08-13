@@ -1,16 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import { FrontendError, isRecord, toFrontendError } from "./errors";
+import { isNullablePlanningResultDto } from "./planning_result";
+import { isProviderEligibilityDtoArray } from "./provider_eligibility";
 import type {
   ActiveTaskDto,
   ActiveTaskStatusDto,
   BootstrapStatusDto,
+  CancelPlanningDto,
   CapabilityDto,
   DatabaseStatus,
   HealthDto,
   HealthState,
   LoggingStatus,
   LegacyMigrationDiagnosticDto,
+  PlanningResultDto,
   ProjectDto,
+  ProviderEligibilityDto,
   ProjectCandidateDto,
   ProjectStatusDto,
   RefreshClaudeCapabilityDto,
@@ -19,6 +24,8 @@ import type {
   TaskIsolationDto,
   StorageStatus,
   SystemStatusDto,
+  TaskBriefDto,
+  TaskBriefInput,
   TaskDto,
   TaskState,
   TaskTransitionDto,
@@ -42,8 +49,12 @@ export const IPC_COMMANDS = {
   getActiveTask: "get_active_task",
   getTask: "get_task",
   listTaskHistory: "list_task_history",
+  getProviderEligibility: "get_provider_eligibility",
   setClaudeExecutablePath: "set_claude_executable_path",
   refreshClaudeCapability: "refresh_claude_capability",
+  startClaudePlanning: "start_claude_planning",
+  cancelClaudePlanning: "cancel_claude_planning",
+  getPlanningResult: "get_planning_result",
 } as const;
 
 export type InvokeTransport = (
@@ -61,15 +72,19 @@ export interface IpcClient {
   inspectProjectCandidate(inputPath: string): Promise<ProjectCandidateDto>;
   registerProject(inputPath: string, confirmationToken: string, name?: string): Promise<ProjectDto>;
   getProjectGitStatus(projectId: string): Promise<ProjectStatusDto>;
-  createIsolationTask(projectId: string): Promise<TaskIsolationDto>;
+  createIsolationTask(projectId: string, brief: TaskBriefInput): Promise<TaskIsolationDto>;
   getTaskIsolation(taskId: string): Promise<TaskIsolationDto>;
   approveGitInitialization(taskId: string, expectedVersion: number): Promise<TaskIsolationDto>;
   createTaskWorktree(taskId: string, expectedVersion: number): Promise<TaskIsolationDto>;
   getActiveTask(): Promise<ActiveTaskDto | null>;
   getTask(taskId: string): Promise<TaskDto>;
   listTaskHistory(taskId: string): Promise<TaskTransitionDto[]>;
+  getProviderEligibility(taskId: string): Promise<readonly ProviderEligibilityDto[]>;
   setClaudeExecutablePath(path: string): Promise<SetClaudeExecutablePathDto>;
   refreshClaudeCapability(): Promise<RefreshClaudeCapabilityDto>;
+  startClaudePlanning(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  cancelClaudePlanning(taskId: string): Promise<CancelPlanningDto>;
+  getPlanningResult(taskId: string): Promise<PlanningResultDto | null>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -112,7 +127,7 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
     inspectProjectCandidate: (inputPath) => request(IPC_COMMANDS.inspectProjectCandidate, isProjectCandidateDto, { inputPath }),
     registerProject: (inputPath, confirmationToken, name) => request(IPC_COMMANDS.registerProject, isProjectDto, { inputPath, confirmationToken, name: name ?? null }),
     getProjectGitStatus: (projectId) => request(IPC_COMMANDS.getProjectGitStatus, isProjectStatusDto, { projectId }),
-    createIsolationTask: (projectId) => request(IPC_COMMANDS.createIsolationTask, isTaskIsolationDto, { projectId }),
+    createIsolationTask: (projectId, brief) => request(IPC_COMMANDS.createIsolationTask, isTaskIsolationDto, { projectId, brief }),
     getTaskIsolation: (taskId) => request(IPC_COMMANDS.getTaskIsolation, isTaskIsolationDto, { taskId }),
     approveGitInitialization: (taskId, expectedVersion) => request(IPC_COMMANDS.approveGitInitialization, isTaskIsolationDto, { taskId, expectedVersion }),
     createTaskWorktree: (taskId, expectedVersion) => request(IPC_COMMANDS.createTaskWorktree, isTaskIsolationDto, { taskId, expectedVersion }),
@@ -120,10 +135,18 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
     getTask: (taskId) => request(IPC_COMMANDS.getTask, isTaskDto, { taskId }),
     listTaskHistory: (taskId) =>
       request(IPC_COMMANDS.listTaskHistory, isTaskTransitionDtoArray, { taskId }),
+    getProviderEligibility: (taskId) =>
+      request(IPC_COMMANDS.getProviderEligibility, isProviderEligibilityDtoArray, { taskId }),
     setClaudeExecutablePath: (path) =>
       request(IPC_COMMANDS.setClaudeExecutablePath, isSetClaudeExecutablePathDto, { path }),
     refreshClaudeCapability: () =>
       request(IPC_COMMANDS.refreshClaudeCapability, isRefreshClaudeCapabilityDto),
+    startClaudePlanning: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudePlanning, isTaskDto, { taskId, expectedVersion }),
+    cancelClaudePlanning: (taskId) =>
+      request(IPC_COMMANDS.cancelClaudePlanning, isCancelPlanningDto, { taskId }),
+    getPlanningResult: (taskId) =>
+      request(IPC_COMMANDS.getPlanningResult, isNullablePlanningResultDto, { taskId }),
   };
 }
 
@@ -154,12 +177,12 @@ const TASK_STATES: readonly TaskState[] = [
   "gitInitialized",
   "worktreeCreating",
   "worktreeReady",
-  "planningWithClaude",
+  "planning",
   "awaitingDesignApproval",
-  "implementingWithCodex",
+  "implementing",
   "testing",
   "autoFixing",
-  "reviewingWithClaude",
+  "reviewing",
   "reviewFixing",
   "awaitingUserDiffApproval",
   "merging",
@@ -281,6 +304,16 @@ function isNullableActiveTaskDto(value: unknown): value is ActiveTaskDto | null 
   return value === null || isActiveTaskDto(value);
 }
 
+function isTaskBriefDto(value: unknown): value is TaskBriefDto {
+  return (
+    isRecord(value) &&
+    typeof value.requirements === "string" &&
+    typeof value.completionCriteria === "string" &&
+    typeof value.prohibitedScope === "string" &&
+    typeof value.createdAtMs === "number"
+  );
+}
+
 function isTaskDto(value: unknown): value is TaskDto {
   return (
     isRecord(value) &&
@@ -292,7 +325,8 @@ function isTaskDto(value: unknown): value is TaskDto {
     (value.resumeTargetState === null || isOneOf(value.resumeTargetState, TASK_STATES)) &&
     typeof value.createdAtMs === "number" &&
     typeof value.updatedAtMs === "number" &&
-    isNullableNumber(value.terminalAtMs)
+    isNullableNumber(value.terminalAtMs) &&
+    (value.brief === null || isTaskBriefDto(value.brief))
   );
 }
 
@@ -319,6 +353,10 @@ function isSetClaudeExecutablePathDto(
     typeof value.displayPath === "string" &&
     isOneOf(value.claudeExecution, CAPABILITY_STATUSES)
   );
+}
+
+function isCancelPlanningDto(value: unknown): value is CancelPlanningDto {
+  return isRecord(value) && typeof value.requested === "boolean";
 }
 
 function isRefreshClaudeCapabilityDto(

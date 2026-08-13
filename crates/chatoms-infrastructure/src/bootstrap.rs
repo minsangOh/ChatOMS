@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition};
+use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition, WorkKind};
 use chatoms_ports::{
     DatabaseBootstrapPort, DatabaseBootstrapState, LoggingBootstrapPort, LoggingBootstrapState,
     error::{CategorizedFailure, FailureCategory, PortFailure},
@@ -9,10 +9,12 @@ use chatoms_ports::{
     git::{GitService, RepositoryKind},
     path::ResolvedAppPaths,
     permissions::PermissionStatus,
+    provider::ProviderKind,
     repository::{
-        ActiveLease, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
         GitOperationReceipt, GitOperationReceiptKind, ProjectFilesystemIdentityRecord,
-        ProjectRecord, ProjectSummary, RepositoryError, RepositoryErrorCode, TaskGitIsolation,
+        ProjectRecord, ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError,
+        RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation, TaskPlanningResultRecord,
     },
 };
 
@@ -438,6 +440,7 @@ impl FoundationRepository for SharedFoundationRepository {
         classified_transition: &TaskStateTransition,
         lease_acquired_at_ms: i64,
         isolation: &TaskGitIsolation,
+        brief: Option<&TaskBriefRecord>,
     ) -> Result<(), RepositoryError> {
         self.with_repository(|repository| {
             repository.create_isolation_task(
@@ -446,6 +449,7 @@ impl FoundationRepository for SharedFoundationRepository {
                 classified_transition,
                 lease_acquired_at_ms,
                 isolation,
+                brief,
             )
         })
     }
@@ -455,6 +459,57 @@ impl FoundationRepository for SharedFoundationRepository {
         task_id: TaskId,
     ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
         self.with_repository(|repository| repository.get_task_isolation(task_id))
+    }
+
+    fn get_task_brief(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskBriefRecord>, RepositoryError> {
+        self.with_repository(|repository| repository.get_task_brief(task_id))
+    }
+
+    fn get_task_planning_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskPlanningResultRecord>, RepositoryError> {
+        self.with_repository(|repository| repository.get_task_planning_result(task_id))
+    }
+
+    fn get_provider_consent(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+    ) -> Result<Option<ProviderConsent>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_provider_consent(task_id, provider, work_kind, approved_task_version)
+        })
+    }
+
+    fn save_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        consent: Option<&ProviderConsent>,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_planning_transition(expected_version, task, transition, consent)
+        })
+    }
+
+    fn save_planning_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskPlanningResultRecord,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_planning_result(expected_version, task, transition, result, terminal)
+        })
     }
 
     fn begin_git_initialization(
@@ -555,6 +610,34 @@ impl FoundationRepository for SharedFoundationRepository {
     ) -> Result<(), RepositoryError> {
         self.with_repository(|repository| {
             repository.terminate_isolation_task(expected_version, task, transition, isolation)
+        })
+    }
+
+    fn ensure_default_profile_and_claude_binding(
+        &mut self,
+        profile: &AppProfileRecord,
+        binding: &ProviderBindingRecord,
+    ) -> Result<ProviderBindingRecord, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.ensure_default_profile_and_claude_binding(profile, binding)
+        })
+    }
+
+    fn get_claude_binding(
+        &mut self,
+        profile_name: &str,
+    ) -> Result<Option<ProviderBindingRecord>, RepositoryError> {
+        self.with_repository(|repository| repository.get_claude_binding(profile_name))
+    }
+
+    fn update_claude_executable_path(
+        &mut self,
+        binding_id: &str,
+        executable_path: Option<&str>,
+        updated_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.update_claude_executable_path(binding_id, executable_path, updated_at_ms)
         })
     }
 }

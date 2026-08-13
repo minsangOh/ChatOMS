@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod claude_planning;
 pub mod database;
 pub mod error;
 pub mod git;

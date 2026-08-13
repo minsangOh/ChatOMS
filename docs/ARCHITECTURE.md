@@ -58,12 +58,12 @@ flowchart TB
 |---|---|---|
 | `ProviderService` | 공급자 실행, event 변환, capability 검증 | Claude CLI adapter, Codex app-server adapter |
 | `GitService` | 저장소 감지·상태 조회, 승인된 초기화, 기준 commit과 task branch/worktree 생성·검증 | `chatoms-infrastructure` Git adapter |
-| `ProcessRunner` | 프로그램과 인수 배열 기반 실행, 출력·종료 제어 | Phase 3에서 공급자 실행과 함께 추가 |
+| `ProcessRunner` | 프로그램·인수 배열·CWD·stdio 정책 기반 one-shot 실행 | `chatoms-infrastructure` one-shot adapter 구현, streaming·cancellation은 후속 범위 |
 | `ArtifactRepository` | 마스킹된 로그, diff, 결과와 첨부파일 저장·조회 | 로컬 artifact infrastructure |
 | `FilePermissionService` | 앱 데이터 경로의 사용자 전용 권한 적용·검증 | Windows/macOS platform adapter |
 | `UpdateService` | 업데이트 상태와 향후 업데이트 동작의 계약 | Phase 1~6에는 port만 정의하고 구현은 Phase 7 결정 이후 추가 |
 
-이 표는 전체 목표 경계를 설명한다. 현재 source 기준으로 repository·path·permission·bootstrap·time port와 Phase 2 의미 기반 `GitService`가 있고, `ProviderService`와 범용 `ProcessRunner`는 Phase 3, 실제 `UpdateService`는 Phase 7에서 추가한다.
+이 표는 전체 목표 경계를 설명한다. 현재 source 기준으로 repository·path·permission·bootstrap·time port, Phase 2 의미 기반 `GitService`, provider capability port와 구조화된 one-shot `ProcessRunner`가 구현되어 있다. 실제 provider session·event streaming·cancellation과 `UpdateService` 동작은 후속 범위다.
 
 ## 컴파일 의존 방향
 
@@ -105,10 +105,10 @@ adapters / infrastructure
 
 ### Codex — 현재 capability 상태
 
-- 구현 실행 계약이 정의되어 있으며 `codex app-server`의 stdio JSONL 프로토콜을 제어 방식으로 사용한다. 공식 문서 기준 `codex app-server`의 maturity는 Experimental이다.
+- 설계·구현·리뷰 실행 계약과 executable trust 근거가 모두 미승인이다. `codex app-server`의 stdio JSONL 프로토콜과 Experimental maturity 정보만으로 승인된 실행 계약을 구성하지 않는다.
 - schema/capability 검증 절차는 공식 문서 근거가 확인되고 별도 구현계획이 승인되기 전까지 구현하지 않는다.
 - Codex 실행파일의 서명 또는 동등한 신뢰 근거가 확인되기 전까지 Codex capability는 `Unsupported`로 보고되며, 호환성 검증이 실패해도 `codex exec`로 자동 전환하지 않는다.
-- Codex의 설계·리뷰 실행 계약은 아직 정의되지 않았다.
+- 따라서 Codex는 현재 어떤 작업 종류에도 eligible provider가 아니다.
 
 ## Context Package 흐름
 

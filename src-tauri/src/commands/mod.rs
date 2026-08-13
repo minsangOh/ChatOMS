@@ -1,10 +1,12 @@
 pub mod git_isolation;
+pub mod planning;
 pub mod projects;
 pub mod provider;
+pub mod provider_eligibility;
 pub mod system;
 pub mod tasks;
 
-pub const REGISTERED_HANDLERS: [&str; 18] = [
+pub const REGISTERED_HANDLERS: [&str; 22] = [
     "get_version",
     "get_health",
     "get_system_status",
@@ -21,8 +23,12 @@ pub const REGISTERED_HANDLERS: [&str; 18] = [
     "get_active_task",
     "get_task",
     "list_task_history",
+    "get_provider_eligibility",
     "set_claude_executable_path",
     "refresh_claude_capability",
+    "start_claude_planning",
+    "cancel_claude_planning",
+    "get_planning_result",
 ];
 
 #[cfg(test)]

@@ -7,16 +7,18 @@ use std::{
 
 use chatoms_domain::{
     ActorKind, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId, TaskSnapshot, TaskState,
-    TaskStateTransition, TaskStateTransitionId,
+    TaskStateTransition, TaskStateTransitionId, WorkKind,
 };
 use chatoms_ports::{
     TimeProvider,
     error::{FailureCategory, PortFailure},
+    provider::ProviderKind,
     repository::{
         ActiveLease, FoundationRepository, GitInitApproval, GitOperationAttempt,
         GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
-        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, RepositoryError,
-        RepositoryErrorCode, TaskGitIsolation,
+        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderConsent,
+        RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
+        TaskPlanningResultRecord,
     },
 };
 
@@ -28,6 +30,9 @@ pub struct FakeRepository {
     pub tasks: HashMap<TaskId, Task>,
     pub transitions: HashMap<TaskId, Vec<TaskStateTransition>>,
     pub isolations: HashMap<TaskId, TaskGitIsolation>,
+    pub briefs: HashMap<TaskId, TaskBriefRecord>,
+    pub consents: HashMap<(TaskId, ProviderKind, WorkKind, u64), ProviderConsent>,
+    pub planning_results: HashMap<TaskId, TaskPlanningResultRecord>,
     pub approvals: Vec<GitInitApproval>,
     pub attempts: HashMap<chatoms_domain::GitOperationId, GitOperationAttempt>,
     pub receipts: Vec<GitOperationReceipt>,
@@ -233,6 +238,7 @@ impl FoundationRepository for FakeRepository {
         classified_transition: &TaskStateTransition,
         lease_acquired_at_ms: i64,
         isolation: &TaskGitIsolation,
+        brief: Option<&TaskBriefRecord>,
     ) -> Result<(), RepositoryError> {
         self.record("create_isolation_task");
         self.maybe_fail("create_isolation_task")?;
@@ -242,6 +248,9 @@ impl FoundationRepository for FakeRepository {
             vec![initial_transition.clone(), classified_transition.clone()],
         );
         self.isolations.insert(task.id(), isolation.clone());
+        if let Some(brief) = brief {
+            self.briefs.insert(task.id(), brief.clone());
+        }
         self.active_lease = Some(ActiveLease {
             task_id: task.id(),
             acquired_at_ms: lease_acquired_at_ms,
@@ -256,6 +265,91 @@ impl FoundationRepository for FakeRepository {
         self.record("get_task_isolation");
         self.maybe_fail("get_task_isolation")?;
         Ok(self.isolations.get(&task_id).cloned())
+    }
+
+    fn get_task_brief(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskBriefRecord>, RepositoryError> {
+        self.record("get_task_brief");
+        self.maybe_fail("get_task_brief")?;
+        Ok(self.briefs.get(&task_id).cloned())
+    }
+
+    fn get_task_planning_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskPlanningResultRecord>, RepositoryError> {
+        self.record("get_task_planning_result");
+        self.maybe_fail("get_task_planning_result")?;
+        Ok(self.planning_results.get(&task_id).cloned())
+    }
+
+    fn get_provider_consent(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+    ) -> Result<Option<ProviderConsent>, RepositoryError> {
+        self.record("get_provider_consent");
+        self.maybe_fail("get_provider_consent")?;
+        Ok(self
+            .consents
+            .get(&(task_id, provider, work_kind, approved_task_version))
+            .copied())
+    }
+
+    fn save_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        consent: Option<&ProviderConsent>,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_planning_transition");
+        self.maybe_fail("save_planning_transition")?;
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        if let Some(consent) = consent {
+            self.consents.insert(
+                (
+                    consent.task_id,
+                    consent.provider,
+                    consent.work_kind,
+                    consent.approved_task_version,
+                ),
+                *consent,
+            );
+        }
+        Ok(())
+    }
+
+    fn save_planning_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskPlanningResultRecord,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_planning_result");
+        self.maybe_fail("save_planning_result")?;
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        self.planning_results.insert(task.id(), result.clone());
+        if terminal {
+            self.active_lease = None;
+        }
+        Ok(())
     }
 
     fn begin_git_initialization(

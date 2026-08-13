@@ -10,12 +10,12 @@ pub enum TaskState {
     GitInitialized,
     WorktreeCreating,
     WorktreeReady,
-    PlanningWithClaude,
+    Planning,
     AwaitingDesignApproval,
-    ImplementingWithCodex,
+    Implementing,
     Testing,
     AutoFixing,
-    ReviewingWithClaude,
+    Reviewing,
     ReviewFixing,
     AwaitingUserDiffApproval,
     Merging,
@@ -39,12 +39,12 @@ impl TaskState {
         Self::GitInitialized,
         Self::WorktreeCreating,
         Self::WorktreeReady,
-        Self::PlanningWithClaude,
+        Self::Planning,
         Self::AwaitingDesignApproval,
-        Self::ImplementingWithCodex,
+        Self::Implementing,
         Self::Testing,
         Self::AutoFixing,
-        Self::ReviewingWithClaude,
+        Self::Reviewing,
         Self::ReviewFixing,
         Self::AwaitingUserDiffApproval,
         Self::Merging,
@@ -106,12 +106,12 @@ impl TaskState {
             self,
             Self::AwaitingGitInitApproval
                 | Self::WorktreeReady
-                | Self::PlanningWithClaude
+                | Self::Planning
                 | Self::AwaitingDesignApproval
-                | Self::ImplementingWithCodex
+                | Self::Implementing
                 | Self::Testing
                 | Self::AutoFixing
-                | Self::ReviewingWithClaude
+                | Self::Reviewing
                 | Self::ReviewFixing
                 | Self::AwaitingUserDiffApproval
                 | Self::MergeConflict
@@ -123,9 +123,9 @@ impl TaskState {
         use TaskState::{
             Archived, AutoFixing, AwaitingDesignApproval, AwaitingGitInitApproval,
             AwaitingUserDiffApproval, Cancelled, CleanupPending, Completed, Created, Failed,
-            GitInitialized, ImplementingWithCodex, MergeConflict, Merging, PlanningWithClaude,
-            PostMergeTesting, ProjectValidated, RecoveryRequired, ReviewFixing,
-            ReviewingWithClaude, Testing, UnknownExternalEffect, WorktreeCreating, WorktreeReady,
+            GitInitialized, Implementing, MergeConflict, Merging, Planning, PostMergeTesting,
+            ProjectValidated, RecoveryRequired, ReviewFixing, Reviewing, Testing,
+            UnknownExternalEffect, WorktreeCreating, WorktreeReady,
         };
 
         matches!(
@@ -143,20 +143,17 @@ impl TaskState {
                     WorktreeCreating,
                     WorktreeReady | RecoveryRequired | Failed | Cancelled
                 )
-                | (WorktreeReady, PlanningWithClaude | Cancelled)
+                | (WorktreeReady, Planning | Cancelled)
                 | (
-                    PlanningWithClaude,
-                    AwaitingDesignApproval | ImplementingWithCodex | Failed | RecoveryRequired
+                    Planning,
+                    AwaitingDesignApproval | Implementing | Failed | RecoveryRequired | Cancelled
                 )
-                | (AwaitingDesignApproval, ImplementingWithCodex | Cancelled)
-                | (ImplementingWithCodex, Testing | Failed | RecoveryRequired)
-                | (
-                    Testing,
-                    AutoFixing | ReviewingWithClaude | Failed | RecoveryRequired
-                )
+                | (AwaitingDesignApproval, Implementing | Cancelled)
+                | (Implementing, Testing | Failed | RecoveryRequired)
+                | (Testing, AutoFixing | Reviewing | Failed | RecoveryRequired)
                 | (AutoFixing, Testing | Failed | RecoveryRequired)
                 | (
-                    ReviewingWithClaude,
+                    Reviewing,
                     ReviewFixing | AwaitingUserDiffApproval | Failed | RecoveryRequired
                 )
                 | (ReviewFixing, Testing | Failed | RecoveryRequired)

@@ -219,7 +219,7 @@ fn recovery_resume_clears_target_and_rejects_mismatch_atomically() {
     let before = task.clone();
     assert_eq!(
         task.resume_from_recovery(
-            TaskState::ImplementingWithCodex,
+            TaskState::Implementing,
             RecoveryValidation::from_completed_checks(),
             104,
         ),

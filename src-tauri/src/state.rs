@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex, MutexGuard, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -5,11 +6,12 @@ use std::sync::{
 
 use chatoms_application::system::CapabilityStatus as AppCapabilityStatus;
 use chatoms_application::{bootstrap::BootstrapStatus, error::ApplicationError};
-use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition};
+use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition, WorkKind};
 use chatoms_infrastructure::bootstrap::{
     LegacyMigrationDiagnostic, SharedDatabase, SharedFoundationRepository, SharedLoggingGuard,
     SharedResolvedAppPaths,
 };
+use chatoms_ports::process::AtomicCancellationSignal;
 #[cfg(windows)]
 pub type PreflightDirectory = chatoms_platform::preflight::TrustedPreflightWorkingDirectory;
 
@@ -37,10 +39,12 @@ use chatoms_ports::{
         GitService, ProjectInspection, RepositorySafetyToken, RepositoryStatus,
         WorktreeCreationOutcome, WorktreePathProvider,
     },
+    provider::ProviderKind,
     repository::{
-        ActiveLease, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
         GitOperationReceipt, GitOperationReceiptKind, ProjectFilesystemIdentityRecord,
-        ProjectRecord, ProjectSummary, RepositoryError, TaskGitIsolation,
+        ProjectRecord, ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError,
+        TaskBriefRecord, TaskGitIsolation, TaskPlanningResultRecord,
     },
 };
 
@@ -164,6 +168,7 @@ impl FoundationRepository for RepositoryHandle {
         classified_transition: &TaskStateTransition,
         lease_acquired_at_ms: i64,
         isolation: &TaskGitIsolation,
+        brief: Option<&TaskBriefRecord>,
     ) -> Result<(), RepositoryError> {
         self.with_inner(|inner| {
             inner.create_isolation_task(
@@ -172,6 +177,7 @@ impl FoundationRepository for RepositoryHandle {
                 classified_transition,
                 lease_acquired_at_ms,
                 isolation,
+                brief,
             )
         })
     }
@@ -181,6 +187,57 @@ impl FoundationRepository for RepositoryHandle {
         task_id: TaskId,
     ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
         self.with_inner(|inner| inner.get_task_isolation(task_id))
+    }
+
+    fn get_task_brief(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskBriefRecord>, RepositoryError> {
+        self.with_inner(|inner| inner.get_task_brief(task_id))
+    }
+
+    fn get_task_planning_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<chatoms_ports::repository::TaskPlanningResultRecord>, RepositoryError> {
+        self.with_inner(|inner| inner.get_task_planning_result(task_id))
+    }
+
+    fn get_provider_consent(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+    ) -> Result<Option<ProviderConsent>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_provider_consent(task_id, provider, work_kind, approved_task_version)
+        })
+    }
+
+    fn save_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        consent: Option<&ProviderConsent>,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.save_planning_transition(expected_version, task, transition, consent)
+        })
+    }
+
+    fn save_planning_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskPlanningResultRecord,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.save_planning_result(expected_version, task, transition, result, terminal)
+        })
     }
 
     fn begin_git_initialization(
@@ -279,6 +336,32 @@ impl FoundationRepository for RepositoryHandle {
     ) -> Result<(), RepositoryError> {
         self.with_inner(|inner| {
             inner.terminate_isolation_task(expected_version, task, transition, isolation)
+        })
+    }
+
+    fn ensure_default_profile_and_claude_binding(
+        &mut self,
+        profile: &AppProfileRecord,
+        binding: &ProviderBindingRecord,
+    ) -> Result<ProviderBindingRecord, RepositoryError> {
+        self.with_inner(|inner| inner.ensure_default_profile_and_claude_binding(profile, binding))
+    }
+
+    fn get_claude_binding(
+        &mut self,
+        profile_name: &str,
+    ) -> Result<Option<ProviderBindingRecord>, RepositoryError> {
+        self.with_inner(|inner| inner.get_claude_binding(profile_name))
+    }
+
+    fn update_claude_executable_path(
+        &mut self,
+        binding_id: &str,
+        executable_path: Option<&str>,
+        updated_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.update_claude_executable_path(binding_id, executable_path, updated_at_ms)
         })
     }
 }
@@ -604,6 +687,63 @@ impl ProviderCapabilityHandle {
     }
 }
 
+/// In-memory-only registry of cancellation handles for Claude Planning runs
+/// currently executing on a background thread, keyed by task id. Never
+/// persisted: an app restart has no running process to cancel anyway, and
+/// `docs/PRODUCT_REQUIREMENTS.md`/AGENTS.md scope this Unit to an in-memory
+/// handle, not a separate execution/session table.
+#[derive(Clone, Default)]
+pub struct PlanningRunRegistry {
+    inner: Arc<Mutex<HashMap<TaskId, AtomicCancellationSignal>>>,
+}
+
+impl PlanningRunRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a fresh cancellation signal for `task_id`. Returns `None`
+    /// instead of overwriting an existing entry: two live handles for the
+    /// same task would mean two independent things could race to cancel (or
+    /// fail to unregister) the same run. `TaskService::start_planning`
+    /// already fails closed (via optimistic task-version concurrency) before
+    /// a second Planning attempt for the same task could ever reach this
+    /// call, so a `None` here indicates a caller invariant violation, not
+    /// routine contention, and the caller must not silently proceed as if a
+    /// handle had been registered.
+    pub fn register(&self, task_id: TaskId) -> Option<AtomicCancellationSignal> {
+        let signal = AtomicCancellationSignal::new();
+        let mut guard = self.inner.lock().ok()?;
+        if guard.contains_key(&task_id) {
+            return None;
+        }
+        guard.insert(task_id, signal.clone());
+        Some(signal)
+    }
+
+    pub fn unregister(&self, task_id: TaskId) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.remove(&task_id);
+        }
+    }
+
+    /// Requests cancellation of the in-flight run for `task_id`, if any.
+    /// Returns whether a matching run was found; the caller must not infer
+    /// anything about the eventual outcome from this alone — only a
+    /// subsequently *confirmed* process exit is recorded as `Cancelled`.
+    pub fn request_cancellation(&self, task_id: TaskId) -> bool {
+        let Ok(guard) = self.inner.lock() else {
+            return false;
+        };
+        let Some(signal) = guard.get(&task_id) else {
+            return false;
+        };
+        signal.cancel();
+        true
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct RuntimeResources {
     pub paths: SharedResolvedAppPaths,
@@ -622,6 +762,7 @@ pub struct AppRuntime {
     pub worktree_paths: WorktreePathHandle,
     pub provider_capabilities: ProviderCapabilityHandle,
     pub preflight_dir: Option<PreflightDirectory>,
+    pub planning_runs: PlanningRunRegistry,
     resources: RuntimeResources,
 }
 
@@ -634,6 +775,7 @@ pub struct RuntimePorts {
     pub worktree_paths: WorktreePathHandle,
     pub provider_capabilities: ProviderCapabilityHandle,
     pub preflight_dir: Option<PreflightDirectory>,
+    pub planning_runs: PlanningRunRegistry,
 }
 
 impl AppRuntime {
@@ -652,6 +794,7 @@ impl AppRuntime {
             worktree_paths: ports.worktree_paths,
             provider_capabilities: ports.provider_capabilities,
             preflight_dir: ports.preflight_dir,
+            planning_runs: ports.planning_runs,
             resources,
         }
     }
@@ -761,5 +904,88 @@ impl ManagedRuntime {
 impl From<SharedFoundationRepository> for RepositoryHandle {
     fn from(repository: SharedFoundationRepository) -> Self {
         Self::new(repository)
+    }
+}
+
+#[cfg(test)]
+mod planning_run_registry_tests {
+    use super::PlanningRunRegistry;
+    use chatoms_domain::TaskId;
+    use chatoms_ports::process::CancellationSignal;
+
+    #[test]
+    fn cancellation_reaches_the_registered_signal_and_reports_it_was_found() {
+        let registry = PlanningRunRegistry::new();
+        let task_id = TaskId::new();
+        let signal = registry.register(task_id).expect("first registration");
+
+        assert!(!signal.is_cancelled());
+        assert!(registry.request_cancellation(task_id));
+        assert!(signal.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_for_an_unregistered_task_reports_nothing_found() {
+        let registry = PlanningRunRegistry::new();
+        assert!(!registry.request_cancellation(TaskId::new()));
+    }
+
+    #[test]
+    fn unregistering_removes_the_entry_so_a_later_cancel_reports_nothing_found() {
+        let registry = PlanningRunRegistry::new();
+        let task_id = TaskId::new();
+        let _signal = registry.register(task_id).expect("first registration");
+
+        registry.unregister(task_id);
+
+        assert!(!registry.request_cancellation(task_id));
+    }
+
+    #[test]
+    fn a_clone_shares_the_same_underlying_registry() {
+        let registry = PlanningRunRegistry::new();
+        let clone = registry.clone();
+        let task_id = TaskId::new();
+        let signal = registry.register(task_id).expect("first registration");
+
+        assert!(clone.request_cancellation(task_id));
+        assert!(signal.is_cancelled());
+    }
+
+    #[test]
+    fn registering_again_for_the_same_task_id_is_rejected_and_the_prior_signal_still_works() {
+        let registry = PlanningRunRegistry::new();
+        let task_id = TaskId::new();
+        let first = registry.register(task_id).expect("first registration");
+
+        assert!(
+            registry.register(task_id).is_none(),
+            "a second registration for a task id already registered must be rejected"
+        );
+
+        assert!(registry.request_cancellation(task_id));
+        assert!(
+            first.is_cancelled(),
+            "the original signal must still be the one in the registry"
+        );
+    }
+
+    #[test]
+    fn registering_again_after_unregistering_succeeds() {
+        let registry = PlanningRunRegistry::new();
+        let task_id = TaskId::new();
+        let first = registry.register(task_id).expect("first registration");
+        registry.unregister(task_id);
+
+        let second = registry
+            .register(task_id)
+            .expect("registration after unregister must succeed");
+
+        assert!(registry.request_cancellation(task_id));
+        assert!(
+            !first.is_cancelled(),
+            "the stale signal must not be reachable anymore"
+        );
+        assert!(second.is_cancelled());
     }
 }

@@ -3,15 +3,16 @@ use std::str::FromStr;
 use chatoms_domain::{
     ActorKind, GitOperationId, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId,
     TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
-    TaskStateTransitionSnapshot,
+    TaskStateTransitionSnapshot, WorkKind,
 };
 use chatoms_ports::git::RepositoryKind;
 use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
     ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitIsolationStatus,
     GitOperationAttempt, GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt,
-    GitOperationReceiptKind, ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary,
-    ProviderBindingRecord, RepositoryError, RepositoryErrorCode, TaskGitIsolation,
+    GitOperationReceiptKind, PlanningResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord,
+    ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError, RepositoryErrorCode,
+    TaskBriefRecord, TaskGitIsolation, TaskPlanningResultRecord,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -332,6 +333,7 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         classified_transition: &TaskStateTransition,
         lease_acquired_at_ms: i64,
         isolation: &TaskGitIsolation,
+        brief: Option<&TaskBriefRecord>,
     ) -> Result<(), RepositoryError> {
         validate_new_isolation_task(
             task,
@@ -340,6 +342,12 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
             lease_acquired_at_ms,
             isolation,
         )?;
+        if let Some(brief) = brief {
+            validate_task_brief(brief)?;
+            if brief.task_id != task.id() {
+                return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+            }
+        }
         let transaction = self
             .database
             .raw_mut()
@@ -369,6 +377,9 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
                 RepositoryError::with_source(RepositoryErrorCode::ActiveLeaseConflict, source)
             })?;
         insert_isolation(&transaction, isolation)?;
+        if let Some(brief) = brief {
+            insert_task_brief(&transaction, brief)?;
+        }
         transaction.commit().map_err(operation_failed)
     }
 
@@ -377,6 +388,133 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         task_id: TaskId,
     ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
         load_isolation(self.database.raw_mut(), task_id)
+    }
+
+    fn get_task_brief(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskBriefRecord>, RepositoryError> {
+        load_task_brief(self.database.raw_mut(), task_id)
+    }
+
+    fn get_task_planning_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskPlanningResultRecord>, RepositoryError> {
+        load_planning_result(self.database.raw_mut(), task_id)
+    }
+
+    fn get_provider_consent(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+    ) -> Result<Option<ProviderConsent>, RepositoryError> {
+        load_provider_consent(
+            self.database.raw_mut(),
+            task_id,
+            provider,
+            work_kind,
+            approved_task_version,
+        )
+    }
+
+    fn save_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        consent: Option<&ProviderConsent>,
+    ) -> Result<(), RepositoryError> {
+        if task.state() != TaskState::Planning {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        if let Some(consent) = consent
+            && (consent.task_id != task.id() || consent.approved_task_version != expected_version)
+        {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::WorktreeReady {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        // Consent is inserted before the task row is bumped to the next
+        // version: the binding trigger requires tasks.version to still equal
+        // approved_task_version (the pre-transition WorktreeReady version).
+        if let Some(consent) = consent {
+            insert_provider_consent(&transaction, consent)?;
+        }
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_planning_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskPlanningResultRecord,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        if task.state().is_terminal() != terminal || result.task_id != task.id() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_planning_result_shape(result)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::Planning {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        insert_planning_result(&transaction, result)?;
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        if terminal {
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM active_task_leases WHERE task_id = ?1",
+                    [task.id().to_string()],
+                )
+                .map_err(operation_failed)?;
+            if deleted != 1 {
+                return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+            }
+        }
+        transaction.commit().map_err(operation_failed)
     }
 
     fn begin_git_initialization(
@@ -1156,6 +1294,289 @@ const fn repository_kind_text(kind: RepositoryKind) -> &'static str {
     match kind {
         RepositoryKind::Git => "Git",
         RepositoryKind::NonGit => "NonGit",
+    }
+}
+
+fn validate_task_brief(brief: &TaskBriefRecord) -> Result<(), RepositoryError> {
+    if brief.requirements.trim().is_empty()
+        || brief.completion_criteria.trim().is_empty()
+        || brief.prohibited_scope.trim().is_empty()
+        || brief.created_at_ms < 0
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn insert_task_brief(
+    connection: &Connection,
+    brief: &TaskBriefRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_briefs (
+                task_id, requirements, completion_criteria, prohibited_scope, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                brief.task_id.to_string(),
+                brief.requirements,
+                brief.completion_criteria,
+                brief.prohibited_scope,
+                brief.created_at_ms,
+            ],
+        )
+        .map_err(operation_failed)?;
+    Ok(())
+}
+
+fn load_task_brief(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskBriefRecord>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT task_id, requirements, completion_criteria, prohibited_scope, created_at_ms
+             FROM task_briefs WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?
+        .map(
+            |(id, requirements, completion_criteria, prohibited_scope, created_at_ms)| {
+                Ok(TaskBriefRecord {
+                    task_id: TaskId::from_str(&id).map_err(invalid_persistence)?,
+                    requirements,
+                    completion_criteria,
+                    prohibited_scope,
+                    created_at_ms,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn insert_provider_consent(
+    connection: &Connection,
+    consent: &ProviderConsent,
+) -> Result<(), RepositoryError> {
+    if consent.consented_at_ms < 0 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    connection
+        .execute(
+            "INSERT INTO task_provider_consents (
+                task_id, provider, work_kind, approved_task_version, consented_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                consent.task_id.to_string(),
+                provider_kind_text(consent.provider),
+                work_kind_text(consent.work_kind),
+                to_sql_integer(consent.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                consent.consented_at_ms,
+            ],
+        )
+        .map_err(operation_failed)?;
+    Ok(())
+}
+
+fn load_provider_consent(
+    connection: &Connection,
+    task_id: TaskId,
+    provider: ProviderKind,
+    work_kind: WorkKind,
+    approved_task_version: u64,
+) -> Result<Option<ProviderConsent>, RepositoryError> {
+    let consented_at_ms = connection
+        .query_row(
+            "SELECT consented_at_ms FROM task_provider_consents
+             WHERE task_id = ?1 AND provider = ?2 AND work_kind = ?3
+               AND approved_task_version = ?4",
+            params![
+                task_id.to_string(),
+                provider_kind_text(provider),
+                work_kind_text(work_kind),
+                to_sql_integer(approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(operation_failed)?;
+    Ok(consented_at_ms.map(|consented_at_ms| ProviderConsent {
+        task_id,
+        provider,
+        work_kind,
+        approved_task_version,
+        consented_at_ms,
+    }))
+}
+
+const fn work_kind_text(kind: WorkKind) -> &'static str {
+    match kind {
+        WorkKind::Planning => "Planning",
+        WorkKind::Implementation => "Implementation",
+        WorkKind::Review => "Review",
+    }
+}
+
+/// Matches the `task_planning_results.plan_text` SQL `CHECK` bound in
+/// `0007_task_planning_results.sql`. Enforced again here so a malformed
+/// record is rejected before it ever reaches the database driver.
+const MAX_PLAN_TEXT_LEN: usize = 100_000;
+
+const fn planning_outcome_text(outcome: PlanningResultOutcome) -> &'static str {
+    match outcome {
+        PlanningResultOutcome::Completed => "Completed",
+        PlanningResultOutcome::Failed => "Failed",
+        PlanningResultOutcome::Cancelled => "Cancelled",
+        PlanningResultOutcome::RecoveryRequired => "RecoveryRequired",
+    }
+}
+
+fn validate_planning_result_shape(
+    result: &TaskPlanningResultRecord,
+) -> Result<(), RepositoryError> {
+    if result.started_at_ms < 0 || result.completed_at_ms < result.started_at_ms {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    match (result.outcome, &result.plan_text) {
+        (PlanningResultOutcome::Completed, Some(text)) => {
+            if text.is_empty() || text.len() > MAX_PLAN_TEXT_LEN {
+                return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+            }
+        }
+        (PlanningResultOutcome::Completed, None) => {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        (_, None) => {}
+        (_, Some(_)) => return Err(repository_error(RepositoryErrorCode::InvalidAggregate)),
+    }
+    Ok(())
+}
+
+fn insert_planning_result(
+    connection: &Connection,
+    result: &TaskPlanningResultRecord,
+) -> Result<(), RepositoryError> {
+    let turn_count = result.turn_count.map(i64::from);
+    connection
+        .execute(
+            "INSERT INTO task_planning_results (
+                task_id, provider, work_kind, outcome, exit_code, turn_count,
+                started_at_ms, completed_at_ms, plan_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                result.task_id.to_string(),
+                provider_kind_text(result.provider),
+                work_kind_text(result.work_kind),
+                planning_outcome_text(result.outcome),
+                result.exit_code,
+                turn_count,
+                result.started_at_ms,
+                result.completed_at_ms,
+                result.plan_text,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+fn load_planning_result(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskPlanningResultRecord>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms, plan_text
+             FROM task_planning_results WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i32>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?
+        .map(
+            |(
+                provider,
+                work_kind,
+                outcome,
+                exit_code,
+                turn_count,
+                started_at_ms,
+                completed_at_ms,
+                plan_text,
+            )| {
+                Ok(TaskPlanningResultRecord {
+                    task_id,
+                    provider: provider_kind_from_text(&provider)?,
+                    work_kind: work_kind_from_text(&work_kind)?,
+                    outcome: planning_outcome_from_text(&outcome)?,
+                    exit_code,
+                    turn_count: turn_count.map(u32::try_from).transpose().map_err(|_| {
+                        repository_error(RepositoryErrorCode::InvalidPersistenceState)
+                    })?,
+                    started_at_ms,
+                    completed_at_ms,
+                    plan_text,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn provider_kind_from_text(value: &str) -> Result<ProviderKind, RepositoryError> {
+    match value {
+        "Claude" => Ok(ProviderKind::Claude),
+        "Codex" => Ok(ProviderKind::Codex),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+fn work_kind_from_text(value: &str) -> Result<WorkKind, RepositoryError> {
+    match value {
+        "Planning" => Ok(WorkKind::Planning),
+        "Implementation" => Ok(WorkKind::Implementation),
+        "Review" => Ok(WorkKind::Review),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+fn planning_outcome_from_text(value: &str) -> Result<PlanningResultOutcome, RepositoryError> {
+    match value {
+        "Completed" => Ok(PlanningResultOutcome::Completed),
+        "Failed" => Ok(PlanningResultOutcome::Failed),
+        "Cancelled" => Ok(PlanningResultOutcome::Cancelled),
+        "RecoveryRequired" => Ok(PlanningResultOutcome::RecoveryRequired),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
     }
 }
 
@@ -2100,12 +2521,12 @@ fn state_text(state: TaskState) -> &'static str {
         TaskState::GitInitialized => "GitInitialized",
         TaskState::WorktreeCreating => "WorktreeCreating",
         TaskState::WorktreeReady => "WorktreeReady",
-        TaskState::PlanningWithClaude => "PlanningWithClaude",
+        TaskState::Planning => "Planning",
         TaskState::AwaitingDesignApproval => "AwaitingDesignApproval",
-        TaskState::ImplementingWithCodex => "ImplementingWithCodex",
+        TaskState::Implementing => "Implementing",
         TaskState::Testing => "Testing",
         TaskState::AutoFixing => "AutoFixing",
-        TaskState::ReviewingWithClaude => "ReviewingWithClaude",
+        TaskState::Reviewing => "Reviewing",
         TaskState::ReviewFixing => "ReviewFixing",
         TaskState::AwaitingUserDiffApproval => "AwaitingUserDiffApproval",
         TaskState::Merging => "Merging",
@@ -2155,12 +2576,12 @@ fn parse_state(value: &str) -> Result<TaskState, RepositoryError> {
         "GitInitialized" => Ok(TaskState::GitInitialized),
         "WorktreeCreating" => Ok(TaskState::WorktreeCreating),
         "WorktreeReady" => Ok(TaskState::WorktreeReady),
-        "PlanningWithClaude" => Ok(TaskState::PlanningWithClaude),
+        "Planning" => Ok(TaskState::Planning),
         "AwaitingDesignApproval" => Ok(TaskState::AwaitingDesignApproval),
-        "ImplementingWithCodex" => Ok(TaskState::ImplementingWithCodex),
+        "Implementing" => Ok(TaskState::Implementing),
         "Testing" => Ok(TaskState::Testing),
         "AutoFixing" => Ok(TaskState::AutoFixing),
-        "ReviewingWithClaude" => Ok(TaskState::ReviewingWithClaude),
+        "Reviewing" => Ok(TaskState::Reviewing),
         "ReviewFixing" => Ok(TaskState::ReviewFixing),
         "AwaitingUserDiffApproval" => Ok(TaskState::AwaitingUserDiffApproval),
         "Merging" => Ok(TaskState::Merging),

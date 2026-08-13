@@ -29,8 +29,12 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::tasks::get_active_task,
             commands::tasks::get_task,
             commands::tasks::list_task_history,
+            commands::provider_eligibility::get_provider_eligibility,
             commands::provider::set_claude_executable_path,
             commands::provider::refresh_claude_capability,
+            commands::planning::start_claude_planning,
+            commands::planning::cancel_claude_planning,
+            commands::planning::get_planning_result,
         ])
         .run(tauri::generate_context!())
 }

@@ -20,12 +20,12 @@ export type TaskState =
   | "gitInitialized"
   | "worktreeCreating"
   | "worktreeReady"
-  | "planningWithClaude"
+  | "planning"
   | "awaitingDesignApproval"
-  | "implementingWithCodex"
+  | "implementing"
   | "testing"
   | "autoFixing"
-  | "reviewingWithClaude"
+  | "reviewing"
   | "reviewFixing"
   | "awaitingUserDiffApproval"
   | "merging"
@@ -39,6 +39,26 @@ export type TaskState =
   | "cancelled"
   | "cleanupPending"
   | "archived";
+
+export type WorkKind = "planning" | "implementation" | "review";
+export type ProviderKind = "claude" | "codex";
+export type ContractStatus = "approved" | "notApproved";
+export type EligibilityBlockingReason =
+  | "capabilityUnavailable"
+  | "capabilityUnsupported"
+  | "contractNotApproved"
+  | "taskStateMismatch";
+
+export type ProviderEligibilityDto = {
+  readonly workKind: WorkKind;
+  readonly provider: ProviderKind;
+  readonly capability: CapabilityStatus;
+  readonly contract: ContractStatus;
+  readonly eligible: boolean;
+  readonly stateAllowsWorkKind: boolean;
+  readonly blockingReasons: readonly EligibilityBlockingReason[];
+};
+
 
 export interface VersionDto {
   version: string;
@@ -110,6 +130,19 @@ export interface ActiveTaskDto {
   acquiredAtMs: number;
 }
 
+export interface TaskBriefDto {
+  requirements: string;
+  completionCriteria: string;
+  prohibitedScope: string;
+  createdAtMs: number;
+}
+
+export interface TaskBriefInput {
+  requirements: string;
+  completionCriteria: string;
+  prohibitedScope: string;
+}
+
 export interface TaskDto {
   id: string;
   projectId: string;
@@ -120,6 +153,22 @@ export interface TaskDto {
   createdAtMs: number;
   updatedAtMs: number;
   terminalAtMs: number | null;
+  brief: TaskBriefDto | null;
+}
+
+export interface CancelPlanningDto {
+  requested: boolean;
+}
+
+export type PlanningOutcome = "completed" | "failed" | "cancelled" | "recoveryRequired";
+
+export interface PlanningResultDto {
+  outcome: PlanningOutcome;
+  exitCode: number | null;
+  turnCount: number | null;
+  startedAtMs: number;
+  completedAtMs: number;
+  planText: string | null;
 }
 
 export interface TaskTransitionDto {

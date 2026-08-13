@@ -91,7 +91,8 @@ impl ApplicationError {
             | DomainError::InvalidTimestamp
             | DomainError::InvalidVersion
             | DomainError::InvalidActorKind
-            | DomainError::InvalidReasonCode => FailureCategory::InvalidInput,
+            | DomainError::InvalidReasonCode
+            | DomainError::InvalidTaskBrief => FailureCategory::InvalidInput,
         };
         Self::from_failure(
             category,

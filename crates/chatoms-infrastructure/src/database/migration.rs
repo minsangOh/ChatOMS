@@ -50,10 +50,22 @@ impl Migration {
     }
 }
 
-pub static FOUNDATION_MIGRATION: [Migration; 3] = [
+pub static FOUNDATION_MIGRATION: [Migration; 7] = [
     Migration::new(1, "foundation", schema::FOUNDATION_SQL),
     Migration::new(2, "git_isolation", schema::GIT_ISOLATION_SQL),
     Migration::new(3, "provider_binding", schema::PROVIDER_BINDING_SQL),
+    Migration::new(
+        4,
+        "provider_neutral_task_states",
+        schema::PROVIDER_NEUTRAL_TASK_STATES_SQL,
+    ),
+    Migration::new(5, "task_briefs", schema::TASK_BRIEFS_SQL),
+    Migration::new(6, "provider_consents", schema::PROVIDER_CONSENTS_SQL),
+    Migration::new(
+        7,
+        "task_planning_results",
+        schema::TASK_PLANNING_RESULTS_SQL,
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -483,6 +495,49 @@ fn validate_applied_prefix(
 }
 
 fn apply_one(
+    connection: &mut Connection,
+    migration: Migration,
+    identities: &[LegacyProjectIdentity],
+) -> Result<(), DatabaseError> {
+    if migration.version != 4 || migration.name != "provider_neutral_task_states" {
+        return apply_one_transaction(connection, migration, identities);
+    }
+
+    set_foreign_keys(connection, false)?;
+    let migration_result = apply_one_transaction(connection, migration, identities);
+    let restore_result = set_foreign_keys(connection, true);
+    match restore_result {
+        Ok(()) => migration_result,
+        Err(error) => Err(error),
+    }
+}
+
+fn set_foreign_keys(connection: &Connection, enabled: bool) -> Result<(), DatabaseError> {
+    connection
+        .pragma_update(None, "foreign_keys", enabled)
+        .map_err(|source| DatabaseError::ConfigureDatabase {
+            pragma: "foreign_keys",
+            source,
+        })?;
+    let actual: i64 = connection
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|source| DatabaseError::ConfigureDatabase {
+            pragma: "foreign_keys",
+            source,
+        })?;
+    let expected = if enabled { 1 } else { 0 };
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(DatabaseError::VerifyPragma {
+            pragma: "foreign_keys",
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        })
+    }
+}
+
+fn apply_one_transaction(
     connection: &mut Connection,
     migration: Migration,
     identities: &[LegacyProjectIdentity],

@@ -36,26 +36,33 @@ fn run_registry(
 
 #[test]
 fn production_registry_and_checksum_policy_are_valid() {
-    assert_eq!(FOUNDATION_MIGRATION.len(), 3);
+    assert_eq!(FOUNDATION_MIGRATION.len(), 7);
     assert_eq!(FOUNDATION_MIGRATION[0].version, 1);
     assert_eq!(FOUNDATION_MIGRATION[0].name, "foundation");
     assert_eq!(FOUNDATION_MIGRATION[1].version, 2);
     assert_eq!(FOUNDATION_MIGRATION[1].name, "git_isolation");
     assert_eq!(FOUNDATION_MIGRATION[2].version, 3);
     assert_eq!(FOUNDATION_MIGRATION[2].name, "provider_binding");
+    assert_eq!(FOUNDATION_MIGRATION[3].version, 4);
+    assert_eq!(FOUNDATION_MIGRATION[3].name, "provider_neutral_task_states");
+    assert_eq!(FOUNDATION_MIGRATION[4].version, 5);
+    assert_eq!(FOUNDATION_MIGRATION[4].name, "task_briefs");
+    assert_eq!(FOUNDATION_MIGRATION[5].version, 6);
+    assert_eq!(FOUNDATION_MIGRATION[5].name, "provider_consents");
+    assert_eq!(FOUNDATION_MIGRATION[6].version, 7);
+    assert_eq!(FOUNDATION_MIGRATION[6].name, "task_planning_results");
     validate_registry(&FOUNDATION_MIGRATION).expect("production registry must be valid");
 
-    let checksum = FOUNDATION_MIGRATION[0].checksum_sha256();
-    assert_eq!(checksum.len(), 64);
-    assert!(
-        checksum
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    );
-    assert_eq!(
-        checksum_sha256(FOUNDATION_MIGRATION[0].sql.as_bytes()),
-        checksum
-    );
+    for migration in FOUNDATION_MIGRATION {
+        let checksum = migration.checksum_sha256();
+        assert_eq!(checksum.len(), 64);
+        assert!(
+            checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(checksum_sha256(migration.sql.as_bytes()), checksum);
+    }
     assert_ne!(checksum_sha256(b"line\n"), checksum_sha256(b"line\r\n"));
     assert_eq!(
         checksum_sha256(b"same bytes"),
@@ -547,21 +554,21 @@ fn registry_rejects_zero_non_one_start_duplicates_order_and_empty_fields() {
 fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     let database = TestDatabase::empty();
     let first = run_registry(&database, &FOUNDATION_MIGRATION).expect("first migration run");
-    assert_eq!(first.schema_version, 3);
-    assert_eq!(first.applied_count, 3);
+    assert_eq!(first.schema_version, 7);
+    assert_eq!(first.applied_count, 7);
 
     let connection = database.open_raw();
     let metadata: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations WHERE version = 3",
+             FROM schema_migrations WHERE version = 7",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("read migration metadata");
-    assert_eq!(metadata.0, 3);
-    assert_eq!(metadata.1, "provider_binding");
-    assert_eq!(metadata.2, FOUNDATION_MIGRATION[2].checksum_sha256());
+    assert_eq!(metadata.0, 7);
+    assert_eq!(metadata.1, "task_planning_results");
+    assert_eq!(metadata.2, FOUNDATION_MIGRATION[6].checksum_sha256());
     assert!(metadata.3 >= 0);
     let schema_before: String = connection
         .query_row(
@@ -574,7 +581,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     drop(connection);
 
     let second = run_registry(&database, &FOUNDATION_MIGRATION).expect("second migration run");
-    assert_eq!(second.schema_version, 3);
+    assert_eq!(second.schema_version, 7);
     assert_eq!(second.applied_count, 0);
     let connection = database.open_raw();
     let schema_after: String = connection
@@ -586,11 +593,11 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
         )
         .expect("read schema snapshot after reopen");
     assert_eq!(schema_after, schema_before);
-    assert_eq!(count_rows(&connection, "schema_migrations"), 3);
+    assert_eq!(count_rows(&connection, "schema_migrations"), 7);
     let metadata_after: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations WHERE version = 3",
+             FROM schema_migrations WHERE version = 7",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -792,6 +799,9 @@ fn foundation_contains_required_tables_and_indexes() {
         "tasks",
         "task_state_transitions",
         "active_task_leases",
+        "task_briefs",
+        "task_provider_consents",
+        "task_planning_results",
         "schema_migrations",
     ] {
         assert!(table_exists(&connection, table), "missing table {table}");
@@ -1111,5 +1121,593 @@ fn lease_delete_order_and_terminal_insert_are_guarded() {
         )
         .expect_err("terminal lease insert must fail");
     assert!(is_constraint_error(&error));
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+fn migrate_through_v3(database: &TestDatabase) {
+    let outcome = run_registry(database, &FOUNDATION_MIGRATION[..3]).expect("apply v1 through v3");
+    assert_eq!(outcome.schema_version, 3);
+    assert_eq!(outcome.applied_count, 3);
+}
+
+fn provider_state_path(state: &str) -> &'static [&'static str] {
+    match state {
+        "PlanningWithClaude" => &[
+            "ProjectValidated",
+            "WorktreeCreating",
+            "WorktreeReady",
+            "PlanningWithClaude",
+        ],
+        "ImplementingWithCodex" => &[
+            "ProjectValidated",
+            "WorktreeCreating",
+            "WorktreeReady",
+            "PlanningWithClaude",
+            "ImplementingWithCodex",
+        ],
+        "ReviewingWithClaude" => &[
+            "ProjectValidated",
+            "WorktreeCreating",
+            "WorktreeReady",
+            "PlanningWithClaude",
+            "ImplementingWithCodex",
+            "Testing",
+            "ReviewingWithClaude",
+        ],
+        _ => panic!("unexpected provider-bound state fixture: {state}"),
+    }
+}
+
+fn insert_provider_state_fixture(
+    database: &TestDatabase,
+    legacy_state: &str,
+    paused: bool,
+) -> (i64, i64) {
+    let mut connection = database.open_raw();
+    insert_project(&connection, "provider-state-project");
+    let path = provider_state_path(legacy_state);
+    let version = path.len() as i64 + if paused { 1 } else { 0 };
+    let current_state = if paused { "Paused" } else { legacy_state };
+    let transaction = connection.transaction().expect("begin v3 fixture");
+
+    insert_task(
+        &transaction,
+        "provider-state-task",
+        "provider-state-project",
+        current_state,
+        version,
+        paused.then_some(legacy_state),
+        None,
+    )
+    .expect("insert provider-bound task");
+    transaction
+        .execute(
+            "INSERT INTO task_state_transitions (
+                id, task_id, sequence, from_state, to_state, task_version,
+                actor_kind, reason_code, occurred_at_ms
+             ) VALUES (
+                'provider-transition-1', 'provider-state-task', 1, NULL, 'Created', 0,
+                'application', 'task.created', 100
+             )",
+            [],
+        )
+        .expect("insert initial transition");
+
+    let mut from_state = "Created";
+    for (index, &to_state) in path.iter().enumerate() {
+        let task_version = index as i64 + 1;
+        let sequence = task_version + 1;
+        transaction
+            .execute(
+                "INSERT INTO task_state_transitions (
+                    id, task_id, sequence, from_state, to_state, task_version,
+                    actor_kind, reason_code, occurred_at_ms
+                 ) VALUES (?1, 'provider-state-task', ?2, ?3, ?4, ?5,
+                           'application', 'task.transition', ?6)",
+                params![
+                    format!("provider-transition-{sequence}"),
+                    sequence,
+                    from_state,
+                    to_state,
+                    task_version,
+                    100 + task_version
+                ],
+            )
+            .expect("insert provider state history");
+        from_state = to_state;
+    }
+    if paused {
+        let sequence = version + 1;
+        transaction
+            .execute(
+                "INSERT INTO task_state_transitions (
+                    id, task_id, sequence, from_state, to_state, task_version,
+                    actor_kind, reason_code, occurred_at_ms
+                 ) VALUES (?1, 'provider-state-task', ?2, ?3, 'Paused', ?4,
+                           'user', 'task.paused', ?5)",
+                params![
+                    format!("provider-transition-{sequence}"),
+                    sequence,
+                    legacy_state,
+                    version,
+                    100 + version
+                ],
+            )
+            .expect("insert paused transition");
+    }
+    insert_lease(&transaction, "provider-state-task").expect("insert active lease");
+    transaction
+        .execute(
+            "INSERT INTO task_git_isolations (
+                task_id, project_id, status, expected_task_version, created_at_ms, updated_at_ms
+             ) VALUES (
+                'provider-state-task', 'provider-state-project', 'Ready', ?1, 100, 100
+             )",
+            [version],
+        )
+        .expect("insert task isolation");
+    insert_task(
+        &transaction,
+        "terminal-task",
+        "provider-state-project",
+        "Completed",
+        9,
+        None,
+        Some(999),
+    )
+    .expect("insert terminal timestamp fixture");
+    transaction.commit().expect("commit v3 fixture");
+    (version, version + 1)
+}
+
+fn assert_provider_state_fixture_migrated(
+    connection: &Connection,
+    legacy_state: &str,
+    neutral_state: &str,
+    paused: bool,
+    expected_version: i64,
+    expected_sequence: i64,
+) {
+    let task: (String, Option<String>, i64, Option<i64>) = connection
+        .query_row(
+            "SELECT state, resume_target_state, version, terminal_at_ms
+             FROM tasks WHERE id = 'provider-state-task'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read migrated task");
+    assert_eq!(
+        task,
+        (
+            if paused { "Paused" } else { neutral_state }.to_owned(),
+            paused.then(|| neutral_state.to_owned()),
+            expected_version,
+            None
+        )
+    );
+
+    let terminal: (String, i64, i64) = connection
+        .query_row(
+            "SELECT state, version, terminal_at_ms
+             FROM tasks WHERE id = 'terminal-task'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read terminal timestamp fixture");
+    assert_eq!(terminal, ("Completed".to_owned(), 9, 999));
+
+    let last_history: (i64, i64) = connection
+        .query_row(
+            "SELECT sequence, task_version
+             FROM task_state_transitions
+             WHERE task_id = 'provider-state-task'
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read migrated transition sequence");
+    assert_eq!(last_history, (expected_sequence, expected_version));
+    let legacy_history_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM task_state_transitions
+             WHERE from_state = ?1 OR to_state = ?1",
+            [legacy_state],
+            |row| row.get(0),
+        )
+        .expect("count legacy history state");
+    assert_eq!(legacy_history_count, 0);
+    let neutral_history_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM task_state_transitions
+             WHERE from_state = ?1 OR to_state = ?1",
+            [neutral_state],
+            |row| row.get(0),
+        )
+        .expect("count neutral history state");
+    assert!(neutral_history_count >= 1);
+
+    let lease: (i64, String, i64) = connection
+        .query_row(
+            "SELECT singleton_key, task_id, acquired_at_ms FROM active_task_leases",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read preserved active lease");
+    assert_eq!(lease, (1, "provider-state-task".to_owned(), 100));
+    let isolation: (String, String, i64) = connection
+        .query_row(
+            "SELECT task_id, project_id, expected_task_version
+             FROM task_git_isolations WHERE task_id = 'provider-state-task'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read preserved task isolation");
+    assert_eq!(
+        isolation,
+        (
+            "provider-state-task".to_owned(),
+            "provider-state-project".to_owned(),
+            expected_version
+        )
+    );
+
+    let task_schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'tasks'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read tasks schema");
+    let history_schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'table' AND name = 'task_state_transitions'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read transition schema");
+    for legacy in [
+        "PlanningWithClaude",
+        "ImplementingWithCodex",
+        "ReviewingWithClaude",
+    ] {
+        assert!(!task_schema.contains(legacy));
+        assert!(!history_schema.contains(legacy));
+    }
+    assert_eq!(foreign_key_violation_count(connection), 0);
+}
+
+#[test]
+fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
+    for (legacy_state, neutral_state) in [
+        ("PlanningWithClaude", "Planning"),
+        ("ImplementingWithCodex", "Implementing"),
+        ("ReviewingWithClaude", "Reviewing"),
+    ] {
+        for paused in [false, true] {
+            let database = TestDatabase::empty();
+            migrate_through_v3(&database);
+            let (expected_version, expected_sequence) =
+                insert_provider_state_fixture(&database, legacy_state, paused);
+
+            let outcome = run_registry(&database, &FOUNDATION_MIGRATION)
+                .expect("apply provider-neutral state migration");
+            assert_eq!(outcome.schema_version, 7);
+            assert_eq!(outcome.applied_count, 4);
+
+            let connection = database.open_raw();
+            assert_provider_state_fixture_migrated(
+                &connection,
+                legacy_state,
+                neutral_state,
+                paused,
+                expected_version,
+                expected_sequence,
+            );
+            drop(connection);
+
+            let rerun = run_registry(&database, &FOUNDATION_MIGRATION)
+                .expect("re-run provider-neutral state migration");
+            assert_eq!(rerun.schema_version, 7);
+            assert_eq!(rerun.applied_count, 0);
+        }
+    }
+}
+
+#[test]
+fn failed_v4_rebuild_restores_foreign_key_enforcement_and_rolls_back() {
+    static REGISTRY: [Migration; 4] = [
+        Migration::new(
+            1,
+            "one",
+            "CREATE TABLE migration_one (id INTEGER PRIMARY KEY);",
+        ),
+        Migration::new(2, "two", "SELECT 1;"),
+        Migration::new(3, "three", "SELECT 1;"),
+        Migration::new(
+            4,
+            "provider_neutral_task_states",
+            "CREATE TABLE rolled_back_v4 (id INTEGER PRIMARY KEY); INVALID SQL;",
+        ),
+    ];
+
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    assert!(matches!(
+        MigrationRunner::new(&REGISTRY).run(&mut connection),
+        Err(DatabaseError::MigrationExecutionFailed { version: 4, .. })
+    ));
+    let settings = connection
+        .verify()
+        .expect("migration failure must restore connection PRAGMAs");
+    assert_eq!(settings.foreign_keys, 1);
+
+    let raw = database.open_raw();
+    assert!(!table_exists(&raw, "rolled_back_v4"));
+    assert_eq!(count_rows(&raw, "schema_migrations"), 3);
+}
+
+#[test]
+fn v5_adds_task_briefs_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 7);
+    assert_eq!(outcome.applied_count, 7);
+    assert!(table_exists(&database.open_raw(), "task_briefs"));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 7);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn task_briefs_requires_non_empty_fields_and_is_immutable_after_insert() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "brief-task", "project");
+
+    for (requirements, completion_criteria, prohibited_scope) in [
+        ("", "criteria", "scope"),
+        ("requirements", "", "scope"),
+        ("requirements", "criteria", ""),
+    ] {
+        let error = connection
+            .execute(
+                "INSERT INTO task_briefs (
+                    task_id, requirements, completion_criteria, prohibited_scope, created_at_ms
+                 ) VALUES ('brief-task', ?1, ?2, ?3, 100)",
+                params![requirements, completion_criteria, prohibited_scope],
+            )
+            .expect_err("empty brief field must be rejected");
+        assert!(is_constraint_error(&error), "unexpected error: {error:?}");
+    }
+
+    connection
+        .execute(
+            "INSERT INTO task_briefs (
+                task_id, requirements, completion_criteria, prohibited_scope, created_at_ms
+             ) VALUES ('brief-task', 'requirements', 'criteria', 'scope', 100)",
+            [],
+        )
+        .expect("valid brief insert");
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_briefs SET requirements = 'changed' WHERE task_id = 'brief-task'",
+            [],
+        )
+        .expect_err("task_briefs must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute("DELETE FROM task_briefs WHERE task_id = 'brief-task'", [])
+        .expect_err("task_briefs rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(count_rows(&connection, "task_briefs"), 1);
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn v6_adds_provider_consents_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 7);
+    assert_eq!(outcome.applied_count, 7);
+    assert!(table_exists(&database.open_raw(), "task_provider_consents"));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 7);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn provider_consents_reject_unapproved_values_mismatched_task_versions_and_duplicates() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "consent-task", "project");
+
+    for (provider, work_kind) in [("Codex", "Planning"), ("Claude", "Implementation")] {
+        let error = connection
+            .execute(
+                "INSERT INTO task_provider_consents (
+                    task_id, provider, work_kind, approved_task_version, consented_at_ms
+                 ) VALUES ('consent-task', ?1, ?2, 0, 100)",
+                params![provider, work_kind],
+            )
+            .expect_err("unapproved provider/work_kind combination must be rejected");
+        assert!(is_constraint_error(&error), "unexpected error: {error:?}");
+    }
+
+    let mismatched_version = connection.execute(
+        "INSERT INTO task_provider_consents (
+            task_id, provider, work_kind, approved_task_version, consented_at_ms
+         ) VALUES ('consent-task', 'Claude', 'Planning', 1, 100)",
+        [],
+    );
+    assert!(
+        mismatched_version.as_ref().is_err_and(is_constraint_error),
+        "consent bound to a task version other than the task's current version must be rejected"
+    );
+
+    connection
+        .execute(
+            "INSERT INTO task_provider_consents (
+                task_id, provider, work_kind, approved_task_version, consented_at_ms
+             ) VALUES ('consent-task', 'Claude', 'Planning', 0, 100)",
+            [],
+        )
+        .expect("consent bound to the exact current task version");
+
+    let duplicate = connection.execute(
+        "INSERT INTO task_provider_consents (
+            task_id, provider, work_kind, approved_task_version, consented_at_ms
+         ) VALUES ('consent-task', 'Claude', 'Planning', 0, 200)",
+        [],
+    );
+    assert!(
+        duplicate.as_ref().is_err_and(is_constraint_error),
+        "duplicate (task_id, provider, work_kind, approved_task_version) must be rejected"
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_provider_consents SET consented_at_ms = 999 WHERE task_id = 'consent-task'",
+            [],
+        )
+        .expect_err("task_provider_consents must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_provider_consents WHERE task_id = 'consent-task'",
+            [],
+        )
+        .expect_err("task_provider_consents rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(count_rows(&connection, "task_provider_consents"), 1);
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn v7_adds_task_planning_results_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 7);
+    assert_eq!(outcome.applied_count, 7);
+    assert!(table_exists(&database.open_raw(), "task_planning_results"));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 7);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn task_planning_results_enforce_outcome_shape_fixed_provider_and_immutability() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "planning-task", "project");
+
+    for (provider, work_kind) in [("Codex", "Planning"), ("Claude", "Implementation")] {
+        let error = connection
+            .execute(
+                "INSERT INTO task_planning_results (
+                    task_id, provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms, plan_text
+                 ) VALUES ('planning-task', ?1, ?2, 'Completed', 0, 1, 100, 200, 'plan')",
+                params![provider, work_kind],
+            )
+            .expect_err("unapproved provider/work_kind combination must be rejected");
+        assert!(is_constraint_error(&error), "unexpected error: {error:?}");
+    }
+
+    let bad_outcome = connection.execute(
+        "INSERT INTO task_planning_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms, plan_text
+         ) VALUES ('planning-task', 'Claude', 'Planning', 'NotAnOutcome', 0, 1, 100, 200, 'plan')",
+        [],
+    );
+    assert!(bad_outcome.as_ref().is_err_and(is_constraint_error));
+
+    for (outcome, plan_text) in [
+        ("Completed", None),
+        ("Failed", Some("plan")),
+        ("Cancelled", Some("plan")),
+        ("RecoveryRequired", Some("plan")),
+    ] {
+        let error = connection
+            .execute(
+                "INSERT INTO task_planning_results (
+                    task_id, provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms, plan_text
+                 ) VALUES ('planning-task', 'Claude', 'Planning', ?1, 0, 1, 100, 200, ?2)",
+                params![outcome, plan_text],
+            )
+            .expect_err("plan_text presence must match the outcome");
+        assert!(is_constraint_error(&error), "unexpected error: {error:?}");
+    }
+
+    let backwards_timestamps = connection.execute(
+        "INSERT INTO task_planning_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms, plan_text
+         ) VALUES ('planning-task', 'Claude', 'Planning', 'Failed', 1, NULL, 200, 100, NULL)",
+        [],
+    );
+    assert!(
+        backwards_timestamps
+            .as_ref()
+            .is_err_and(is_constraint_error)
+    );
+
+    connection
+        .execute(
+            "INSERT INTO task_planning_results (
+                task_id, provider, work_kind, outcome, exit_code, turn_count,
+                started_at_ms, completed_at_ms, plan_text
+             ) VALUES ('planning-task', 'Claude', 'Planning', 'Completed', 0, 5, 100, 200, 'the plan')",
+            [],
+        )
+        .expect("valid completed result");
+
+    let duplicate = connection.execute(
+        "INSERT INTO task_planning_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms, plan_text
+         ) VALUES ('planning-task', 'Claude', 'Planning', 'Failed', 1, NULL, 100, 200, NULL)",
+        [],
+    );
+    assert!(
+        duplicate.as_ref().is_err_and(is_constraint_error),
+        "task_id is 1:1: a second row for the same task must be rejected"
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_planning_results SET plan_text = 'changed' WHERE task_id = 'planning-task'",
+            [],
+        )
+        .expect_err("task_planning_results must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_planning_results WHERE task_id = 'planning-task'",
+            [],
+        )
+        .expect_err("task_planning_results rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(count_rows(&connection, "task_planning_results"), 1);
     assert_eq!(foreign_key_violation_count(&connection), 0);
 }

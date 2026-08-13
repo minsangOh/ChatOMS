@@ -44,7 +44,7 @@ pub fn handle_list_task_history(
         .map_err(IpcErrorDto::from)
 }
 
-fn parse_task_id(value: &str) -> Result<TaskId, IpcErrorDto> {
+pub(super) fn parse_task_id(value: &str) -> Result<TaskId, IpcErrorDto> {
     TaskId::from_str(value)
         .map_err(|error| IpcErrorDto::from(ApplicationError::from_domain(&error)))
 }

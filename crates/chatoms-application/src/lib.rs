@@ -4,8 +4,10 @@
 pub mod bootstrap;
 pub mod error;
 pub mod git_isolation;
+pub mod planning_execution;
 pub mod projects;
 pub mod provider;
+pub mod provider_eligibility;
 pub mod system;
 pub mod tasks;
 

@@ -3,6 +3,7 @@ import type {
   BootstrapStatusDto,
   HealthDto,
   ProjectDto,
+  ProviderEligibilityDto,
   SystemStatusDto,
   VersionDto,
 } from "../ipc/types";
@@ -17,6 +18,14 @@ export const bootstrapStatus: BootstrapStatusDto = {
   applicationVersion: "0.1.0",
   ready: true,
 };
+const failClosedEligibility: readonly ProviderEligibilityDto[] = [
+  { workKind: "planning", provider: "claude", capability: "unavailable", contract: "notApproved", eligible: false, stateAllowsWorkKind: false, blockingReasons: ["contractNotApproved"] as const },
+  { workKind: "planning", provider: "codex", capability: "unavailable", contract: "notApproved", eligible: false, stateAllowsWorkKind: false, blockingReasons: ["contractNotApproved"] as const },
+  { workKind: "implementation", provider: "claude", capability: "unavailable", contract: "notApproved", eligible: false, stateAllowsWorkKind: false, blockingReasons: ["contractNotApproved"] as const },
+  { workKind: "implementation", provider: "codex", capability: "unavailable", contract: "notApproved", eligible: false, stateAllowsWorkKind: false, blockingReasons: ["contractNotApproved"] as const },
+  { workKind: "review", provider: "claude", capability: "unavailable", contract: "notApproved", eligible: false, stateAllowsWorkKind: false, blockingReasons: ["contractNotApproved"] as const },
+  { workKind: "review", provider: "codex", capability: "unavailable", contract: "notApproved", eligible: false, stateAllowsWorkKind: false, blockingReasons: ["contractNotApproved"] as const },
+];
 export const systemStatus: SystemStatusDto = {
   applicationVersion: "0.1.0",
   health: "healthy",
@@ -46,7 +55,7 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
     inspectProjectCandidate: async () => { throw new Error("not implemented in frontend tests"); },
     registerProject: async () => { throw new Error("not implemented in frontend tests"); },
     getProjectGitStatus: async () => { throw new Error("not implemented in frontend tests"); },
-    createIsolationTask: async () => { throw new Error("not implemented in frontend tests"); },
+    createIsolationTask: async (_, brief) => { if (!brief) throw new Error("brief is required"); throw new Error("not implemented in frontend tests"); },
     getTaskIsolation: async () => { throw new Error("not implemented in frontend tests"); },
     approveGitInitialization: async () => { throw new Error("not implemented in frontend tests"); },
     createTaskWorktree: async () => { throw new Error("not implemented in frontend tests"); },
@@ -55,8 +64,12 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
       throw new Error("not implemented in frontend tests");
     },
     listTaskHistory: async () => [],
+    getProviderEligibility: async () => failClosedEligibility,
     setClaudeExecutablePath: async () => ({ displayPath: "%USERPROFILE%\\claude.exe", claudeExecution: "unavailable" as const }),
     refreshClaudeCapability: async () => ({ outcome: "completed" as const, claudeExecution: "unavailable" as const, codexExecution: "unsupported" as const }),
+    startClaudePlanning: async () => { throw new Error("not implemented in frontend tests"); },
+    cancelClaudePlanning: async () => { throw new Error("not implemented in frontend tests"); },
+    getPlanningResult: async () => null,
     ...overrides,
   };
 }

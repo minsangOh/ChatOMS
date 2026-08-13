@@ -1,8 +1,8 @@
 use std::{path::Path, str::FromStr};
 
 use chatoms_domain::{
-    ActorKind, GitOperationId, ProjectId, ReasonCode, Task, TaskId, TaskState, TaskStateTransition,
-    TaskStateTransitionId, TaskStateTransitionSnapshot,
+    ActorKind, GitOperationId, ProjectId, ReasonCode, Task, TaskBrief, TaskId, TaskState,
+    TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot,
 };
 use chatoms_ports::{
     TimeProvider,
@@ -14,7 +14,7 @@ use chatoms_ports::{
     repository::{
         FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationKind,
         GitOperationReceipt, GitOperationReceiptKind, ProjectFilesystemIdentityRecord,
-        ProjectRecord, TaskGitIsolation,
+        ProjectRecord, TaskBriefRecord, TaskGitIsolation,
     },
 };
 
@@ -29,6 +29,15 @@ pub enum IsolationBlocker {
     GitAuthorMissing,
     GitOperationFailed,
     RecoveryRequired,
+}
+
+/// Raw, unvalidated task brief input for [`GitIsolationService::create_task`].
+/// Validation happens inside `create_task` via [`TaskBrief::new`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskBriefDraft {
+    pub requirements: String,
+    pub completion_criteria: String,
+    pub prohibited_scope: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +89,7 @@ where
     pub fn create_task(
         &mut self,
         project_id: ProjectId,
+        brief: Option<TaskBriefDraft>,
     ) -> Result<TaskIsolationView, ApplicationError> {
         let project = self.load_project(project_id)?;
         let identity = self.load_project_identity(project_id)?;
@@ -126,8 +136,32 @@ where
             created_at_ms: now,
             updated_at_ms: now,
         };
+        let brief_record = brief
+            .map(|draft| {
+                TaskBrief::new(
+                    draft.requirements,
+                    draft.completion_criteria,
+                    draft.prohibited_scope,
+                )
+                .map_err(domain_error)
+                .map(|brief| TaskBriefRecord {
+                    task_id,
+                    requirements: brief.requirements().to_owned(),
+                    completion_criteria: brief.completion_criteria().to_owned(),
+                    prohibited_scope: brief.prohibited_scope().to_owned(),
+                    created_at_ms: now,
+                })
+            })
+            .transpose()?;
         self.repository
-            .create_isolation_task(&task, &initial, &classified, now, &isolation)
+            .create_isolation_task(
+                &task,
+                &initial,
+                &classified,
+                now,
+                &isolation,
+                brief_record.as_ref(),
+            )
             .map_err(repository_error)?;
         Ok(view(&task, &isolation, None))
     }
