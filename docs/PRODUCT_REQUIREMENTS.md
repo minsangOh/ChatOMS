@@ -46,7 +46,7 @@ Eligible provider란 다음 두 조건을 모두 만족하는 provider다.
 
 현재 승인된 실행 계약은 다음과 같다.
 
-* Claude: 읽기 전용 설계·리뷰 계약만 승인됨. 구현(write) 실행 계약은 장기 목표이나 미정의·미구현이다.
+* Claude: Planning·Review 읽기 전용 계약과 Implementation write 계약이 승인·구현됐다. 시작은 사용자 동의와 capability gate를 통과해야 하며, 불확실한 write 결과는 `RecoveryRequired`로 fail-closed 처리한다.
 * Codex: executable trust 근거와 작업 종류별 실행 계약이 모두 미승인이다. capability는 `Unsupported`이며 현재 eligible provider가 아니다.
 
 Gajae-Code는 인증 프록시나 모델 API 변환기로 사용하지 않는다.
@@ -237,7 +237,7 @@ Gajae-Code 하네스 전체 단계를 사용하지 않고 Claude 또는 Codex를
 
 | Provider | 설계 | 구현 | 리뷰 | 비고 |
 |---|---|---|---|---|
-| Claude | 읽기 전용 계약 승인됨 | 미정의 | 읽기 전용 계약 승인됨 | 구현(write) 계약은 장기 목표이나 미정의·미구현 |
+| Claude | 읽기 전용 계약 승인됨 | write 계약 승인됨 | 읽기 전용 계약 승인됨 | Codex가 미승인인 동안 현재 eligible provider는 Claude뿐 |
 | Codex | 미정의 | 미정의 | 미정의 | trust 근거와 실행 계약이 미승인이고 capability가 `Unsupported`이므로 현재 선택 불가 |
 
 실행 중 provider 자동 전환, 세션 handoff와 Context Package 구조 변경은 현재 범위에 포함하지 않는다.
@@ -1277,16 +1277,17 @@ UI보다 도메인 로직과 안전성을 먼저 구현한다.
 ## Phase 4 — 하네스
 
 * 작업 상태 머신
-* 설계 단계 (사용자가 eligible provider 선택)
-* Context Package
-* 구현 단계 (사용자가 eligible provider 선택)
-* 테스트 실행
-* 자동 수정
-* 리뷰 단계 (사용자가 eligible provider 선택)
-* 리뷰 재수정
+* Claude Planning·Implementation·Review 실행
+* 승인된 Cargo-only 테스트 실행
+* 마스킹된 결과의 읽기 전용 표시
 
 ## Phase 5 — 승인 및 병합
 
+* Context Package
+* 고위험 작업 판별·승인
+* provider/model 선택 UI
+* 모델 추천·사용자 override·프로젝트별 모델 고정
+* 자동 수정과 리뷰 재수정
 * 정책 엔진
 * 승인 UI
 * diff 검토

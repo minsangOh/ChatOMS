@@ -90,7 +90,7 @@ Phase 1 기반
 
 ## Phase 3 — 프로세스와 공급자 연동
 
-**상태:** 다음 승인된 구현 범위
+**상태:** 완료
 
 **선행조건:** Phase 1 완료. 통합 검증에는 Phase 2의 worktree가 필요하다.
 
@@ -104,15 +104,17 @@ Phase 1 기반
 
 ## Phase 4 — 하네스 워크플로
 
+**상태:** 완료
+
 **선행조건:** Phase 2와 Phase 3 완료.
 
-**목적:** 설계 → 구현·테스트 → 리뷰의 순차 워크플로를 완성한다. 각 작업 종류의 provider는 사용자가 실행 시 eligible provider 중에서 선택한다.
+**목적:** Claude Planning → Implementation → Cargo-only Testing → Review의 순차 워크플로를 `AwaitingUserDiffApproval`까지 구현한다. Codex는 trust·계약 미승인 상태로 차단한다.
 
-**포함 범위:** 상태 머신, Context Package revision, 설계 단계, 고위험 판별, 구현 단계, 검증 명령, 최대 2회 테스트 수정, 리뷰 단계, 최대 1회 중대 문제 재수정, 작업 종류·단계별 모델 추천, 추천 provider·모델·이유·예상 비용 등급 또는 호출 규모 표시, 사용자 override와 프로젝트별 모델 고정. provider 선택과 실제 실행 시작 흐름 안에서 실제 설계·리뷰 세션 실행과 Claude turn 상한(설계 12/리뷰 8) 실측 강제, 호환성 실패·중단·오류를 안전한 공통 provider event로 변환하는 처리, `ProcessRunner` stdout/stderr 스트리밍·중단·종료를 구현한다. 실제 Codex 활성화는 별도 trust 근거와 구현계획 승인 후에만 가능하며, 승인 이후 프로필별 `CODEX_HOME`을 사용한 Codex app-server 세션을 이 provider 실행 오케스트레이션에 포함한다.
+**포함 범위:** provider-neutral 상태 모델, immutable TaskBrief와 전송 동의, Claude Planning·Implementation·Review의 bounded 실행·취소·panic containment·startup reconciliation, 승인된 Cargo fixed-command validation, 안전한 결과 저장·read-only UI, stdout/stderr·diff 비노출 경계, streaming/cancellation ProcessRunner를 구현한다. Claude Planning은 12 turns, Review는 8 turns으로 강제하며 Codex는 trust 승인 전 `Unsupported`/`NotApproved`로 차단한다.
 
-**제외 범위:** 기본 브랜치 병합, 보관 기간 자동 정리, 업데이트.
+**제외 범위:** 기본 브랜치 병합, 보관 기간 자동 정리, 업데이트, Context Package, 고위험 작업 판별·승인, 다중 provider/model 선택 UI, package-manager script 실행, `AutoFixing`, `ReviewFixing`, 모델 추천·사용자 override·프로젝트별 모델 고정, Codex 활성화.
 
-**완료 조건:** 작업이 재시도 상한과 자동 수정 금지 조건을 지키며 `AwaitingUserDiffApproval` 또는 근거가 기록된 중단 상태에 도달한다. 모델 추천은 근거와 예상 비용 등급 또는 호출 규모를 표시하고 사용자 override와 프로젝트 고정을 우선하며, 승인 없이 더 비싼 모델로 자동 상향하지 않는다. Claude 설계·리뷰 세션은 turn 상한을 실측 강제하고, provider 호환성 실패·중단·오류는 공통 provider event로 안전하게 변환되며, Codex app-server 세션은 trust 승인 전까지 활성화되지 않는다.
+**완료 조건:** 작업이 `AwaitingUserDiffApproval` 또는 근거가 기록된 fail-closed 중단 상태에 도달한다. Claude Planning·Review는 turn 상한을 실측 강제하고, active `Planning`/`Implementing`/`Testing`/`Reviewing`은 재시작 시 `RecoveryRequired`로 회수하며, Codex는 trust 승인 전 활성화되지 않는다.
 
 ## Phase 5 — 승인·검토·병합
 
@@ -120,9 +122,9 @@ Phase 1 기반
 
 **목적:** 고위험 작업 승인, 최종 diff 검토와 안전한 로컬 병합을 제공한다.
 
-**포함 범위:** 중앙 Policy Engine, 승인 화면, 결과 화면, 대상 프로젝트 schema·migration·데이터 변환 승인, 단일 작업 commit, `--no-ff` 병합, 보수적 충돌 분류와 병합 후 테스트. 자동 충돌 해결은 결정적으로 재생성 가능한 파일, 순수 formatting 차이와 명백한 import 정리에만 허용한다.
+**포함 범위:** 중앙 Policy Engine, Context Package, 고위험 작업 승인, provider/model 선택 UI, 모델 추천·사용자 override·프로젝트별 모델 고정, `AutoFixing`, `ReviewFixing`, 결과 화면, 대상 프로젝트 schema·migration·데이터 변환 승인, 단일 작업 commit, `--no-ff` 병합, 보수적 충돌 분류와 병합 후 테스트. 자동 충돌 해결은 결정적으로 재생성 가능한 파일, 순수 formatting 차이와 명백한 import 정리에만 허용한다.
 
-**제외 범위:** push, PR·이슈·릴리스, 배포, 프로그램 로직, 설정, DB schema·migration, 보안 정책, 의존성, 삭제 대 수정 또는 요구사항 의미 변경이 얽힌 충돌의 자동 해결.
+**제외 범위:** push, PR·이슈·릴리스, 배포, 대상 프로젝트의 프로그램 로직·설정·DB schema·migration, 보안 정책, 의존성, 삭제 대 수정 또는 요구사항 의미 변경이 얽힌 충돌의 자동 해결.
 
 **완료 조건:** 승인 없는 고위험 동작과 병합이 차단되고, 기준 브랜치 변경·미커밋 상태·위험 충돌에서 실패 폐쇄하며 병합 결과와 검증이 기록된다.
 

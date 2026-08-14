@@ -93,15 +93,16 @@ adapters / infrastructure
 
 ### Claude — 현재 승인된 실행 계약
 
-- 현재 승인된 계약은 읽기 전용 설계·리뷰 계약뿐이다. 설계 실행은 최대 12 turns, 리뷰 실행은 최대 8 turns로 제한한다.
-- 읽기 전용 실행은 `--permission-mode plan`으로 파일 편집을 차단하고 `--tools "Read,Glob,Grep"` allowlist로 `Bash`를 포함한 나머지 도구를 차단하는 조합이다. 두 flag는 함께 필요하며 `--disallowedTools`가 아니라 이 allowlist를 우선 사용한다. 출력은 stream-json, 최종 결과는 JSON Schema로 검증한다.
+- Planning과 Review는 읽기 전용 계약으로 실행한다. Planning은 최대 12 turns, Review는 최대 8 turns이며 `--permission-mode plan`과 `--tools "Read,Glob,Grep"` allowlist로 `Bash`를 포함한 나머지 도구를 차단한다.
+- Implementation은 `default` permission mode에서 `Read,Glob,Grep,Edit,Write`만 허용하고 `Edit,Write`만 headless 승인한다. `Bash`, package-manager script, 임의 network 명령은 허용하지 않는다.
+- 세 작업 종류 모두 trusted preflight directory를 CWD로 사용하고 worktree는 `--add-dir`로만 전달한다. `--strict-mcp-config`, `--setting-sources project,local`, `--disable-slash-commands`를 적용하며 stdout/stderr 원문·session 정보는 UI, 로그, SQLite에 노출하지 않는다.
 - Claude provider capability의 `Supported`는 executable trust, 로컬 CLI compatibility, 로그인 상태를 모두 통과했을 때만 성립한다.
 - Compatibility와 로그인 상태 검증은 모델 세션을 시작하거나 외부로 전송하지 않는 정적·로컬 preflight로 수행하며, 신뢰된 사용자 지정 executable에 대해서만 `--version`, 도움말 기반 필수 flag 확인과 `claude auth status` 종료 코드를 사용한다.
 - `claude auth status`의 표준출력·표준오류는 절대 읽지 않으며 로그인 여부는 종료 코드만으로 판정한다.
 - `--version`과 도움말 기반 필수 flag 확인의 표준출력은 compatibility 판정에 필요한 범위에서만 메모리 안에서 일시적으로 해석한 뒤 즉시 폐기한다. 표준오류는 이때도 해석·표시·저장하지 않으며, 원문은 UI, 로그, DB, artifact 어디에도 표시·저장하지 않는다.
 - 실제 모델 호출을 통한 검증은 작업 시작 시 공급자 전송 승인 이후 단계로 미룬다.
 - 신뢰·버전·필수 flag·로그인 상태 중 하나라도 실패하거나 판정이 모호하면 `Supported`가 아닌 `Unsupported`로 fail-closed 처리하며 권한을 완화하거나 비구조화 출력으로 전환하지 않는다.
-- Claude 구현(write) 실행 계약은 장기 목표에 포함되나 아직 정의되지 않았다. 정의 전까지 Claude를 구현 작업 종류에 선택할 수 없다.
+- Claude Implementation은 별도 동의와 worktree·TaskBrief·Planning 결과 사전 검증을 통과한 뒤에만 시작하며, write 실행의 nonzero/timeout/uncertain 결과는 `RecoveryRequired`로 fail-closed 처리한다.
 
 ### Codex — 현재 capability 상태
 
