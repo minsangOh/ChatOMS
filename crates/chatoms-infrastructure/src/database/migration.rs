@@ -50,10 +50,54 @@ impl Migration {
     }
 }
 
-pub static FOUNDATION_MIGRATION: [Migration; 3] = [
+pub static FOUNDATION_MIGRATION: [Migration; 15] = [
     Migration::new(1, "foundation", schema::FOUNDATION_SQL),
     Migration::new(2, "git_isolation", schema::GIT_ISOLATION_SQL),
     Migration::new(3, "provider_binding", schema::PROVIDER_BINDING_SQL),
+    Migration::new(
+        4,
+        "provider_neutral_task_states",
+        schema::PROVIDER_NEUTRAL_TASK_STATES_SQL,
+    ),
+    Migration::new(5, "task_briefs", schema::TASK_BRIEFS_SQL),
+    Migration::new(6, "provider_consents", schema::PROVIDER_CONSENTS_SQL),
+    Migration::new(
+        7,
+        "task_planning_results",
+        schema::TASK_PLANNING_RESULTS_SQL,
+    ),
+    Migration::new(
+        8,
+        "implementation_consents",
+        schema::IMPLEMENTATION_CONSENTS_SQL,
+    ),
+    Migration::new(
+        9,
+        "task_implementation_results",
+        schema::TASK_IMPLEMENTATION_RESULTS_SQL,
+    ),
+    Migration::new(
+        10,
+        "task_validation_command_approvals",
+        schema::TASK_VALIDATION_COMMAND_APPROVALS_SQL,
+    ),
+    Migration::new(
+        11,
+        "validation_command_executable_binding",
+        schema::VALIDATION_COMMAND_EXECUTABLE_BINDING_SQL,
+    ),
+    Migration::new(
+        12,
+        "validation_command_environment_binding",
+        schema::VALIDATION_COMMAND_ENVIRONMENT_BINDING_SQL,
+    ),
+    Migration::new(
+        13,
+        "task_validation_command_results",
+        schema::TASK_VALIDATION_COMMAND_RESULTS_SQL,
+    ),
+    Migration::new(14, "review_consents", schema::REVIEW_CONSENTS_SQL),
+    Migration::new(15, "task_review_results", schema::TASK_REVIEW_RESULTS_SQL),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,7 +526,112 @@ fn validate_applied_prefix(
     Ok(())
 }
 
+fn validate_no_existing_approvals_then_apply(
+    connection: &mut Connection,
+    migration: Migration,
+    identities: &[LegacyProjectIdentity],
+) -> Result<(), DatabaseError> {
+    let has_existing_approval: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_validation_command_approvals LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| migration_error(migration, source))?;
+
+    if has_existing_approval {
+        return Err(DatabaseError::ValidationCommandApprovalMigrationFailed {
+            reason: "existing approval records must be removed before applying this migration",
+        });
+    }
+
+    apply_one_transaction(connection, migration, identities)
+}
+
+/// Unlike 0011 (whose pre-existing rows were always dev/test scratch data,
+/// since no shipped UI had ever written one), this table may already hold
+/// real user-approved rows by the time migration 12 runs — this Unit's own
+/// approval-persisting code shipped with 0011. Fabricating environment
+/// identity for such a row would misrepresent what was actually verified,
+/// so migration 12 aborts before touching the table if any row already
+/// exists, exactly mirroring 0011's own precondition.
+fn validate_no_existing_approvals_then_apply_environment_binding(
+    connection: &mut Connection,
+    migration: Migration,
+    identities: &[LegacyProjectIdentity],
+) -> Result<(), DatabaseError> {
+    let has_existing_approval: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_validation_command_approvals LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| migration_error(migration, source))?;
+
+    if has_existing_approval {
+        return Err(
+            DatabaseError::ValidationCommandEnvironmentBindingMigrationFailed {
+                reason: "existing approval records must be removed before applying this migration",
+            },
+        );
+    }
+
+    apply_one_transaction(connection, migration, identities)
+}
+
 fn apply_one(
+    connection: &mut Connection,
+    migration: Migration,
+    identities: &[LegacyProjectIdentity],
+) -> Result<(), DatabaseError> {
+    if migration.version == 12 && migration.name == "validation_command_environment_binding" {
+        return validate_no_existing_approvals_then_apply_environment_binding(
+            connection, migration, identities,
+        );
+    }
+    if migration.version == 11 && migration.name == "validation_command_executable_binding" {
+        return validate_no_existing_approvals_then_apply(connection, migration, identities);
+    }
+
+    if migration.version != 4 || migration.name != "provider_neutral_task_states" {
+        return apply_one_transaction(connection, migration, identities);
+    }
+
+    set_foreign_keys(connection, false)?;
+    let migration_result = apply_one_transaction(connection, migration, identities);
+    let restore_result = set_foreign_keys(connection, true);
+    match restore_result {
+        Ok(()) => migration_result,
+        Err(error) => Err(error),
+    }
+}
+
+fn set_foreign_keys(connection: &Connection, enabled: bool) -> Result<(), DatabaseError> {
+    connection
+        .pragma_update(None, "foreign_keys", enabled)
+        .map_err(|source| DatabaseError::ConfigureDatabase {
+            pragma: "foreign_keys",
+            source,
+        })?;
+    let actual: i64 = connection
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|source| DatabaseError::ConfigureDatabase {
+            pragma: "foreign_keys",
+            source,
+        })?;
+    let expected = if enabled { 1 } else { 0 };
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(DatabaseError::VerifyPragma {
+            pragma: "foreign_keys",
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        })
+    }
+}
+
+fn apply_one_transaction(
     connection: &mut Connection,
     migration: Migration,
     identities: &[LegacyProjectIdentity],

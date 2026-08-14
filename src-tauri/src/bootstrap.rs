@@ -4,6 +4,7 @@ use chatoms_application::{
     bootstrap::{BootstrapService, BootstrapStatus, DatabaseStatus, StorageStatus},
     error::ApplicationError,
     git_isolation::GitIsolationService,
+    tasks::TaskService,
 };
 use chatoms_infrastructure::bootstrap::{
     DatabaseBootstrapAdapter, LegacyProjectPreflightAdapter, LoggingBootstrapAdapter,
@@ -39,9 +40,10 @@ use chatoms_ports::{
 };
 
 use crate::state::{
-    AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle, ManagedRuntime,
-    ProviderCapabilityHandle, RepositoryHandle, RuntimePorts, RuntimeResources, TimeProviderHandle,
-    WorktreePathHandle,
+    AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle,
+    ImplementationRunRegistry, ManagedRuntime, PlanningRunRegistry, ProviderCapabilityHandle,
+    RepositoryHandle, ReviewRunRegistry, RuntimePorts, RuntimeResources, TestingRunRegistry,
+    TimeProviderHandle, WorktreePathHandle,
 };
 
 pub fn compose_runtime<S, D, L, R, T, C>(
@@ -104,6 +106,26 @@ where
             {
                 return ManagedRuntime::unavailable(error, Some(status));
             }
+            if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_planning()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
+            if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_implementation()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
+            if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_testing()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
+            if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_reviewing()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
             let preflight_dir = prepare_preflight_directory();
             ManagedRuntime::ready(AppRuntime::new(
                 status,
@@ -116,6 +138,10 @@ where
                     worktree_paths: WorktreePathHandle::new(worktree_paths),
                     provider_capabilities: ProviderCapabilityHandle::new(),
                     preflight_dir,
+                    planning_runs: PlanningRunRegistry::new(),
+                    implementation_runs: ImplementationRunRegistry::new(),
+                    testing_runs: TestingRunRegistry::new(),
+                    review_runs: ReviewRunRegistry::new(),
                 },
                 resources,
             ))
@@ -666,7 +692,13 @@ mod tests {
             *runtime.lock().expect("state"),
             RuntimeState::Ready(_)
         ));
-        assert_eq!(calls, ["storage", "database", "logging", "lease", "lease"]);
+        assert_eq!(
+            calls,
+            [
+                "storage", "database", "logging", "lease", "lease", "lease", "lease", "lease",
+                "lease"
+            ]
+        );
 
         let (runtime, calls) = compose(
             StorageBootstrapState::Ready,
@@ -681,7 +713,13 @@ mod tests {
             ready.bootstrap_status.logging_status,
             chatoms_application::bootstrap::LoggingStatus::Unavailable
         );
-        assert_eq!(calls, ["storage", "database", "logging", "lease", "lease"]);
+        assert_eq!(
+            calls,
+            [
+                "storage", "database", "logging", "lease", "lease", "lease", "lease", "lease",
+                "lease"
+            ]
+        );
     }
 
     #[test]

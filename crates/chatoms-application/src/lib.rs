@@ -4,9 +4,16 @@
 pub mod bootstrap;
 pub mod error;
 pub mod git_isolation;
+pub mod implementation_execution;
+pub mod planning_execution;
 pub mod projects;
 pub mod provider;
+pub mod provider_eligibility;
+pub mod review_diff;
+pub mod review_execution;
 pub mod system;
 pub mod tasks;
+pub mod testing_execution;
+pub mod validation_commands;
 
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");

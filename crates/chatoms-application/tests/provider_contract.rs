@@ -37,6 +37,7 @@ fn provider_and_process_vocabulary_needs_only_std_and_ports_crates() {
         executable: PathBuf::from("provider.exe"),
         arguments: vec![OsString::from("--version")],
         working_directory: PathBuf::from("."),
+        environment: None,
     };
     assert_eq!(spec.clone(), spec);
     assert_ne!(ProcessOutcome::Completed, ProcessOutcome::Uncertain);

@@ -3,7 +3,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use chatoms_application::{
-    git_isolation::{GitIsolationService, IsolationBlocker},
+    git_isolation::{GitIsolationService, IsolationBlocker, TaskBriefDraft},
     projects::{ProjectMutationService, RegisterProjectRequest},
 };
 use chatoms_ports::{
@@ -319,7 +319,7 @@ fn registered_root_identity_rebinding_blocks_task_creation() {
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect_err("rebound root must fail before task intent");
     assert_eq!(error.code().as_str(), "APP_CONFLICT");
     assert!(repository.tasks.is_empty());
@@ -344,7 +344,7 @@ fn dirty_repository_blocks_before_managed_path_or_git_mutation() {
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("create task");
     let blocked = GitIsolationService::new(
         &mut repository,
@@ -358,6 +358,106 @@ fn dirty_repository_blocks_before_managed_path_or_git_mutation() {
     assert_eq!(blocked.blocker, Some(IsolationBlocker::DirtyRepository));
     assert_eq!(paths.calls, 0);
     assert_eq!(git.create_calls, 0);
+}
+
+#[test]
+fn create_task_with_brief_persists_immutable_brief_alongside_task() {
+    let directory = PathBuf::from("C:/fixture-brief");
+    let mut repository = FakeRepository::default();
+    let mut git = git_fake(&directory, RepositoryKind::Git, true);
+    let mut time = FakeTime::at(100);
+    let project_id = register(&mut repository, &mut git, &mut time);
+    let mut paths = PathsFake {
+        target: directory.join("worktree"),
+        calls: 0,
+    };
+    let mut filesystem = FilesystemFake;
+    let task = GitIsolationService::new(
+        &mut repository,
+        &mut git,
+        &mut filesystem,
+        &mut paths,
+        &mut time,
+    )
+    .create_task(
+        project_id,
+        Some(TaskBriefDraft {
+            requirements: "Add CSV export".to_owned(),
+            completion_criteria: "Export button downloads a CSV".to_owned(),
+            prohibited_scope: "Do not touch the import pipeline".to_owned(),
+        }),
+    )
+    .expect("create task with brief");
+
+    let read_back = repository
+        .get_task_brief(task.task_id)
+        .expect("read brief")
+        .expect("brief present");
+    let stored = repository
+        .briefs
+        .get(&task.task_id)
+        .expect("brief persisted alongside task");
+    assert_eq!(stored.requirements, "Add CSV export");
+    assert_eq!(stored.completion_criteria, "Export button downloads a CSV");
+    assert_eq!(stored.prohibited_scope, "Do not touch the import pipeline");
+    assert_eq!(&read_back, stored);
+}
+
+#[test]
+fn create_task_without_brief_stores_no_brief_record() {
+    let directory = PathBuf::from("C:/fixture-no-brief");
+    let mut repository = FakeRepository::default();
+    let mut git = git_fake(&directory, RepositoryKind::Git, true);
+    let mut time = FakeTime::at(100);
+    let project_id = register(&mut repository, &mut git, &mut time);
+    let mut paths = PathsFake {
+        target: directory.join("worktree"),
+        calls: 0,
+    };
+    let mut filesystem = FilesystemFake;
+    let task = GitIsolationService::new(
+        &mut repository,
+        &mut git,
+        &mut filesystem,
+        &mut paths,
+        &mut time,
+    )
+    .create_task(project_id, None)
+    .expect("create task without brief");
+
+    assert!(!repository.briefs.contains_key(&task.task_id));
+}
+
+#[test]
+fn create_task_rejects_a_brief_with_an_empty_field_before_touching_the_repository() {
+    let directory = PathBuf::from("C:/fixture-blank-brief");
+    let mut repository = FakeRepository::default();
+    let mut git = git_fake(&directory, RepositoryKind::Git, true);
+    let mut time = FakeTime::at(100);
+    let project_id = register(&mut repository, &mut git, &mut time);
+    let mut paths = PathsFake {
+        target: directory.join("worktree"),
+        calls: 0,
+    };
+    let mut filesystem = FilesystemFake;
+    let error = GitIsolationService::new(
+        &mut repository,
+        &mut git,
+        &mut filesystem,
+        &mut paths,
+        &mut time,
+    )
+    .create_task(
+        project_id,
+        Some(TaskBriefDraft {
+            requirements: "   ".to_owned(),
+            completion_criteria: "criteria".to_owned(),
+            prohibited_scope: "scope".to_owned(),
+        }),
+    )
+    .expect_err("blank requirements must be rejected");
+    assert_eq!(error.code().as_str(), "APP_INVALID_INPUT");
+    assert!(!repository.calls.contains(&"create_isolation_task"));
 }
 
 #[test]
@@ -380,7 +480,7 @@ fn uncertain_partial_worktree_effect_is_recorded_as_recovery_required_without_cl
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("create task");
     let result = GitIsolationService::new(
         &mut repository,
@@ -421,7 +521,7 @@ fn approved_init_binds_intent_and_missing_author_enters_recovery_after_mutation(
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("awaiting approval");
     let result = GitIsolationService::new(
         &mut repository,
@@ -474,7 +574,7 @@ fn completed_git_effect_with_failed_completion_write_is_reconciled_to_recovery()
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("awaiting approval");
     repository.fail_on = Some((
         "save_git_initialization_completion",
@@ -517,7 +617,7 @@ fn snapshot_oid_mismatch_never_records_git_initialized() {
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("awaiting approval");
     let result = GitIsolationService::new(
         &mut repository,
@@ -565,7 +665,7 @@ fn post_mutation_filesystem_failures_immediately_preserve_recovery_evidence() {
             &mut paths,
             &mut time,
         )
-        .create_task(project_id)
+        .create_task(project_id, None)
         .expect("awaiting approval");
         let mut filesystem = PostMutationFilesystemFake {
             failure,
@@ -635,7 +735,7 @@ fn recovery_write_failure_preserves_post_mutation_intent_and_receipt() {
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("awaiting approval");
     repository.fail_on = Some((
         "save_isolation_transition",
@@ -696,7 +796,7 @@ fn startup_reconciliation_marks_incomplete_receipt_boundary_recovery_and_keeps_l
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("create task");
     repository.fail_on = Some((
         "append_git_operation_receipt",
@@ -750,7 +850,7 @@ fn startup_reconciliation_completes_only_exact_three_receipts_and_verified_state
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("create task");
     repository.fail_on = Some((
         "append_git_operation_receipt",
@@ -834,7 +934,7 @@ fn startup_reconciliation_covers_every_worktree_receipt_crash_boundary() {
             &mut paths,
             &mut time,
         )
-        .create_task(project_id)
+        .create_task(project_id, None)
         .expect("create task");
         repository.fail_on = Some((
             "append_git_operation_receipt",
@@ -923,7 +1023,7 @@ fn startup_reconciliation_covers_every_git_init_receipt_crash_boundary() {
             &mut paths,
             &mut time,
         )
-        .create_task(project_id)
+        .create_task(project_id, None)
         .expect("awaiting approval");
         repository.fail_on = Some((
             "append_git_operation_receipt",
@@ -1001,7 +1101,7 @@ fn startup_reconciliation_fails_closed_on_lease_task_operation_mismatch() {
         &mut paths,
         &mut time,
     )
-    .create_task(project_id)
+    .create_task(project_id, None)
     .expect("create task");
     let mut task = repository
         .tasks

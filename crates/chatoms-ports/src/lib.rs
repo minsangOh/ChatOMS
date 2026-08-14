@@ -1,14 +1,20 @@
 #![doc = "Port boundary for persistence, platform, provider, Git, process, and update interfaces."]
 #![forbid(unsafe_code)]
 
+pub mod diff;
 pub mod error;
 pub mod filesystem;
 pub mod git;
+pub mod implementation;
 pub mod path;
 pub mod permissions;
+pub mod planning;
 pub mod process;
 pub mod provider;
 pub mod repository;
+pub mod review;
+pub mod validation;
+pub mod validation_execution;
 
 use error::PortFailure;
 

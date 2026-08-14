@@ -47,7 +47,7 @@ Eligible provider란 다음 두 조건을 모두 만족하는 provider다.
 현재 승인된 실행 계약은 다음과 같다.
 
 * Claude: 읽기 전용 설계·리뷰 계약만 승인됨. 구현(write) 실행 계약은 장기 목표이나 미정의·미구현이다.
-* Codex: 구현 실행 계약이 정의되어 있으나, executable trust 근거가 확인되기 전까지 capability가 `Unavailable`이므로 현재 선택할 수 없다.
+* Codex: executable trust 근거와 작업 종류별 실행 계약이 모두 미승인이다. capability는 `Unsupported`이며 현재 eligible provider가 아니다.
 
 Gajae-Code는 인증 프록시나 모델 API 변환기로 사용하지 않는다.
 
@@ -238,7 +238,7 @@ Gajae-Code 하네스 전체 단계를 사용하지 않고 Claude 또는 Codex를
 | Provider | 설계 | 구현 | 리뷰 | 비고 |
 |---|---|---|---|---|
 | Claude | 읽기 전용 계약 승인됨 | 미정의 | 읽기 전용 계약 승인됨 | 구현(write) 계약은 장기 목표이나 미정의·미구현 |
-| Codex | 미정의 | 구현 계약 정의됨 | 미정의 | capability가 `Unavailable`이므로 현재 선택 불가 |
+| Codex | 미정의 | 미정의 | 미정의 | trust 근거와 실행 계약이 미승인이고 capability가 `Unsupported`이므로 현재 선택 불가 |
 
 실행 중 provider 자동 전환, 세션 handoff와 Context Package 구조 변경은 현재 범위에 포함하지 않는다.
 

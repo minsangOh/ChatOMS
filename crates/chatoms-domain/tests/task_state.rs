@@ -24,6 +24,29 @@ fn state_list_has_exactly_25_unique_pascal_case_values() {
 
     let invalid = TaskState::deserialize(value::StrDeserializer::<value::Error>::new("NotAState"));
     assert!(invalid.is_err());
+
+    for (state, serialized) in [
+        (TaskState::Planning, "Planning"),
+        (TaskState::Implementing, "Implementing"),
+        (TaskState::Reviewing, "Reviewing"),
+    ] {
+        assert_eq!(
+            state
+                .serialize(StringSerializer)
+                .expect("serialize renamed state"),
+            serialized
+        );
+    }
+    for legacy in [
+        "PlanningWithClaude",
+        "ImplementingWithCodex",
+        "ReviewingWithClaude",
+    ] {
+        assert!(
+            TaskState::deserialize(value::StrDeserializer::<value::Error>::new(legacy)).is_err(),
+            "legacy provider-bound state must not deserialize: {legacy}"
+        );
+    }
 }
 
 #[test]
@@ -76,28 +99,29 @@ fn complete_static_transition_matrix_matches_independent_expectation() {
         (WorktreeCreating, RecoveryRequired),
         (WorktreeCreating, Failed),
         (WorktreeCreating, Cancelled),
-        (WorktreeReady, PlanningWithClaude),
+        (WorktreeReady, Planning),
         (WorktreeReady, Cancelled),
-        (PlanningWithClaude, AwaitingDesignApproval),
-        (PlanningWithClaude, ImplementingWithCodex),
-        (PlanningWithClaude, Failed),
-        (PlanningWithClaude, RecoveryRequired),
-        (AwaitingDesignApproval, ImplementingWithCodex),
+        (Planning, AwaitingDesignApproval),
+        (Planning, Implementing),
+        (Planning, Failed),
+        (Planning, RecoveryRequired),
+        (Planning, Cancelled),
+        (AwaitingDesignApproval, Implementing),
         (AwaitingDesignApproval, Cancelled),
-        (ImplementingWithCodex, Testing),
-        (ImplementingWithCodex, Failed),
-        (ImplementingWithCodex, RecoveryRequired),
+        (Implementing, Testing),
+        (Implementing, Failed),
+        (Implementing, RecoveryRequired),
         (Testing, AutoFixing),
-        (Testing, ReviewingWithClaude),
+        (Testing, Reviewing),
         (Testing, Failed),
         (Testing, RecoveryRequired),
         (AutoFixing, Testing),
         (AutoFixing, Failed),
         (AutoFixing, RecoveryRequired),
-        (ReviewingWithClaude, ReviewFixing),
-        (ReviewingWithClaude, AwaitingUserDiffApproval),
-        (ReviewingWithClaude, Failed),
-        (ReviewingWithClaude, RecoveryRequired),
+        (Reviewing, ReviewFixing),
+        (Reviewing, AwaitingUserDiffApproval),
+        (Reviewing, Failed),
+        (Reviewing, RecoveryRequired),
         (ReviewFixing, Testing),
         (ReviewFixing, Failed),
         (ReviewFixing, RecoveryRequired),
@@ -163,12 +187,12 @@ fn contextual_and_static_transition_categories_do_not_overlap() {
     let pause_sources = [
         AwaitingGitInitApproval,
         WorktreeReady,
-        PlanningWithClaude,
+        Planning,
         AwaitingDesignApproval,
-        ImplementingWithCodex,
+        Implementing,
         Testing,
         AutoFixing,
-        ReviewingWithClaude,
+        Reviewing,
         ReviewFixing,
         AwaitingUserDiffApproval,
         MergeConflict,
@@ -180,12 +204,12 @@ fn contextual_and_static_transition_categories_do_not_overlap() {
         GitInitialized,
         WorktreeCreating,
         WorktreeReady,
-        PlanningWithClaude,
+        Planning,
         AwaitingDesignApproval,
-        ImplementingWithCodex,
+        Implementing,
         Testing,
         AutoFixing,
-        ReviewingWithClaude,
+        Reviewing,
         ReviewFixing,
         AwaitingUserDiffApproval,
         Merging,

@@ -20,6 +20,8 @@ pub enum DomainError {
     InvalidActorKind,
     #[error("invalid reason code")]
     InvalidReasonCode,
+    #[error("invalid task brief")]
+    InvalidTaskBrief,
     #[error("domain invariant violation")]
     InvariantViolation,
 }

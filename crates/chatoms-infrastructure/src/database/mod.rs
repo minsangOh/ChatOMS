@@ -66,4 +66,8 @@ pub enum DatabaseError {
     ForeignKeyViolation { version: u32, violations: usize },
     #[error("database invariant violation: {reason}")]
     InvariantViolation { reason: &'static str },
+    #[error("migration 11 (validation_command_executable_binding) aborted: {reason}")]
+    ValidationCommandApprovalMigrationFailed { reason: &'static str },
+    #[error("migration 12 (validation_command_environment_binding) aborted: {reason}")]
+    ValidationCommandEnvironmentBindingMigrationFailed { reason: &'static str },
 }

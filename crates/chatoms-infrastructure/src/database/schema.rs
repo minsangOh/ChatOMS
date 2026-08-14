@@ -2,6 +2,29 @@ pub(crate) const FOUNDATION_SQL: &str = include_str!("../../migrations/0001_foun
 pub(crate) const GIT_ISOLATION_SQL: &str = include_str!("../../migrations/0002_git_isolation.sql");
 pub(crate) const PROVIDER_BINDING_SQL: &str =
     include_str!("../../migrations/0003_provider_binding.sql");
+pub(crate) const PROVIDER_NEUTRAL_TASK_STATES_SQL: &str =
+    include_str!("../../migrations/0004_provider_neutral_task_states.sql");
+pub(crate) const TASK_BRIEFS_SQL: &str = include_str!("../../migrations/0005_task_briefs.sql");
+pub(crate) const PROVIDER_CONSENTS_SQL: &str =
+    include_str!("../../migrations/0006_provider_consents.sql");
+pub(crate) const TASK_PLANNING_RESULTS_SQL: &str =
+    include_str!("../../migrations/0007_task_planning_results.sql");
+pub(crate) const IMPLEMENTATION_CONSENTS_SQL: &str =
+    include_str!("../../migrations/0008_implementation_consents.sql");
+pub(crate) const TASK_IMPLEMENTATION_RESULTS_SQL: &str =
+    include_str!("../../migrations/0009_task_implementation_results.sql");
+pub(crate) const TASK_VALIDATION_COMMAND_APPROVALS_SQL: &str =
+    include_str!("../../migrations/0010_task_validation_command_approvals.sql");
+pub(crate) const VALIDATION_COMMAND_EXECUTABLE_BINDING_SQL: &str =
+    include_str!("../../migrations/0011_validation_command_executable_binding.sql");
+pub(crate) const VALIDATION_COMMAND_ENVIRONMENT_BINDING_SQL: &str =
+    include_str!("../../migrations/0012_validation_command_environment_binding.sql");
+pub(crate) const TASK_VALIDATION_COMMAND_RESULTS_SQL: &str =
+    include_str!("../../migrations/0013_task_validation_command_results.sql");
+pub(crate) const REVIEW_CONSENTS_SQL: &str =
+    include_str!("../../migrations/0014_review_consents.sql");
+pub(crate) const TASK_REVIEW_RESULTS_SQL: &str =
+    include_str!("../../migrations/0015_task_review_results.sql");
 
 pub(crate) const METADATA_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (

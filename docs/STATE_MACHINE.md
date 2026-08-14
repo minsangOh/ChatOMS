@@ -23,7 +23,7 @@
 | `GitInitialized` | 승인된 Git 초기화와 초기 snapshot 완료 | `WorktreeCreating`, `Failed` | 완료된 승인 필요 | 가능 |
 | `WorktreeCreating` | 기준 commit을 고정하고 예약된 task branch를 실제 생성한 뒤 worktree 생성 중 | `WorktreeReady`, `RecoveryRequired`, `Failed`, `Cancelled` | 없음 | 조건부 |
 | `WorktreeReady` | 작업 전용 branch와 worktree 검증 완료 | `Planning`, `Paused`, `Cancelled` | 공급자 전송 동의 필요 | 가능 |
-| `Planning` | 사용자가 선택한 eligible provider가 요구사항·설계 분석 중 | `AwaitingDesignApproval`, `Implementing`, `Paused`, `Failed`, `RecoveryRequired` | 고위험 설계일 때만 필요 | 가능 |
+| `Planning` | 사용자가 선택한 eligible provider가 요구사항·설계 분석 중 | `AwaitingDesignApproval`, `Implementing`, `Paused`, `Failed`, `RecoveryRequired`, `Cancelled` | 고위험 설계일 때만 필요 | 가능 |
 | `AwaitingDesignApproval` | 고위험 설계와 영향 설명이 준비됨 | `Implementing`, `Paused`, `Cancelled` | 구현 전 필요 | 가능 |
 | `Implementing` | 사용자가 선택한 eligible provider가 승인 범위 안에서 worktree를 수정 중 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 범위 밖 동작은 별도 승인 | 가능 |
 | `Testing` | 선택된 format/lint/type/test/build 검증 실행 중 | `AutoFixing`, `Reviewing`, `Paused`, `Failed`, `RecoveryRequired` | 승인 대상 명령이면 필요 | 가능 |
@@ -43,7 +43,9 @@
 | `CleanupPending` | 종료 결과가 확정된 뒤 보존 기간·안전 조건을 기다리거나 정리 재시도를 대기함 | `Archived` | 보존 표시가 있으면 자동 정리 금지 | 정리만 재시도 |
 | `Archived` | 적용 가능한 보존·정리 조건을 완료하여 실행·복구 대상이 아님 | 없음 | 없음 | 불가 |
 
-상태 이름은 작업 종류를 나타내며 provider를 내장하지 않는다. `Planning`, `Implementing`, `Reviewing` 등 실행 상태에는 사용자가 선택한 provider가 기록된다. 이 문서의 상태 이름 변경은 provider-neutral 목표 모델이며, Rust enum·SQLite 저장 값·TypeScript type의 실제 rename은 별도 구현 Unit으로 수행한다.
+상태 이름은 작업 종류를 나타내며 provider를 내장하지 않는다. `Planning`, `Implementing`, `Reviewing` 등 실행 상태에는 사용자가 선택한 provider가 기록된다. Phase 4 Unit 1에서 Rust enum·SQLite 저장 값·TypeScript type을 이 provider-neutral 상태 이름으로 일치시켰다.
+
+`Planning`은 다른 active-execution 상태(`Implementing`, `Testing`, `AutoFixing`, `Reviewing`, `ReviewFixing`)와 달리 `Cancelled`로 가기 위해 `Paused`를 거치지 않는다. Claude Planning은 읽기 전용 계약(`--tools Read,Glob,Grep`)이라 외부 부작용이 구조적으로 없고, 취소 요청은 streaming process runner가 실제 프로세스 종료를 확인한 뒤에만 `Cancelled`로 기록되므로(확인되지 않은 취소는 `RecoveryRequired`) `Paused`를 거치는 중간 승인 단계가 필요하지 않다. Phase 4 Unit 4b-4에서 승인되었다.
 
 `Completed`, `Failed`, `Cancelled`에서 정리 대상이 하나라도 있으면 반드시 `CleanupPending`을 거친다. 정리 대상이 전혀 없을 때만 `Archived`로 직접 이동할 수 있다. Task 기록과 artifact에는 [90일 보존 정책](PRODUCT_REQUIREMENTS.md#185-보관-기간)을, 병합된 branch와 worktree에는 [최소 7일 및 안전 조건](PRODUCT_REQUIREMENTS.md#20-병합-후-worktree-정리)을 적용하며 조건 충족 전에는 `Archived`로 이동하지 않는다.
 

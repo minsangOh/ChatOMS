@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::PortFailure;
+use crate::error::{FailureCategory, PortFailure};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectoryIdentity {
@@ -33,4 +33,15 @@ pub trait FilesystemIdentityPort {
         path: &Path,
         expected: &DirectoryIdentity,
     ) -> Result<Box<dyn DirectoryIdentityGuard>, PortFailure>;
+
+    /// Inspects a single regular file (not a directory) and returns its
+    /// stable NTFS object identity, for callers that need to bind trust to
+    /// one specific file — e.g. a validation tool executable — rather than
+    /// a directory tree. Implementations must reject anything that is not a
+    /// regular file, including reparse points/symlinks. Defaults to
+    /// fail-closed [`FailureCategory::Unsupported`] on platforms without an
+    /// implementation.
+    fn inspect_supported_file(&mut self, _path: &Path) -> Result<DirectoryIdentity, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
 }
