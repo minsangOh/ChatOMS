@@ -3,16 +3,19 @@ use std::str::FromStr;
 use chatoms_domain::{
     ActorKind, GitOperationId, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId,
     TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
-    TaskStateTransitionSnapshot, WorkKind,
+    TaskStateTransitionSnapshot, ValidationCommandKind, WorkKind,
 };
 use chatoms_ports::git::RepositoryKind;
 use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
     ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitIsolationStatus,
     GitOperationAttempt, GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt,
-    GitOperationReceiptKind, PlanningResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord,
-    ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError, RepositoryErrorCode,
-    TaskBriefRecord, TaskGitIsolation, TaskPlanningResultRecord,
+    GitOperationReceiptKind, ImplementationResultOutcome, PlanningResultOutcome,
+    ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
+    ProviderConsent, RepositoryError, RepositoryErrorCode, ReviewResultOutcome, TaskBriefRecord,
+    TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
+    TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+    ValidationCommandResultOutcome, ValidationCommandResultRecord,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -404,6 +407,20 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         load_planning_result(self.database.raw_mut(), task_id)
     }
 
+    fn get_task_implementation_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskImplementationResultRecord>, RepositoryError> {
+        load_implementation_result(self.database.raw_mut(), task_id)
+    }
+
+    fn get_task_review_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskReviewResultRecord>, RepositoryError> {
+        load_review_result(self.database.raw_mut(), task_id)
+    }
+
     fn get_provider_consent(
         &mut self,
         task_id: TaskId,
@@ -467,6 +484,103 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         transaction.commit().map_err(operation_failed)
     }
 
+    fn save_implementation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        consent: Option<&ProviderConsent>,
+    ) -> Result<(), RepositoryError> {
+        if task.state() != TaskState::Implementing {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        if let Some(consent) = consent
+            && (consent.task_id != task.id()
+                || consent.work_kind != WorkKind::Implementation
+                || consent.approved_task_version != expected_version)
+        {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::AwaitingDesignApproval {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        // Consent is inserted before the task row is bumped to the next
+        // version: the binding trigger requires tasks.version to still equal
+        // approved_task_version (the pre-transition AwaitingDesignApproval
+        // version).
+        if let Some(consent) = consent {
+            insert_provider_consent(&transaction, consent)?;
+        }
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_review_consent(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        consented_at_ms: i64,
+    ) -> Result<ProviderConsent, RepositoryError> {
+        if consented_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::Reviewing {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let existing = load_provider_consent(
+            &transaction,
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            expected_version,
+        )?;
+        let consent = match existing {
+            Some(consent) => consent,
+            None => {
+                let consent = ProviderConsent {
+                    task_id,
+                    provider: ProviderKind::Claude,
+                    work_kind: WorkKind::Review,
+                    approved_task_version: expected_version,
+                    consented_at_ms,
+                };
+                insert_provider_consent(&transaction, &consent)?;
+                consent
+            }
+        };
+        transaction.commit().map_err(operation_failed)?;
+        Ok(consent)
+    }
+
     fn save_planning_result(
         &mut self,
         expected_version: u64,
@@ -514,6 +628,233 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
                 return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
             }
         }
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_implementation_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskImplementationResultRecord,
+    ) -> Result<(), RepositoryError> {
+        if task.state().is_terminal() || result.task_id != task.id() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_implementation_result_shape(result)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::Implementing {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        insert_implementation_result(&transaction, result)?;
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_review_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskReviewResultRecord,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        if task.state().is_terminal() != terminal || result.task_id != task.id() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_review_result_shape(result)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::Reviewing {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        insert_review_result(&transaction, result)?;
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        if terminal {
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM active_task_leases WHERE task_id = ?1",
+                    [task.id().to_string()],
+                )
+                .map_err(operation_failed)?;
+            if deleted != 1 {
+                return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+            }
+        }
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_validation_command_approval(
+        &mut self,
+        approval: &ValidationCommandApprovalRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_validation_command_approval_shape(approval)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, approval.task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != approval.approved_task_version
+            || !matches!(
+                current.state(),
+                TaskState::Implementing | TaskState::Testing
+            )
+        {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        insert_validation_command_approval(&transaction, approval)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn list_validation_command_approvals(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        load_validation_command_approvals(self.database.raw_mut(), task_id, approved_task_version)
+    }
+
+    fn append_validation_command_result(
+        &mut self,
+        attempt: &ValidationCommandResultAttempt,
+    ) -> Result<ValidationCommandResultRecord, RepositoryError> {
+        validate_validation_command_result_attempt_shape(attempt)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let approval_exists = validation_command_approval_exists(
+            &transaction,
+            attempt.task_id,
+            attempt.approved_task_version,
+            attempt.kind,
+        )?;
+        if !approval_exists {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let attempt_sequence = next_validation_command_result_sequence(
+            &transaction,
+            attempt.task_id,
+            attempt.approved_task_version,
+            attempt.kind,
+        )?;
+        insert_validation_command_result(&transaction, attempt, attempt_sequence)?;
+        transaction.commit().map_err(operation_failed)?;
+        Ok(ValidationCommandResultRecord {
+            task_id: attempt.task_id,
+            approved_task_version: attempt.approved_task_version,
+            kind: attempt.kind,
+            attempt_sequence,
+            outcome: attempt.outcome,
+            exit_code: attempt.exit_code,
+            safe_summary: attempt.safe_summary.clone(),
+            started_at_ms: attempt.started_at_ms,
+            completed_at_ms: attempt.completed_at_ms,
+        })
+    }
+
+    fn list_validation_command_results(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        kind: ValidationCommandKind,
+    ) -> Result<Vec<ValidationCommandResultRecord>, RepositoryError> {
+        load_validation_command_results(
+            self.database.raw_mut(),
+            task_id,
+            approved_task_version,
+            kind,
+        )
+    }
+
+    fn finalize_validation_command_batch(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        attempt: &ValidationCommandResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        if task.state().is_terminal() || attempt.task_id != task.id() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_validation_command_result_attempt_shape(attempt)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::Testing {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        let approval_exists = validation_command_approval_exists(
+            &transaction,
+            attempt.task_id,
+            attempt.approved_task_version,
+            attempt.kind,
+        )?;
+        if !approval_exists {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let attempt_sequence = next_validation_command_result_sequence(
+            &transaction,
+            attempt.task_id,
+            attempt.approved_task_version,
+            attempt.kind,
+        )?;
+        insert_validation_command_result(&transaction, attempt, attempt_sequence)?;
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
         transaction.commit().map_err(operation_failed)
     }
 
@@ -1545,6 +1886,719 @@ fn load_planning_result(
             },
         )
         .transpose()
+}
+
+/// Matches the `task_review_results.review_text` SQL `CHECK` bound in
+/// `0015_task_review_results.sql`. Enforced again here so a malformed
+/// record is rejected before it ever reaches the database driver.
+const MAX_REVIEW_TEXT_LEN: usize = 100_000;
+
+const fn review_outcome_text(outcome: ReviewResultOutcome) -> &'static str {
+    match outcome {
+        ReviewResultOutcome::Completed => "Completed",
+        ReviewResultOutcome::Failed => "Failed",
+        ReviewResultOutcome::Cancelled => "Cancelled",
+        ReviewResultOutcome::RecoveryRequired => "RecoveryRequired",
+    }
+}
+
+fn review_outcome_from_text(value: &str) -> Result<ReviewResultOutcome, RepositoryError> {
+    match value {
+        "Completed" => Ok(ReviewResultOutcome::Completed),
+        "Failed" => Ok(ReviewResultOutcome::Failed),
+        "Cancelled" => Ok(ReviewResultOutcome::Cancelled),
+        "RecoveryRequired" => Ok(ReviewResultOutcome::RecoveryRequired),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+fn validate_review_result_shape(result: &TaskReviewResultRecord) -> Result<(), RepositoryError> {
+    if result.started_at_ms < 0 || result.completed_at_ms < result.started_at_ms {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    match (result.outcome, &result.review_text) {
+        (ReviewResultOutcome::Completed, Some(text)) => {
+            if text.is_empty() || text.len() > MAX_REVIEW_TEXT_LEN {
+                return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+            }
+        }
+        (ReviewResultOutcome::Completed, None) => {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        (_, None) => {}
+        (_, Some(_)) => return Err(repository_error(RepositoryErrorCode::InvalidAggregate)),
+    }
+    Ok(())
+}
+
+fn insert_review_result(
+    connection: &Connection,
+    result: &TaskReviewResultRecord,
+) -> Result<(), RepositoryError> {
+    let turn_count = result.turn_count.map(i64::from);
+    connection
+        .execute(
+            "INSERT INTO task_review_results (
+                task_id, provider, work_kind, outcome, exit_code, turn_count,
+                started_at_ms, completed_at_ms, review_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                result.task_id.to_string(),
+                provider_kind_text(result.provider),
+                work_kind_text(result.work_kind),
+                review_outcome_text(result.outcome),
+                result.exit_code,
+                turn_count,
+                result.started_at_ms,
+                result.completed_at_ms,
+                result.review_text,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+fn load_review_result(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskReviewResultRecord>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms, review_text
+             FROM task_review_results WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i32>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?
+        .map(
+            |(
+                provider,
+                work_kind,
+                outcome,
+                exit_code,
+                turn_count,
+                started_at_ms,
+                completed_at_ms,
+                review_text,
+            )| {
+                Ok(TaskReviewResultRecord {
+                    task_id,
+                    provider: provider_kind_from_text(&provider)?,
+                    work_kind: work_kind_from_text(&work_kind)?,
+                    outcome: review_outcome_from_text(&outcome)?,
+                    exit_code,
+                    turn_count: turn_count.map(u32::try_from).transpose().map_err(|_| {
+                        repository_error(RepositoryErrorCode::InvalidPersistenceState)
+                    })?,
+                    started_at_ms,
+                    completed_at_ms,
+                    review_text,
+                })
+            },
+        )
+        .transpose()
+}
+
+const fn implementation_outcome_text(outcome: ImplementationResultOutcome) -> &'static str {
+    match outcome {
+        ImplementationResultOutcome::Completed => "Completed",
+        ImplementationResultOutcome::Cancelled => "Cancelled",
+        ImplementationResultOutcome::RecoveryRequired => "RecoveryRequired",
+    }
+}
+
+fn implementation_outcome_from_text(
+    value: &str,
+) -> Result<ImplementationResultOutcome, RepositoryError> {
+    match value {
+        "Completed" => Ok(ImplementationResultOutcome::Completed),
+        "Cancelled" => Ok(ImplementationResultOutcome::Cancelled),
+        "RecoveryRequired" => Ok(ImplementationResultOutcome::RecoveryRequired),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+fn validate_implementation_result_shape(
+    result: &TaskImplementationResultRecord,
+) -> Result<(), RepositoryError> {
+    if result.started_at_ms < 0 || result.completed_at_ms < result.started_at_ms {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn insert_implementation_result(
+    connection: &Connection,
+    result: &TaskImplementationResultRecord,
+) -> Result<(), RepositoryError> {
+    let turn_count = result.turn_count.map(i64::from);
+    connection
+        .execute(
+            "INSERT INTO task_implementation_results (
+                task_id, provider, work_kind, outcome, exit_code, turn_count,
+                started_at_ms, completed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                result.task_id.to_string(),
+                provider_kind_text(result.provider),
+                work_kind_text(result.work_kind),
+                implementation_outcome_text(result.outcome),
+                result.exit_code,
+                turn_count,
+                result.started_at_ms,
+                result.completed_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+fn load_implementation_result(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskImplementationResultRecord>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms
+             FROM task_implementation_results WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i32>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?
+        .map(
+            |(
+                provider,
+                work_kind,
+                outcome,
+                exit_code,
+                turn_count,
+                started_at_ms,
+                completed_at_ms,
+            )| {
+                Ok(TaskImplementationResultRecord {
+                    task_id,
+                    provider: provider_kind_from_text(&provider)?,
+                    work_kind: work_kind_from_text(&work_kind)?,
+                    outcome: implementation_outcome_from_text(&outcome)?,
+                    exit_code,
+                    turn_count: turn_count.map(u32::try_from).transpose().map_err(|_| {
+                        repository_error(RepositoryErrorCode::InvalidPersistenceState)
+                    })?,
+                    started_at_ms,
+                    completed_at_ms,
+                })
+            },
+        )
+        .transpose()
+}
+
+const fn validation_command_kind_text(kind: ValidationCommandKind) -> &'static str {
+    match kind {
+        ValidationCommandKind::Format => "Format",
+        ValidationCommandKind::Lint => "Lint",
+        ValidationCommandKind::Typecheck => "Typecheck",
+        ValidationCommandKind::Test => "Test",
+        ValidationCommandKind::Build => "Build",
+    }
+}
+
+fn validation_command_kind_from_text(
+    value: &str,
+) -> Result<ValidationCommandKind, RepositoryError> {
+    match value {
+        "Format" => Ok(ValidationCommandKind::Format),
+        "Lint" => Ok(ValidationCommandKind::Lint),
+        "Typecheck" => Ok(ValidationCommandKind::Typecheck),
+        "Test" => Ok(ValidationCommandKind::Test),
+        "Build" => Ok(ValidationCommandKind::Build),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+/// Matches the `task_validation_command_approvals.executable` SQL `CHECK`
+/// bound in `0010_task_validation_command_approvals.sql`. Enforced again
+/// here so a malformed record is rejected before it ever reaches the
+/// database driver.
+const MAX_VALIDATION_EXECUTABLE_LEN: usize = 256;
+
+/// Matches the `approved_executable_path`/`tool_directory_path` SQL `CHECK`
+/// bounds in `0011_validation_command_executable_binding.sql`.
+const MAX_VALIDATION_PATH_LEN: usize = 4096;
+
+/// A defense-in-depth check independent of the caller's candidate-membership
+/// validation (`chatoms_application::validation_commands`, not yet wired at
+/// this layer): rejects any value that is an absolute path or contains a
+/// `..` path-traversal component, so an approval can never resolve outside
+/// the task worktree it is scoped to.
+fn is_worktree_confined(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    !path.is_absolute()
+        && !path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+}
+
+/// Defense-in-depth counterpart to [`is_worktree_confined`] for the fields
+/// that must be an already-canonicalized absolute path (the approved
+/// executable/tool-directory paths): requires an absolute path and rejects
+/// any `..` component, so a caller bug can never persist a path-traversal
+/// value even though the primary canonicalization happens one layer up, in
+/// the `FilesystemIdentityPort` adapter the application layer calls before
+/// building this record.
+fn is_canonical_absolute_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+}
+
+/// Matches the hex-identity `CHECK` bounds in
+/// `0011_validation_command_executable_binding.sql`, which mirror the
+/// `root_volume_serial_hex`/`root_file_id_hex` convention from
+/// `0002_git_isolation.sql`.
+fn is_hex_of_length(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_validation_command_approval_shape(
+    approval: &ValidationCommandApprovalRecord,
+) -> Result<(), RepositoryError> {
+    if approval.approved_at_ms < 0 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    if approval.executable.is_empty() || approval.executable.len() > MAX_VALIDATION_EXECUTABLE_LEN {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    if !is_worktree_confined(&approval.executable)
+        || approval
+            .arguments
+            .iter()
+            .any(|argument| !is_worktree_confined(argument))
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    if approval.approved_executable_path.is_empty()
+        || approval.approved_executable_path.len() > MAX_VALIDATION_PATH_LEN
+        || !is_canonical_absolute_path(&approval.approved_executable_path)
+        || approval.tool_directory_path.is_empty()
+        || approval.tool_directory_path.len() > MAX_VALIDATION_PATH_LEN
+        || !is_canonical_absolute_path(&approval.tool_directory_path)
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    if !is_hex_of_length(&approval.executable_volume_serial_hex, 16)
+        || !is_hex_of_length(&approval.executable_file_id_hex, 32)
+        || !is_hex_of_length(&approval.tool_directory_volume_serial_hex, 16)
+        || !is_hex_of_length(&approval.tool_directory_file_id_hex, 32)
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    validate_optional_environment_binding(
+        &approval.approved_cargo_home_path,
+        &approval.cargo_home_volume_serial_hex,
+        &approval.cargo_home_file_id_hex,
+    )?;
+    validate_optional_environment_binding(
+        &approval.approved_rustup_home_path,
+        &approval.rustup_home_volume_serial_hex,
+        &approval.rustup_home_file_id_hex,
+    )?;
+    Ok(())
+}
+
+/// Defense-in-depth shape check for an optional `CARGO_HOME`/`RUSTUP_HOME`
+/// binding: the three fields must be all `None` (no approved override) or
+/// all `Some` with a valid canonical absolute path and valid stable-identity
+/// hex, mirroring the SQL `CHECK` in
+/// `0012_validation_command_environment_binding.sql`.
+fn validate_optional_environment_binding(
+    path: &Option<String>,
+    volume_serial_hex: &Option<String>,
+    file_id_hex: &Option<String>,
+) -> Result<(), RepositoryError> {
+    match (path, volume_serial_hex, file_id_hex) {
+        (None, None, None) => Ok(()),
+        (Some(path), Some(volume_serial_hex), Some(file_id_hex)) => {
+            if path.is_empty()
+                || path.len() > MAX_VALIDATION_PATH_LEN
+                || !is_canonical_absolute_path(path)
+                || !is_hex_of_length(volume_serial_hex, 16)
+                || !is_hex_of_length(file_id_hex, 32)
+            {
+                return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+            }
+            Ok(())
+        }
+        _ => Err(repository_error(RepositoryErrorCode::InvalidAggregate)),
+    }
+}
+
+fn insert_validation_command_approval(
+    connection: &Connection,
+    approval: &ValidationCommandApprovalRecord,
+) -> Result<(), RepositoryError> {
+    let arguments_json = serde_json::to_string(&approval.arguments)
+        .map_err(|_| repository_error(RepositoryErrorCode::InvalidAggregate))?;
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, command_kind, executable,
+                arguments_json, worktree_scope, approved_executable_path,
+                executable_volume_serial_hex, executable_file_id_hex,
+                tool_directory_path, tool_directory_volume_serial_hex,
+                tool_directory_file_id_hex,
+                approved_cargo_home_path, cargo_home_volume_serial_hex, cargo_home_file_id_hex,
+                approved_rustup_home_path, rustup_home_volume_serial_hex, rustup_home_file_id_hex,
+                approved_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, 'TaskWorktree', ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18
+             )",
+            params![
+                approval.task_id.to_string(),
+                to_sql_integer(approval.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                validation_command_kind_text(approval.kind),
+                approval.executable,
+                arguments_json,
+                approval.approved_executable_path,
+                approval.executable_volume_serial_hex,
+                approval.executable_file_id_hex,
+                approval.tool_directory_path,
+                approval.tool_directory_volume_serial_hex,
+                approval.tool_directory_file_id_hex,
+                approval.approved_cargo_home_path,
+                approval.cargo_home_volume_serial_hex,
+                approval.cargo_home_file_id_hex,
+                approval.approved_rustup_home_path,
+                approval.rustup_home_volume_serial_hex,
+                approval.rustup_home_file_id_hex,
+                approval.approved_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+fn load_validation_command_approvals(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT command_kind, executable, arguments_json, approved_executable_path,
+                    executable_volume_serial_hex, executable_file_id_hex,
+                    tool_directory_path, tool_directory_volume_serial_hex,
+                    tool_directory_file_id_hex,
+                    approved_cargo_home_path, cargo_home_volume_serial_hex,
+                    cargo_home_file_id_hex, approved_rustup_home_path,
+                    rustup_home_volume_serial_hex, rustup_home_file_id_hex,
+                    approved_at_ms
+             FROM task_validation_command_approvals
+             WHERE task_id = ?1 AND approved_task_version = ?2
+             ORDER BY command_kind",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map(params![task_id.to_string(), version], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, i64>(15)?,
+            ))
+        })
+        .map_err(operation_failed)?;
+    let mut approvals = Vec::new();
+    for row in rows {
+        let (
+            kind,
+            executable,
+            arguments_json,
+            approved_executable_path,
+            executable_volume_serial_hex,
+            executable_file_id_hex,
+            tool_directory_path,
+            tool_directory_volume_serial_hex,
+            tool_directory_file_id_hex,
+            approved_cargo_home_path,
+            cargo_home_volume_serial_hex,
+            cargo_home_file_id_hex,
+            approved_rustup_home_path,
+            rustup_home_volume_serial_hex,
+            rustup_home_file_id_hex,
+            approved_at_ms,
+        ) = row.map_err(operation_failed)?;
+        let arguments: Vec<String> = serde_json::from_str(&arguments_json)
+            .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        approvals.push(ValidationCommandApprovalRecord {
+            task_id,
+            approved_task_version,
+            kind: validation_command_kind_from_text(&kind)?,
+            executable,
+            arguments,
+            approved_executable_path,
+            executable_volume_serial_hex,
+            executable_file_id_hex,
+            tool_directory_path,
+            tool_directory_volume_serial_hex,
+            tool_directory_file_id_hex,
+            approved_cargo_home_path,
+            cargo_home_volume_serial_hex,
+            cargo_home_file_id_hex,
+            approved_rustup_home_path,
+            rustup_home_volume_serial_hex,
+            rustup_home_file_id_hex,
+            approved_at_ms,
+        });
+    }
+    Ok(approvals)
+}
+
+/// Matches the `safe_summary` SQL `CHECK` bound in
+/// `0013_task_validation_command_results.sql`. Deliberately small: this is a
+/// masked, already-bounded summary a future orchestration Unit produces,
+/// never raw stdout/stderr.
+const MAX_SAFE_SUMMARY_LEN: usize = 2000;
+
+fn validate_validation_command_result_attempt_shape(
+    attempt: &ValidationCommandResultAttempt,
+) -> Result<(), RepositoryError> {
+    if attempt.started_at_ms < 0 || attempt.completed_at_ms < attempt.started_at_ms {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    if attempt.safe_summary.is_empty() || attempt.safe_summary.len() > MAX_SAFE_SUMMARY_LEN {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    let exit_code_confirmed = matches!(
+        attempt.outcome,
+        ValidationCommandResultOutcome::Success | ValidationCommandResultOutcome::ExitFailure
+    );
+    if exit_code_confirmed != attempt.exit_code.is_some() {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn validation_command_approval_exists(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+    kind: ValidationCommandKind,
+) -> Result<bool, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_validation_command_approvals
+                WHERE task_id = ?1 AND approved_task_version = ?2 AND command_kind = ?3
+             )",
+            params![
+                task_id.to_string(),
+                version,
+                validation_command_kind_text(kind)
+            ],
+            |row| row.get(0),
+        )
+        .map_err(operation_failed)
+}
+
+fn next_validation_command_result_sequence(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+    kind: ValidationCommandKind,
+) -> Result<u32, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let next_sequence: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(attempt_sequence), 0) + 1
+             FROM task_validation_command_results
+             WHERE task_id = ?1 AND approved_task_version = ?2 AND command_kind = ?3",
+            params![
+                task_id.to_string(),
+                version,
+                validation_command_kind_text(kind)
+            ],
+            |row| row.get(0),
+        )
+        .map_err(operation_failed)?;
+    u32::try_from(next_sequence)
+        .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))
+}
+
+fn insert_validation_command_result(
+    connection: &Connection,
+    attempt: &ValidationCommandResultAttempt,
+    attempt_sequence: u32,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_results (
+                task_id, approved_task_version, command_kind, attempt_sequence,
+                outcome, exit_code, safe_summary, started_at_ms, completed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                attempt.task_id.to_string(),
+                to_sql_integer(attempt.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                validation_command_kind_text(attempt.kind),
+                attempt_sequence,
+                validation_command_result_outcome_text(attempt.outcome),
+                attempt.exit_code,
+                attempt.safe_summary,
+                attempt.started_at_ms,
+                attempt.completed_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+fn load_validation_command_results(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+    kind: ValidationCommandKind,
+) -> Result<Vec<ValidationCommandResultRecord>, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT attempt_sequence, outcome, exit_code, safe_summary,
+                    started_at_ms, completed_at_ms
+             FROM task_validation_command_results
+             WHERE task_id = ?1 AND approved_task_version = ?2 AND command_kind = ?3
+             ORDER BY attempt_sequence",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map(
+            params![
+                task_id.to_string(),
+                version,
+                validation_command_kind_text(kind)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i32>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(operation_failed)?;
+    let mut results = Vec::new();
+    for row in rows {
+        let (attempt_sequence, outcome, exit_code, safe_summary, started_at_ms, completed_at_ms) =
+            row.map_err(operation_failed)?;
+        let attempt_sequence = u32::try_from(attempt_sequence)
+            .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        results.push(ValidationCommandResultRecord {
+            task_id,
+            approved_task_version,
+            kind,
+            attempt_sequence,
+            outcome: validation_command_result_outcome_from_text(&outcome)?,
+            exit_code,
+            safe_summary,
+            started_at_ms,
+            completed_at_ms,
+        });
+    }
+    Ok(results)
+}
+
+const fn validation_command_result_outcome_text(
+    outcome: ValidationCommandResultOutcome,
+) -> &'static str {
+    match outcome {
+        ValidationCommandResultOutcome::Success => "Success",
+        ValidationCommandResultOutcome::ExitFailure => "ExitFailure",
+        ValidationCommandResultOutcome::TimedOut => "TimedOut",
+        ValidationCommandResultOutcome::StdoutBoundExceeded => "StdoutBoundExceeded",
+        ValidationCommandResultOutcome::Cancelled => "Cancelled",
+        ValidationCommandResultOutcome::Uncertain => "Uncertain",
+    }
+}
+
+fn validation_command_result_outcome_from_text(
+    value: &str,
+) -> Result<ValidationCommandResultOutcome, RepositoryError> {
+    match value {
+        "Success" => Ok(ValidationCommandResultOutcome::Success),
+        "ExitFailure" => Ok(ValidationCommandResultOutcome::ExitFailure),
+        "TimedOut" => Ok(ValidationCommandResultOutcome::TimedOut),
+        "StdoutBoundExceeded" => Ok(ValidationCommandResultOutcome::StdoutBoundExceeded),
+        "Cancelled" => Ok(ValidationCommandResultOutcome::Cancelled),
+        "Uncertain" => Ok(ValidationCommandResultOutcome::Uncertain),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
 }
 
 fn provider_kind_from_text(value: &str) -> Result<ProviderKind, RepositoryError> {

@@ -160,6 +160,40 @@ export interface CancelPlanningDto {
   requested: boolean;
 }
 
+export interface CancelImplementationDto {
+  requested: boolean;
+}
+
+export interface CancelTestingDto {
+  requested: boolean;
+}
+
+export interface CancelReviewDto {
+  requested: boolean;
+}
+
+export type ValidationCommandKind = "format" | "lint" | "typecheck" | "test" | "build";
+
+export interface ValidationCommandCandidateDto {
+  kind: ValidationCommandKind;
+  label: string;
+}
+
+export interface ValidationCommandApprovalStatusDto {
+  approvedKinds: readonly ValidationCommandKind[];
+}
+
+export interface ApproveValidationCommandInput {
+  kinds: readonly ValidationCommandKind[];
+  executablePath: string;
+  cargoHomePath: string | null;
+  rustupHomePath: string | null;
+}
+
+export interface ApproveValidationCommandResultDto {
+  approvedKinds: readonly ValidationCommandKind[];
+}
+
 export type PlanningOutcome = "completed" | "failed" | "cancelled" | "recoveryRequired";
 
 export interface PlanningResultDto {
@@ -169,6 +203,17 @@ export interface PlanningResultDto {
   startedAtMs: number;
   completedAtMs: number;
   planText: string | null;
+}
+
+export type ReviewOutcome = "completed" | "failed" | "cancelled" | "recoveryRequired";
+
+export interface ReviewResultDto {
+  outcome: ReviewOutcome;
+  exitCode: number | null;
+  turnCount: number | null;
+  startedAtMs: number;
+  completedAtMs: number;
+  reviewText: string | null;
 }
 
 export interface TaskTransitionDto {

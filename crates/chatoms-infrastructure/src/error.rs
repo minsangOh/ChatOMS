@@ -90,7 +90,11 @@ impl CategorizedFailure for DatabaseError {
             | Self::MigrationOutOfOrder { .. }
             | Self::DatabaseNewerThanApplication { .. }
             | Self::MigrationExecutionFailed { .. }
-            | Self::LegacyProjectPreflightFailed { .. } => FailureCategory::MigrationFailure,
+            | Self::LegacyProjectPreflightFailed { .. }
+            | Self::ValidationCommandApprovalMigrationFailed { .. }
+            | Self::ValidationCommandEnvironmentBindingMigrationFailed { .. } => {
+                FailureCategory::MigrationFailure
+            }
             Self::ForeignKeyViolation { .. } | Self::InvariantViolation { .. } => {
                 FailureCategory::InvariantViolation
             }

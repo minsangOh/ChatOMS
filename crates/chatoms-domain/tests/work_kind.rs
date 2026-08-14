@@ -5,7 +5,7 @@ fn each_work_kind_has_exactly_one_task_state_that_allows_entry() {
     for (work_kind, entry_state) in [
         (WorkKind::Planning, TaskState::WorktreeReady),
         (WorkKind::Implementation, TaskState::AwaitingDesignApproval),
-        (WorkKind::Review, TaskState::Testing),
+        (WorkKind::Review, TaskState::Reviewing),
     ] {
         assert_eq!(work_kind.entry_state(), entry_state);
         for state in TaskState::ALL {

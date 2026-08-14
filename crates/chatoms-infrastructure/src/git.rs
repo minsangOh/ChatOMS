@@ -2,10 +2,15 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -13,6 +18,7 @@ use chatoms_platform::git_runtime::TrustedGitRuntime;
 use chatoms_platform::{ensure_supported_directory, supported_directory_identity};
 
 use chatoms_ports::{
+    diff::{WorktreeDiff, WorktreeDiffOutcome, WorktreeDiffPort},
     error::{FailureCategory, PortFailure},
     filesystem::DirectoryIdentity,
     git::{
@@ -65,6 +71,21 @@ impl TrustedGitRuntime {
 }
 
 const INITIAL_SNAPSHOT_MESSAGE: &str = "chore: create initial project snapshot";
+
+/// Byte bound on a single worktree diff read. Small and explicit: this diff
+/// is only ever meant to become part of a future Claude Review stdin
+/// payload alongside a fixed template and the stored plan text, not a
+/// general-purpose diff viewer.
+const DIFF_MAX_BYTES: usize = 512 * 1024;
+
+/// Wall-clock bound on a single worktree diff read. `git diff` against a
+/// worktree's own `HEAD` is expected to be fast; this exists only to force
+/// termination if the process hangs (e.g. a stuck filesystem).
+const DIFF_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Poll interval while waiting for the diff process to exit or the deadline
+/// to pass.
+const DIFF_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Debug)]
 struct GitControlPaths {
@@ -688,6 +709,188 @@ impl GitService for GitCliAdapter {
     }
 }
 
+/// Reads the current worktree diff via the same trusted Git runtime and
+/// `env_clear`'d control-path machinery every other `GitCliAdapter` command
+/// uses (see `common_arguments`/`configure_controlled_environment`), but
+/// through its own bounded/time-limited capture (`capture_bounded_stdout`)
+/// rather than `output`/`output_with_input`'s unbounded
+/// `wait_with_output`. Deliberately a separate trait ([`WorktreeDiffPort`])
+/// rather than a new [`GitService`] method — see that trait's doc comment.
+impl WorktreeDiffPort for GitCliAdapter {
+    fn current_diff(&mut self, worktree: &Path) -> Result<WorktreeDiffOutcome, PortFailure> {
+        if !worktree.is_absolute() {
+            return Err(PortFailure::new(FailureCategory::InvalidInput));
+        }
+        self.ensure_control_paths()?;
+        self.validate_runtime()?;
+        self.validate_control_paths()?;
+        let mut command = Command::new(self.runtime.executable());
+        command
+            .env_clear()
+            .current_dir(&self.control.home)
+            .args(self.common_arguments())
+            .args(diff_arguments(worktree));
+        configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        classify_capture(capture_bounded_stdout(
+            command,
+            DIFF_MAX_BYTES,
+            DIFF_TIMEOUT,
+        )?)
+    }
+}
+
+/// Fixed, non-caller-influenced argv for a bounded current-worktree diff:
+/// `-C <worktree> diff --no-color --no-ext-diff --no-textconv HEAD -- .`.
+/// `--no-ext-diff`/`--no-textconv` stop a repository-local `diff.*`
+/// driver/textconv config (or a `GIT_EXTERNAL_DIFF` the controlled
+/// environment already strips) from running arbitrary content-dependent
+/// code. `diff HEAD` (rather than separate `diff` and `diff --cached`
+/// calls) reports the union of staged and unstaged changes against the
+/// worktree's own current commit in one call. The trailing `-- .` pins the
+/// diff to files inside `worktree` even though `-C worktree` already scopes
+/// it there, as defense in depth against any future argument added before
+/// it. No revision or path ever comes from a caller.
+fn diff_arguments(worktree: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("-C"),
+        worktree.as_os_str().to_owned(),
+        OsString::from("diff"),
+        OsString::from("--no-color"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--no-textconv"),
+        OsString::from("HEAD"),
+        OsString::from("--"),
+        OsString::from("."),
+    ]
+}
+
+/// Raw disposition of a bounded, time-limited process capture, before it
+/// has been reduced to the safe [`WorktreeDiffOutcome`]/[`PortFailure`]
+/// vocabulary by [`classify_capture`]. Kept separate so the bounded-capture
+/// mechanics (spawn, drain stdout/stderr, enforce a byte cap and a
+/// deadline) can be unit-tested against an arbitrary fixture process,
+/// independent of the trusted Git runtime.
+enum BoundedCaptureOutcome {
+    Success(Vec<u8>),
+    ExitFailure,
+    TooLarge,
+    TimedOut,
+    Uncertain,
+}
+
+/// Spawns `command` (already fully configured by the caller — executable,
+/// args, cwd, environment) with piped stdout/stderr, and reads stdout on a
+/// background thread that stops as soon as `max_bytes` would be exceeded
+/// (so an oversized diff is never buffered in full) while stderr is drained
+/// and discarded purely to prevent pipe backpressure. The main thread polls
+/// `try_wait` against `timeout`; if the deadline passes first, the child is
+/// killed. A byte-bound breach takes priority over a clean exit or a
+/// timeout if both become true, since the content is unusable either way.
+fn capture_bounded_stdout(
+    mut command: Command,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedCaptureOutcome, PortFailure> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(map_spawn_error)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| PortFailure::new(FailureCategory::Internal))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| PortFailure::new(FailureCategory::Internal))?;
+
+    let stderr_drain = thread::spawn(move || {
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+    });
+
+    let too_large = Arc::new(AtomicBool::new(false));
+    let too_large_reader = Arc::clone(&too_large);
+    let stdout_reader = thread::spawn(move || -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if buffer.len() + read > max_bytes {
+                        too_large_reader.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+            }
+        }
+        buffer
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if too_large.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    timed_out = !too_large.load(Ordering::SeqCst);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                thread::sleep(DIFF_POLL_INTERVAL);
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let _ = stderr_drain.join();
+    let Ok(stdout_bytes) = stdout_reader.join() else {
+        return Ok(BoundedCaptureOutcome::Uncertain);
+    };
+
+    if too_large.load(Ordering::SeqCst) {
+        return Ok(BoundedCaptureOutcome::TooLarge);
+    }
+    let Some(status) = status else {
+        return Ok(if timed_out {
+            BoundedCaptureOutcome::TimedOut
+        } else {
+            BoundedCaptureOutcome::Uncertain
+        });
+    };
+    if !status.success() {
+        return Ok(BoundedCaptureOutcome::ExitFailure);
+    }
+    Ok(BoundedCaptureOutcome::Success(stdout_bytes))
+}
+
+/// Reduces a [`BoundedCaptureOutcome`] to the port's safe vocabulary. A
+/// non-zero Git exit is treated as a genuine command failure
+/// ([`FailureCategory::Conflict`], matching this file's existing
+/// `ensure_success`), and non-UTF-8 stdout as malformed input
+/// ([`FailureCategory::InvalidInput`], matching `trimmed_utf8`) — both
+/// `Err`, not an outcome variant, since neither is a safe-to-classify
+/// disposition of a well-formed run.
+fn classify_capture(outcome: BoundedCaptureOutcome) -> Result<WorktreeDiffOutcome, PortFailure> {
+    match outcome {
+        BoundedCaptureOutcome::TooLarge => Ok(WorktreeDiffOutcome::DiffTooLarge),
+        BoundedCaptureOutcome::TimedOut => Ok(WorktreeDiffOutcome::TimedOut),
+        BoundedCaptureOutcome::Uncertain => Ok(WorktreeDiffOutcome::Uncertain),
+        BoundedCaptureOutcome::ExitFailure => Err(PortFailure::new(FailureCategory::Conflict)),
+        BoundedCaptureOutcome::Success(bytes) if bytes.is_empty() => {
+            Ok(WorktreeDiffOutcome::NoChanges)
+        }
+        BoundedCaptureOutcome::Success(bytes) => String::from_utf8(bytes)
+            .map(|text| WorktreeDiffOutcome::Diff(WorktreeDiff::new(text)))
+            .map_err(|_| PortFailure::new(FailureCategory::InvalidInput)),
+    }
+}
+
 fn git_control_paths(root: &Path) -> GitControlPaths {
     GitControlPaths {
         home: root.join("home"),
@@ -1067,5 +1270,168 @@ fn map_io_error(error: std::io::Error) -> PortFailure {
         std::io::ErrorKind::NotFound => PortFailure::new(FailureCategory::NotFound),
         std::io::ErrorKind::PermissionDenied => PortFailure::new(FailureCategory::PermissionDenied),
         _ => PortFailure::new(FailureCategory::Conflict),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use chatoms_ports::error::CategorizedFailure;
+
+    // These tests exercise `capture_bounded_stdout`/`classify_capture`
+    // against fixture `cmd.exe` processes, never a real (or even fake) Git
+    // binary — the trusted-runtime-gated `WorktreeDiffPort::current_diff`
+    // itself needs a genuine signed Git for Windows install to spawn at
+    // all, so its own argv construction is covered separately by
+    // `diff_arguments_are_fixed_and_scoped_to_worktree` below, a pure
+    // function with no process involved.
+
+    fn fixture_command(script: &str) -> Command {
+        let mut command = Command::new("cmd");
+        command.args(["/C", script]);
+        command
+    }
+
+    #[test]
+    fn diff_arguments_are_fixed_and_scoped_to_worktree() {
+        let worktree = Path::new(r"C:\ChatOMS\worktrees\project\task");
+        let arguments = diff_arguments(worktree);
+        assert_eq!(
+            arguments,
+            vec![
+                OsString::from("-C"),
+                OsString::from(worktree),
+                OsString::from("diff"),
+                OsString::from("--no-color"),
+                OsString::from("--no-ext-diff"),
+                OsString::from("--no-textconv"),
+                OsString::from("HEAD"),
+                OsString::from("--"),
+                OsString::from("."),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_returns_success_bytes_for_a_clean_exit() {
+        let outcome = capture_bounded_stdout(
+            fixture_command("echo hello"),
+            DIFF_MAX_BYTES,
+            Duration::from_secs(5),
+        )
+        .expect("capture succeeds");
+        let BoundedCaptureOutcome::Success(bytes) = outcome else {
+            panic!("expected Success, got a different outcome");
+        };
+        assert!(String::from_utf8(bytes).expect("utf8").contains("hello"));
+    }
+
+    #[test]
+    fn capture_returns_empty_success_bytes_for_no_output() {
+        let outcome = capture_bounded_stdout(
+            fixture_command("exit 0"),
+            DIFF_MAX_BYTES,
+            Duration::from_secs(5),
+        )
+        .expect("capture succeeds");
+        let BoundedCaptureOutcome::Success(bytes) = outcome else {
+            panic!("expected Success, got a different outcome");
+        };
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn capture_reports_exit_failure_without_needing_output_content() {
+        let outcome = capture_bounded_stdout(
+            fixture_command("exit 3"),
+            DIFF_MAX_BYTES,
+            Duration::from_secs(5),
+        )
+        .expect("capture succeeds");
+        assert!(matches!(outcome, BoundedCaptureOutcome::ExitFailure));
+    }
+
+    #[test]
+    fn capture_stops_reading_once_the_byte_bound_is_exceeded() {
+        let outcome = capture_bounded_stdout(
+            fixture_command("echo 0123456789012345678901234567890123456789"),
+            16,
+            Duration::from_secs(5),
+        )
+        .expect("capture succeeds");
+        assert!(matches!(outcome, BoundedCaptureOutcome::TooLarge));
+    }
+
+    #[test]
+    fn capture_kills_and_reports_timeout_for_a_hanging_process() {
+        // Spawned directly (no `cmd /C` wrapper), matching how the
+        // production adapter spawns `git.exe` itself: a single process with
+        // no grandchild. `child.kill()` only terminates the process it was
+        // given, not any children it may have spawned (this is exactly why
+        // `StdProcessRunner::run_streaming` elsewhere in this crate needs
+        // `taskkill /T /F`) — a `cmd /C ping ...` fixture here would leave
+        // an orphaned `ping.exe` holding the pipe open for the full
+        // duration, which does not reflect how `current_diff` actually
+        // spawns Git.
+        let started = Instant::now();
+        let mut command = Command::new("ping");
+        command.args(["127.0.0.1", "-n", "30"]);
+        let outcome = capture_bounded_stdout(command, DIFF_MAX_BYTES, Duration::from_millis(150))
+            .expect("capture succeeds");
+        assert!(matches!(outcome, BoundedCaptureOutcome::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout should cut the hang short, not wait for the full ping duration"
+        );
+    }
+
+    #[test]
+    fn classify_maps_too_large_and_timeout_and_uncertain_to_outcomes_not_errors() {
+        assert_eq!(
+            classify_capture(BoundedCaptureOutcome::TooLarge).expect("ok"),
+            WorktreeDiffOutcome::DiffTooLarge
+        );
+        assert_eq!(
+            classify_capture(BoundedCaptureOutcome::TimedOut).expect("ok"),
+            WorktreeDiffOutcome::TimedOut
+        );
+        assert_eq!(
+            classify_capture(BoundedCaptureOutcome::Uncertain).expect("ok"),
+            WorktreeDiffOutcome::Uncertain
+        );
+    }
+
+    #[test]
+    fn classify_maps_exit_failure_to_a_typed_error_without_raw_content() {
+        let error =
+            classify_capture(BoundedCaptureOutcome::ExitFailure).expect_err("exit failure errs");
+        assert_eq!(error.category(), FailureCategory::Conflict);
+    }
+
+    #[test]
+    fn classify_maps_empty_success_to_no_changes() {
+        assert_eq!(
+            classify_capture(BoundedCaptureOutcome::Success(Vec::new())).expect("ok"),
+            WorktreeDiffOutcome::NoChanges
+        );
+    }
+
+    #[test]
+    fn classify_maps_non_utf8_success_to_a_typed_error_without_raw_bytes() {
+        let error = classify_capture(BoundedCaptureOutcome::Success(vec![0xFF, 0xFE]))
+            .expect_err("non-UTF-8 bytes err");
+        assert_eq!(error.category(), FailureCategory::InvalidInput);
+    }
+
+    #[test]
+    fn classify_maps_nonempty_utf8_success_to_diff_text() {
+        let outcome = classify_capture(BoundedCaptureOutcome::Success(
+            b"--- a/f\n+++ b/f\n".to_vec(),
+        ))
+        .expect("ok");
+        let WorktreeDiffOutcome::Diff(diff) = outcome else {
+            panic!("expected a Diff outcome");
+        };
+        assert_eq!(diff.text(), "--- a/f\n+++ b/f\n");
     }
 }

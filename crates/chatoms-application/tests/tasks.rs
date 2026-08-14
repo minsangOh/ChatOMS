@@ -5,8 +5,9 @@ use std::str::FromStr;
 use chatoms_application::{
     error::ApplicationErrorCode,
     tasks::{
-        CreateTaskRequest, RecordPlanningResultRequest, StartPlanningRequest, TaskActionRequest,
-        TaskService, TransitionTaskRequest,
+        CreateTaskRequest, RecordImplementationResultRequest, RecordPlanningResultRequest,
+        RecordReviewResultRequest, StartImplementationRequest, StartPlanningRequest,
+        StartReviewRequest, TaskActionRequest, TaskService, TransitionTaskRequest,
     },
 };
 use chatoms_domain::{ProjectId, TaskId, TaskState, WorkKind};
@@ -14,8 +15,9 @@ use chatoms_ports::{
     error::{CategorizedFailure, FailureCategory, PortFailure},
     provider::ProviderKind,
     repository::{
-        ActiveLease, GitIsolationStatus, PlanningResultOutcome, RepositoryErrorCode,
-        TaskGitIsolation, TaskPlanningResultRecord,
+        ActiveLease, GitIsolationStatus, ImplementationResultOutcome, PlanningResultOutcome,
+        RepositoryErrorCode, ReviewResultOutcome, TaskGitIsolation, TaskPlanningResultRecord,
+        TaskReviewResultRecord,
     },
 };
 
@@ -59,6 +61,19 @@ fn start_planning(task_id: TaskId, expected_version: u64) -> StartPlanningReques
         "user".to_owned(),
         "task.planning.consent".to_owned(),
     )
+}
+
+fn start_implementation(task_id: TaskId, expected_version: u64) -> StartImplementationRequest {
+    StartImplementationRequest::new(
+        task_id,
+        expected_version,
+        "user".to_owned(),
+        "task.implementation.consent".to_owned(),
+    )
+}
+
+fn start_review(task_id: TaskId, expected_version: u64) -> StartReviewRequest {
+    StartReviewRequest::new(task_id, expected_version)
 }
 
 fn worktree_ready_isolation(task_id: TaskId, expected_version: u64) -> TaskGitIsolation {
@@ -388,6 +403,273 @@ fn reconcile_startup_planning_fails_closed_on_repository_error_without_assuming_
 
     assert_eq!(error.code(), ApplicationErrorCode::Internal);
     assert_eq!(repository.tasks[&task_id].state(), TaskState::Planning);
+    assert_eq!(repository.tasks[&task_id].version(), 4);
+    assert!(repository.last_saved.is_none());
+}
+
+#[test]
+fn reconcile_startup_testing_moves_a_leftover_testing_task_to_recovery_required_and_keeps_the_lease()
+ {
+    let (task, history) = restored_task(TaskState::Testing, 4, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_testing()
+        .expect("reconciliation succeeds")
+        .expect("a leftover Testing task is reconciled");
+
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(view.version, 5);
+    let (expected_version, saved, record) = repository.last_saved.expect("saved transition");
+    assert_eq!(expected_version, 4);
+    assert_eq!(saved.state(), TaskState::RecoveryRequired);
+    assert_eq!(record.from_state(), Some(TaskState::Testing));
+    assert_eq!(record.to_state(), TaskState::RecoveryRequired);
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "RecoveryRequired must keep the active lease"
+    );
+    assert_eq!(
+        repository.calls,
+        [
+            "active_lease",
+            "get_task",
+            "get_task",
+            "list_task_transitions",
+            "save_transition"
+        ]
+    );
+}
+
+#[test]
+fn reconcile_startup_testing_is_a_no_op_without_an_active_task() {
+    let mut repository = FakeRepository::default();
+    let mut time = FakeTime::at(30);
+
+    let result = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_testing()
+        .expect("no active task is not an error");
+
+    assert!(result.is_none());
+    assert_eq!(repository.calls, ["active_lease"]);
+}
+
+#[test]
+fn reconcile_startup_testing_is_a_no_op_when_the_active_task_is_not_testing() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let result = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_testing()
+        .expect("a non-Testing active task is not an error");
+
+    assert!(result.is_none());
+    assert_eq!(repository.calls, ["active_lease", "get_task"]);
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::WorktreeReady);
+}
+
+#[test]
+fn reconcile_startup_testing_fails_closed_on_repository_error_without_assuming_success() {
+    let (task, history) = restored_task(TaskState::Testing, 4, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some(("get_task", RepositoryErrorCode::OperationFailed)),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_testing()
+        .expect_err("a repository failure must surface, not be treated as reconciled");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Testing);
+    assert_eq!(repository.tasks[&task_id].version(), 4);
+    assert!(repository.last_saved.is_none());
+}
+
+#[test]
+fn reconcile_startup_reviewing_moves_a_leftover_reviewing_task_to_recovery_required_and_keeps_the_lease()
+ {
+    let (task, history) = restored_task(TaskState::Reviewing, 4, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_reviewing()
+        .expect("reconciliation succeeds")
+        .expect("a leftover Reviewing task is reconciled");
+
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(view.version, 5);
+    let (expected_version, saved, record) = repository.last_saved.expect("saved transition");
+    assert_eq!(expected_version, 4);
+    assert_eq!(saved.state(), TaskState::RecoveryRequired);
+    assert_eq!(record.from_state(), Some(TaskState::Reviewing));
+    assert_eq!(record.to_state(), TaskState::RecoveryRequired);
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "RecoveryRequired must keep the active lease"
+    );
+    assert_eq!(
+        repository.calls,
+        [
+            "active_lease",
+            "get_task",
+            "get_task",
+            "list_task_transitions",
+            "save_transition"
+        ]
+    );
+}
+
+#[test]
+fn reconcile_startup_reviewing_is_a_no_op_without_an_active_task() {
+    let mut repository = FakeRepository::default();
+    let mut time = FakeTime::at(30);
+
+    let result = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_reviewing()
+        .expect("no active task is not an error");
+
+    assert!(result.is_none());
+    assert_eq!(repository.calls, ["active_lease"]);
+}
+
+#[test]
+fn reconcile_startup_reviewing_is_a_no_op_when_the_active_task_is_not_reviewing() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let result = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_reviewing()
+        .expect("a non-Reviewing active task is not an error");
+
+    assert!(result.is_none());
+    assert_eq!(repository.calls, ["active_lease", "get_task"]);
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::WorktreeReady);
+}
+
+#[test]
+fn reconcile_startup_reviewing_fails_closed_on_repository_error_without_assuming_success() {
+    let (task, history) = restored_task(TaskState::Reviewing, 4, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some(("get_task", RepositoryErrorCode::OperationFailed)),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_reviewing()
+        .expect_err("a repository failure must surface, not be treated as reconciled");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Reviewing);
+    assert_eq!(repository.tasks[&task_id].version(), 4);
+    assert!(repository.last_saved.is_none());
+}
+
+#[test]
+fn reconcile_startup_implementation_moves_a_leftover_implementing_task_to_recovery_required_and_keeps_the_lease()
+ {
+    let (task, history) = restored_task(TaskState::Implementing, 4, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_implementation()
+        .expect("reconciliation succeeds")
+        .expect("a leftover Implementing task is reconciled");
+
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(view.version, 5);
+    let (expected_version, saved, record) = repository.last_saved.expect("saved transition");
+    assert_eq!(expected_version, 4);
+    assert_eq!(saved.state(), TaskState::RecoveryRequired);
+    assert_eq!(record.from_state(), Some(TaskState::Implementing));
+    assert_eq!(record.to_state(), TaskState::RecoveryRequired);
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "RecoveryRequired must keep the active lease"
+    );
+    assert_eq!(
+        repository.calls,
+        [
+            "active_lease",
+            "get_task",
+            "get_task",
+            "list_task_transitions",
+            "save_transition"
+        ]
+    );
+}
+
+#[test]
+fn reconcile_startup_implementation_is_a_no_op_without_an_active_task() {
+    let mut repository = FakeRepository::default();
+    let mut time = FakeTime::at(30);
+
+    let result = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_implementation()
+        .expect("no active task is not an error");
+
+    assert!(result.is_none());
+    assert_eq!(repository.calls, ["active_lease"]);
+}
+
+#[test]
+fn reconcile_startup_implementation_is_a_no_op_when_the_active_task_is_not_implementing() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let result = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_implementation()
+        .expect("a non-Implementing active task is not an error");
+
+    assert!(result.is_none());
+    assert_eq!(repository.calls, ["active_lease", "get_task"]);
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::WorktreeReady);
+}
+
+#[test]
+fn reconcile_startup_implementation_fails_closed_on_repository_error_without_assuming_success() {
+    let (task, history) = restored_task(TaskState::Implementing, 4, 20, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some(("get_task", RepositoryErrorCode::OperationFailed)),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .reconcile_startup_implementation()
+        .expect_err("a repository failure must surface, not be treated as reconciled");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Implementing);
     assert_eq!(repository.tasks[&task_id].version(), 4);
     assert!(repository.last_saved.is_none());
 }
@@ -765,6 +1047,349 @@ fn start_planning_repository_failure_does_not_record_consent_or_advance_task() {
     assert_eq!(repository.tasks[&task_id].version(), 1);
 }
 
+#[test]
+fn start_implementation_records_new_consent_and_transitions_atomically() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .start_implementation(start_implementation(task_id, 1))
+        .expect("start implementation");
+
+    assert_eq!(view.state, TaskState::Implementing);
+    assert_eq!(view.version, 2);
+    assert_eq!(view.updated_at_ms, 20);
+    let (expected_version, saved, record) = repository.last_saved.expect("saved transition");
+    assert_eq!(expected_version, 1);
+    assert_eq!(saved.state(), TaskState::Implementing);
+    assert_eq!(record.from_state(), Some(TaskState::AwaitingDesignApproval));
+    assert_eq!(record.to_state(), TaskState::Implementing);
+    let consent = repository
+        .consents
+        .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+        .expect("consent recorded");
+    assert_eq!(consent.consented_at_ms, 20);
+    assert!(repository.calls.contains(&"save_implementation_transition"));
+}
+
+#[test]
+fn start_implementation_reuses_an_existing_same_version_consent_without_overwriting_it() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let existing_consent = chatoms_ports::repository::ProviderConsent {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Implementation,
+        approved_task_version: 1,
+        consented_at_ms: 5,
+    };
+    repository.consents.insert(
+        (task_id, ProviderKind::Claude, WorkKind::Implementation, 1),
+        existing_consent,
+    );
+    let mut time = FakeTime::at(20);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .start_implementation(start_implementation(task_id, 1))
+        .expect("start implementation reuses consent");
+
+    assert_eq!(view.state, TaskState::Implementing);
+    let consent = repository
+        .consents
+        .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+        .expect("consent still present");
+    assert_eq!(
+        consent.consented_at_ms, 5,
+        "reused consent must not be overwritten with a new timestamp"
+    );
+    assert_eq!(repository.consents.len(), 1);
+}
+
+#[test]
+fn start_implementation_rejects_when_task_is_not_awaiting_design_approval() {
+    let (task, history) = restored_task(TaskState::Implementing, 2, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_implementation(start_implementation(task_id, 2))
+        .expect_err("wrong state must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(repository.last_saved.is_none());
+    assert!(repository.consents.is_empty());
+}
+
+#[test]
+fn start_implementation_version_mismatch_leaves_no_partial_write() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_implementation(start_implementation(task_id, 99))
+        .expect_err("stale version must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
+    assert!(repository.last_saved.is_none());
+    assert!(repository.consents.is_empty());
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::AwaitingDesignApproval
+    );
+}
+
+#[test]
+fn start_implementation_repository_failure_does_not_record_consent_or_advance_task() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "save_implementation_transition",
+            RepositoryErrorCode::OperationFailed,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_implementation(start_implementation(task_id, 1))
+        .expect_err("repository failure must surface");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert!(repository.consents.is_empty());
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::AwaitingDesignApproval
+    );
+    assert_eq!(repository.tasks[&task_id].version(), 1);
+}
+
+#[test]
+fn start_implementation_consent_is_independent_of_a_planning_consent_for_the_same_task_and_version()
+{
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let planning_consent = chatoms_ports::repository::ProviderConsent {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        approved_task_version: 1,
+        consented_at_ms: 5,
+    };
+    repository.consents.insert(
+        (task_id, ProviderKind::Claude, WorkKind::Planning, 1),
+        planning_consent,
+    );
+    let mut time = FakeTime::at(20);
+
+    TaskService::new(&mut repository, &mut time)
+        .start_implementation(start_implementation(task_id, 1))
+        .expect("a Planning consent must not be treated as an Implementation consent");
+
+    let implementation_consent = repository
+        .consents
+        .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+        .expect("a fresh Implementation consent must have been recorded");
+    assert_eq!(implementation_consent.consented_at_ms, 20);
+    assert_eq!(
+        repository
+            .consents
+            .get(&(task_id, ProviderKind::Claude, WorkKind::Planning, 1))
+            .expect("the pre-existing Planning consent must be untouched"),
+        &planning_consent
+    );
+    assert_eq!(repository.consents.len(), 2);
+}
+
+#[test]
+fn start_review_records_new_consent_without_transitioning_or_writing_history() {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .start_review(start_review(task_id, 1))
+        .expect("start review");
+
+    assert_eq!(view.state, TaskState::Reviewing);
+    assert_eq!(view.version, 1);
+    let consent = repository
+        .consents
+        .get(&(task_id, ProviderKind::Claude, WorkKind::Review, 1))
+        .expect("consent recorded");
+    assert_eq!(consent.consented_at_ms, 20);
+    assert!(repository.calls.contains(&"save_review_consent"));
+    assert!(
+        repository.last_saved.is_none(),
+        "start_review must never drive a state transition, unlike start_planning/start_implementation"
+    );
+    assert_eq!(repository.transitions[&task_id].len(), 1);
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Reviewing);
+    assert_eq!(repository.tasks[&task_id].version(), 1);
+}
+
+#[test]
+fn start_review_reuses_an_existing_same_version_consent_without_overwriting_it() {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let existing_consent = chatoms_ports::repository::ProviderConsent {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Review,
+        approved_task_version: 1,
+        consented_at_ms: 5,
+    };
+    repository.consents.insert(
+        (task_id, ProviderKind::Claude, WorkKind::Review, 1),
+        existing_consent,
+    );
+    let mut time = FakeTime::at(20);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .start_review(start_review(task_id, 1))
+        .expect("start review reuses consent");
+
+    assert_eq!(view.state, TaskState::Reviewing);
+    let consent = repository
+        .consents
+        .get(&(task_id, ProviderKind::Claude, WorkKind::Review, 1))
+        .expect("consent still present");
+    assert_eq!(
+        consent.consented_at_ms, 5,
+        "reused consent must not be overwritten with a new timestamp"
+    );
+    assert_eq!(repository.consents.len(), 1);
+}
+
+#[test]
+fn start_review_rejects_when_task_is_not_reviewing() {
+    let (task, history) = restored_task(TaskState::Testing, 2, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_review(start_review(task_id, 2))
+        .expect_err("wrong state must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(repository.consents.is_empty());
+}
+
+#[test]
+fn start_review_version_mismatch_leaves_no_partial_write() {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_review(start_review(task_id, 99))
+        .expect_err("stale version must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
+    assert!(repository.consents.is_empty());
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Reviewing);
+    assert_eq!(repository.tasks[&task_id].version(), 1);
+}
+
+#[test]
+fn start_review_repository_failure_does_not_record_consent() {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some(("save_review_consent", RepositoryErrorCode::OperationFailed)),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_review(start_review(task_id, 1))
+        .expect_err("repository failure must surface");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert!(repository.consents.is_empty());
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Reviewing);
+    assert_eq!(repository.tasks[&task_id].version(), 1);
+}
+
+#[test]
+fn start_review_consent_is_independent_of_planning_and_implementation_consents_for_the_same_task_and_version()
+ {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let planning_consent = chatoms_ports::repository::ProviderConsent {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        approved_task_version: 1,
+        consented_at_ms: 5,
+    };
+    let implementation_consent = chatoms_ports::repository::ProviderConsent {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Implementation,
+        approved_task_version: 1,
+        consented_at_ms: 6,
+    };
+    repository.consents.insert(
+        (task_id, ProviderKind::Claude, WorkKind::Planning, 1),
+        planning_consent,
+    );
+    repository.consents.insert(
+        (task_id, ProviderKind::Claude, WorkKind::Implementation, 1),
+        implementation_consent,
+    );
+    let mut time = FakeTime::at(20);
+
+    TaskService::new(&mut repository, &mut time)
+        .start_review(start_review(task_id, 1))
+        .expect("a Planning or Implementation consent must not be treated as a Review consent");
+
+    let review_consent = repository
+        .consents
+        .get(&(task_id, ProviderKind::Claude, WorkKind::Review, 1))
+        .expect("a fresh Review consent must have been recorded");
+    assert_eq!(review_consent.consented_at_ms, 20);
+    assert_eq!(
+        repository
+            .consents
+            .get(&(task_id, ProviderKind::Claude, WorkKind::Planning, 1))
+            .expect("the pre-existing Planning consent must be untouched"),
+        &planning_consent
+    );
+    assert_eq!(
+        repository
+            .consents
+            .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+            .expect("the pre-existing Implementation consent must be untouched"),
+        &implementation_consent
+    );
+    assert_eq!(repository.consents.len(), 3);
+}
+
 fn record_result(
     task_id: TaskId,
     expected_version: u64,
@@ -873,6 +1498,53 @@ fn get_planning_result_reports_none_when_no_attempt_has_been_recorded() {
     let view = TaskService::new(&mut repository, &mut time)
         .get_planning_result(task_id)
         .expect("planning result lookup succeeds");
+
+    assert!(view.is_none());
+}
+
+#[test]
+fn get_review_result_returns_the_stored_safe_record() {
+    let (task, history) = restored_task(TaskState::AwaitingUserDiffApproval, 3, 30, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository.review_results.insert(
+        task_id,
+        TaskReviewResultRecord {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Review,
+            outcome: ReviewResultOutcome::Completed,
+            exit_code: Some(0),
+            turn_count: Some(4),
+            started_at_ms: 5,
+            completed_at_ms: 30,
+            review_text: Some("masked review text".to_owned()),
+        },
+    );
+    let mut time = FakeTime::at(30);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .get_review_result(task_id)
+        .expect("review result lookup succeeds")
+        .expect("a result is recorded");
+
+    assert_eq!(view.outcome, ReviewResultOutcome::Completed);
+    assert_eq!(view.review_text.as_deref(), Some("masked review text"));
+    assert_eq!(view.turn_count, Some(4));
+}
+
+#[test]
+fn get_review_result_reports_none_when_no_attempt_has_been_recorded() {
+    let (task, history) = restored_task(TaskState::AwaitingUserDiffApproval, 3, 30, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(30);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .get_review_result(task_id)
+        .expect("review result lookup succeeds");
 
     assert!(view.is_none());
 }
@@ -1108,5 +1780,559 @@ fn record_planning_result_persistence_failure_falls_back_to_recovery_required_wi
         repository.active_lease.map(|lease| lease.task_id),
         Some(task_id),
         "RecoveryRequired must keep the active lease"
+    );
+}
+
+fn record_implementation_result(
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: ImplementationResultOutcome,
+    exit_code: Option<i32>,
+    turn_count: Option<u32>,
+) -> RecordImplementationResultRequest {
+    RecordImplementationResultRequest::new(
+        task_id,
+        expected_version,
+        outcome,
+        exit_code,
+        turn_count,
+        155,
+        "provider".to_owned(),
+        "task.implementation.result".to_owned(),
+    )
+}
+
+#[test]
+fn record_implementation_result_completed_transitions_to_testing_and_keeps_the_lease() {
+    let (task, history) = restored_task(TaskState::Implementing, 4, 160, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(170);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_implementation_result(record_implementation_result(
+            task_id,
+            4,
+            ImplementationResultOutcome::Completed,
+            Some(0),
+            Some(6),
+        ))
+        .expect("record completed result");
+
+    assert_eq!(view.state, TaskState::Testing);
+    assert_eq!(view.version, 5);
+    assert_eq!(view.updated_at_ms, 170);
+    let (expected_version, saved, record) = repository.last_saved.expect("saved transition");
+    assert_eq!(expected_version, 4);
+    assert_eq!(saved.state(), TaskState::Testing);
+    assert_eq!(record.from_state(), Some(TaskState::Implementing));
+    assert_eq!(record.to_state(), TaskState::Testing);
+    let stored = repository
+        .implementation_results
+        .get(&task_id)
+        .expect("implementation result stored");
+    assert_eq!(stored.outcome, ImplementationResultOutcome::Completed);
+    assert_eq!(stored.exit_code, Some(0));
+    assert_eq!(stored.turn_count, Some(6));
+    assert_eq!(stored.started_at_ms, 155);
+    assert_eq!(stored.completed_at_ms, 170);
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "Testing still requires the active lease"
+    );
+}
+
+#[test]
+fn record_implementation_result_confirmed_cancellation_pauses_with_implementing_resume_target_and_keeps_the_lease()
+ {
+    let (task, history) = restored_task(TaskState::Implementing, 4, 160, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(170);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_implementation_result(record_implementation_result(
+            task_id,
+            4,
+            ImplementationResultOutcome::Cancelled,
+            None,
+            None,
+        ))
+        .expect("record a confirmed cancellation");
+
+    assert_eq!(view.state, TaskState::Paused);
+    assert_eq!(
+        view.resume_target_state,
+        Some(TaskState::Implementing),
+        "a confirmed cancellation must be resumable back to Implementing"
+    );
+    let stored = repository
+        .implementation_results
+        .get(&task_id)
+        .expect("implementation result stored");
+    assert_eq!(stored.outcome, ImplementationResultOutcome::Cancelled);
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "Paused still requires the active lease"
+    );
+}
+
+#[test]
+fn record_implementation_result_recovery_required_keeps_the_lease() {
+    let (task, history) = restored_task(TaskState::Implementing, 4, 160, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(170);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_implementation_result(record_implementation_result(
+            task_id,
+            4,
+            ImplementationResultOutcome::RecoveryRequired,
+            Some(1),
+            None,
+        ))
+        .expect("record recovery-required result");
+
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(
+        repository
+            .implementation_results
+            .get(&task_id)
+            .expect("implementation result stored")
+            .outcome,
+        ImplementationResultOutcome::RecoveryRequired
+    );
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "RecoveryRequired must keep the active lease"
+    );
+}
+
+#[test]
+fn record_implementation_result_rejects_when_task_is_not_implementing() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 3, 150, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(170);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_implementation_result(record_implementation_result(
+            task_id,
+            3,
+            ImplementationResultOutcome::Completed,
+            Some(0),
+            Some(1),
+        ))
+        .expect_err("wrong state must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(repository.last_saved.is_none());
+}
+
+#[test]
+fn record_implementation_result_version_mismatch_leaves_no_partial_write() {
+    let (task, history) = restored_task(TaskState::Implementing, 4, 160, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(170);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_implementation_result(record_implementation_result(
+            task_id,
+            99,
+            ImplementationResultOutcome::Completed,
+            Some(0),
+            Some(1),
+        ))
+        .expect_err("stale version must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
+    assert!(repository.last_saved.is_none());
+    assert!(repository.implementation_results.is_empty());
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Implementing);
+}
+
+#[test]
+fn record_implementation_result_persistence_failure_falls_back_to_recovery_required_without_a_result_row()
+ {
+    let (task, history) = restored_task(TaskState::Implementing, 4, 160, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "save_implementation_result",
+            RepositoryErrorCode::OperationFailed,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(170);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_implementation_result(record_implementation_result(
+            task_id,
+            4,
+            ImplementationResultOutcome::Completed,
+            Some(0),
+            Some(6),
+        ))
+        .expect("falls back to RecoveryRequired instead of surfacing the raw failure");
+
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(view.version, 5);
+    assert!(
+        repository.implementation_results.is_empty(),
+        "the failed primary write must leave no implementation result row behind"
+    );
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "RecoveryRequired must keep the active lease"
+    );
+}
+
+fn record_review_result(
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: ReviewResultOutcome,
+    exit_code: Option<i32>,
+    turn_count: Option<u32>,
+    review_text: Option<String>,
+) -> RecordReviewResultRequest {
+    RecordReviewResultRequest::new(
+        task_id,
+        expected_version,
+        outcome,
+        exit_code,
+        turn_count,
+        review_text,
+        175,
+        "provider".to_owned(),
+        "task.review.result".to_owned(),
+    )
+}
+
+#[test]
+fn record_review_result_completed_reaches_awaiting_user_diff_approval_and_keeps_the_lease() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::Completed,
+            Some(0),
+            Some(4),
+            Some("masked review text".to_owned()),
+        ))
+        .expect("record completed result");
+
+    assert_eq!(view.state, TaskState::AwaitingUserDiffApproval);
+    assert_eq!(view.version, 7);
+    assert_eq!(view.updated_at_ms, 190);
+    let (expected_version, saved, record) = repository.last_saved.expect("saved transition");
+    assert_eq!(expected_version, 6);
+    assert_eq!(saved.state(), TaskState::AwaitingUserDiffApproval);
+    assert_eq!(record.from_state(), Some(TaskState::Reviewing));
+    assert_eq!(record.to_state(), TaskState::AwaitingUserDiffApproval);
+    let stored = repository
+        .review_results
+        .get(&task_id)
+        .expect("review result stored");
+    assert_eq!(stored.outcome, ReviewResultOutcome::Completed);
+    assert_eq!(stored.exit_code, Some(0));
+    assert_eq!(stored.turn_count, Some(4));
+    assert_eq!(stored.review_text.as_deref(), Some("masked review text"));
+    assert_eq!(stored.started_at_ms, 175);
+    assert_eq!(stored.completed_at_ms, 190);
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "AwaitingUserDiffApproval still requires the active lease"
+    );
+}
+
+#[test]
+fn record_review_result_failed_transitions_to_failed_and_releases_the_lease() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::Failed,
+            Some(1),
+            None,
+            None,
+        ))
+        .expect("record failed result");
+
+    assert_eq!(view.state, TaskState::Failed);
+    let stored = repository
+        .review_results
+        .get(&task_id)
+        .expect("review result stored");
+    assert_eq!(stored.outcome, ReviewResultOutcome::Failed);
+    assert_eq!(stored.review_text, None);
+    assert!(
+        repository.active_lease.is_none(),
+        "a terminal Failed outcome must release the active lease"
+    );
+}
+
+#[test]
+fn record_review_result_confirmed_cancellation_pauses_with_reviewing_resume_target_and_keeps_the_lease()
+ {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::Cancelled,
+            None,
+            None,
+            None,
+        ))
+        .expect("record a confirmed cancellation");
+
+    assert_eq!(view.state, TaskState::Paused);
+    assert_eq!(
+        view.resume_target_state,
+        Some(TaskState::Reviewing),
+        "a confirmed cancellation must be resumable back to Reviewing"
+    );
+    let stored = repository
+        .review_results
+        .get(&task_id)
+        .expect("review result stored");
+    assert_eq!(stored.outcome, ReviewResultOutcome::Cancelled);
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "Paused still requires the active lease"
+    );
+}
+
+#[test]
+fn record_review_result_recovery_required_keeps_the_lease() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::RecoveryRequired,
+            Some(1),
+            None,
+            None,
+        ))
+        .expect("record recovery-required result");
+
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(
+        repository
+            .review_results
+            .get(&task_id)
+            .expect("review result stored")
+            .outcome,
+        ReviewResultOutcome::RecoveryRequired
+    );
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "RecoveryRequired must keep the active lease"
+    );
+}
+
+#[test]
+fn record_review_result_rejects_review_text_present_on_a_non_completed_outcome() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::Failed,
+            Some(1),
+            None,
+            Some("should never be attached to a Failed outcome".to_owned()),
+        ))
+        .expect_err("review text must not accompany a non-Completed outcome");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidInput);
+    assert!(repository.last_saved.is_none());
+}
+
+#[test]
+fn record_review_result_rejects_missing_review_text_on_a_completed_outcome() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::Completed,
+            Some(0),
+            Some(1),
+            None,
+        ))
+        .expect_err("a Completed outcome must carry non-empty review text");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidInput);
+    assert!(repository.last_saved.is_none());
+}
+
+#[test]
+fn record_review_result_rejects_when_task_is_not_reviewing() {
+    let (task, history) = restored_task(TaskState::Testing, 5, 170, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            5,
+            ReviewResultOutcome::Completed,
+            Some(0),
+            Some(1),
+            Some("review".to_owned()),
+        ))
+        .expect_err("wrong state must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(repository.last_saved.is_none());
+}
+
+#[test]
+fn record_review_result_version_mismatch_leaves_no_partial_write() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            99,
+            ReviewResultOutcome::Completed,
+            Some(0),
+            Some(1),
+            Some("review".to_owned()),
+        ))
+        .expect_err("stale version must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
+    assert!(repository.last_saved.is_none());
+    assert!(repository.review_results.is_empty());
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::Reviewing);
+}
+
+#[test]
+fn record_review_result_persistence_failure_falls_back_to_recovery_required_without_a_result_row() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some(("save_review_result", RepositoryErrorCode::OperationFailed)),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::Completed,
+            Some(0),
+            Some(4),
+            Some("review".to_owned()),
+        ))
+        .expect("falls back to RecoveryRequired instead of surfacing the raw failure");
+
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(view.version, 7);
+    assert!(
+        repository.review_results.is_empty(),
+        "the failed primary write must leave no review result row behind"
+    );
+    assert_eq!(
+        repository.active_lease.map(|lease| lease.task_id),
+        Some(task_id),
+        "RecoveryRequired must keep the active lease"
+    );
+}
+
+#[test]
+fn record_review_result_persistence_failure_fallback_also_fails_and_propagates_the_original_error()
+{
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 180, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some(("save_review_result", RepositoryErrorCode::OperationFailed)),
+        fail_save_transition_once: Some(RepositoryErrorCode::OperationFailed),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(190);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_review_result(record_review_result(
+            task_id,
+            6,
+            ReviewResultOutcome::Completed,
+            Some(0),
+            Some(4),
+            Some("review".to_owned()),
+        ))
+        .expect_err(
+            "when the RecoveryRequired fallback's own write also fails, the original error \
+             must propagate, not a false success",
+        );
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert!(
+        repository.review_results.is_empty(),
+        "no review result row must be written when both the primary write and its fallback fail"
+    );
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::Reviewing,
+        "the task must be left exactly as it was, not silently advanced, when recovery itself fails"
     );
 }

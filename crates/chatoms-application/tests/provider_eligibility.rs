@@ -27,12 +27,11 @@ fn provider_work_kind_capability_truth_table_is_fail_closed() {
                     .find(|entry| entry.work_kind == work_kind && entry.provider == provider)
                     .expect("provider and work kind entry");
                 let expected_contract = match (provider, work_kind) {
-                    (ProviderKind::Claude, WorkKind::Planning | WorkKind::Review) => {
-                        ContractStatus::Approved
-                    }
-                    (ProviderKind::Claude, WorkKind::Implementation) | (ProviderKind::Codex, _) => {
-                        ContractStatus::NotApproved
-                    }
+                    (
+                        ProviderKind::Claude,
+                        WorkKind::Planning | WorkKind::Implementation | WorkKind::Review,
+                    ) => ContractStatus::Approved,
+                    (ProviderKind::Codex, _) => ContractStatus::NotApproved,
                 };
                 let expected_capability = match cached_capability {
                     Some(CapabilityStatus::Supported) => EligibilityCapability::Supported,
@@ -77,8 +76,39 @@ fn task_state_mismatch_is_reported_without_changing_provider_eligibility() {
     }
     assert!(entry(&entries, WorkKind::Planning, ProviderKind::Claude).eligible);
     assert!(entry(&entries, WorkKind::Review, ProviderKind::Claude).eligible);
-    assert!(!entry(&entries, WorkKind::Implementation, ProviderKind::Claude).eligible);
+    assert!(entry(&entries, WorkKind::Implementation, ProviderKind::Claude).eligible);
     assert!(!entry(&entries, WorkKind::Planning, ProviderKind::Codex).eligible);
+}
+
+#[test]
+fn review_is_startable_only_from_reviewing_never_from_testing() {
+    // `Testing -> Reviewing` is already an automatic transition
+    // (`TaskService::finalize_validation_command_batch` on full validation
+    // success), so a task can only ever be offered a Claude Review start
+    // once it has actually reached `Reviewing`. `Testing` must report a
+    // state mismatch for Review, even though capability and contract are
+    // otherwise satisfied.
+    let capability_summary = ProviderCapabilitySummary {
+        claude: Some(CapabilityStatus::Supported),
+        codex: Some(CapabilityStatus::Unsupported),
+    };
+
+    let testing_entries =
+        ProviderEligibilityPolicy::evaluate(TaskState::Testing, capability_summary);
+    let review_at_testing = entry(&testing_entries, WorkKind::Review, ProviderKind::Claude);
+    assert!(!review_at_testing.state_allows_work_kind);
+    assert!(
+        review_at_testing
+            .blocking_reasons
+            .contains(&EligibilityBlockingReason::TaskStateMismatch)
+    );
+
+    let reviewing_entries =
+        ProviderEligibilityPolicy::evaluate(TaskState::Reviewing, capability_summary);
+    let review_at_reviewing = entry(&reviewing_entries, WorkKind::Review, ProviderKind::Claude);
+    assert!(review_at_reviewing.state_allows_work_kind);
+    assert!(review_at_reviewing.eligible);
+    assert!(review_at_reviewing.blocking_reasons.is_empty());
 }
 
 fn entry(

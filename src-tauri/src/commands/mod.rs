@@ -1,12 +1,16 @@
 pub mod git_isolation;
+pub mod implementation;
 pub mod planning;
 pub mod projects;
 pub mod provider;
 pub mod provider_eligibility;
+pub mod review;
 pub mod system;
 pub mod tasks;
+pub mod testing;
+pub mod validation_commands;
 
-pub const REGISTERED_HANDLERS: [&str; 22] = [
+pub const REGISTERED_HANDLERS: [&str; 32] = [
     "get_version",
     "get_health",
     "get_system_status",
@@ -29,6 +33,16 @@ pub const REGISTERED_HANDLERS: [&str; 22] = [
     "start_claude_planning",
     "cancel_claude_planning",
     "get_planning_result",
+    "start_claude_implementation",
+    "cancel_claude_implementation",
+    "start_validation_testing",
+    "cancel_validation_testing",
+    "get_validation_command_candidates",
+    "get_validation_command_approval_status",
+    "approve_validation_command",
+    "start_claude_review",
+    "cancel_claude_review",
+    "get_review_result",
 ];
 
 #[cfg(test)]

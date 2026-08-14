@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use chatoms_app_lib::state::RepositoryHandle;
 use chatoms_domain::{
     ActorKind, ProjectId, ReasonCode, Task, TaskId, TaskState, TaskStateTransition,
-    TaskStateTransitionId, TaskStateTransitionSnapshot, WorkKind,
+    TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind, WorkKind,
 };
 use chatoms_infrastructure::bootstrap::{DatabaseBootstrapAdapter, SharedDatabase};
 use chatoms_ports::{
@@ -28,9 +28,11 @@ use chatoms_ports::{
     path::ResolvedAppPaths,
     provider::ProviderKind,
     repository::{
-        AppProfileRecord, FoundationRepository, PlanningResultOutcome,
+        AppProfileRecord, FoundationRepository, ImplementationResultOutcome, PlanningResultOutcome,
         ProjectFilesystemIdentityRecord, ProjectRecord, ProviderBindingRecord, ProviderConsent,
-        TaskPlanningResultRecord,
+        ReviewResultOutcome, TaskImplementationResultRecord, TaskPlanningResultRecord,
+        TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+        ValidationCommandResultOutcome,
     },
 };
 
@@ -288,6 +290,157 @@ fn planning_consent_and_transition_delegation_reaches_real_sqlite_through_both_w
 }
 
 #[test]
+fn implementation_consent_and_transition_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+ {
+    let (_dir, mut repository) = real_repository_handle("implementation-transition");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+
+    let none_yet = repository
+        .get_provider_consent(
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            task.version(),
+        )
+        .expect(
+            "get_provider_consent must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(none_yet, None, "no consent has been recorded yet");
+
+    let consent = ProviderConsent {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Implementation,
+        approved_task_version: task.version(),
+        consented_at_ms: 155,
+    };
+    let expected_version = task.version();
+    let previous_state = task.state();
+    task.transition_to(TaskState::Implementing, 160)
+        .expect("AwaitingDesignApproval -> Implementing is a valid domain transition");
+    let implementation_transition = transition_record(&task, previous_state, 160);
+    repository
+        .save_implementation_transition(
+            expected_version,
+            &task,
+            &implementation_transition,
+            Some(&consent),
+        )
+        .expect(
+            "save_implementation_transition must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+
+    let reloaded = repository
+        .get_provider_consent(
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            consent.approved_task_version,
+        )
+        .expect("get_provider_consent after save must reach the real repository")
+        .expect("the consent just saved must be persisted and readable back");
+    assert_eq!(reloaded.consented_at_ms, 155);
+}
+
+#[test]
+fn review_consent_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("review-consent");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+    advance(&mut repository, &mut task, TaskState::Reviewing, 180);
+    let expected_version = task.version();
+
+    let none_yet = repository
+        .get_provider_consent(
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Review,
+            expected_version,
+        )
+        .expect(
+            "get_provider_consent must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(none_yet, None, "no consent has been recorded yet");
+
+    let consent = repository
+        .save_review_consent(expected_version, task.id(), 185)
+        .expect(
+            "save_review_consent must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(consent.consented_at_ms, 185);
+    assert_eq!(consent.work_kind, WorkKind::Review);
+    assert_eq!(consent.approved_task_version, expected_version);
+
+    assert_eq!(
+        repository.get_task(task.id()).expect("get_task"),
+        Some(task.clone()),
+        "save_review_consent must never change task state or version"
+    );
+
+    let reloaded = repository
+        .get_provider_consent(
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Review,
+            expected_version,
+        )
+        .expect("get_provider_consent after save must reach the real repository")
+        .expect("the consent just saved must be persisted and readable back");
+    assert_eq!(reloaded, consent);
+
+    let reused = repository
+        .save_review_consent(expected_version, task.id(), 999)
+        .expect("a second call must reuse the existing consent, not fail");
+    assert_eq!(
+        reused, consent,
+        "reusing an existing same-version consent must return it unchanged"
+    );
+}
+
+#[test]
 fn planning_result_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
     let (_dir, mut repository) = real_repository_handle("planning-result");
     let project_id = ProjectId::new();
@@ -344,4 +497,384 @@ fn planning_result_delegation_reaches_real_sqlite_through_both_wrapper_layers() 
     assert_eq!(stored.outcome, PlanningResultOutcome::Completed);
     assert_eq!(stored.plan_text.as_deref(), Some("masked plan text"));
     assert_eq!(stored.turn_count, Some(3));
+}
+
+#[test]
+fn implementation_result_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("implementation-result");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+
+    assert_eq!(
+        repository.get_task_implementation_result(task.id()).expect(
+            "get_task_implementation_result must reach the real repository, not the trait's \
+                 OperationFailed default"
+        ),
+        None,
+        "no implementation result has been recorded yet"
+    );
+
+    let expected_version = task.version();
+    let previous_state = task.state();
+    task.transition_to(TaskState::Testing, 170)
+        .expect("Implementing -> Testing is a valid domain transition");
+    let result_transition = transition_record(&task, previous_state, 170);
+    let result = TaskImplementationResultRecord {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Implementation,
+        outcome: ImplementationResultOutcome::Completed,
+        exit_code: Some(0),
+        turn_count: Some(4),
+        started_at_ms: 155,
+        completed_at_ms: 170,
+    };
+    repository
+        .save_implementation_result(expected_version, &task, &result_transition, &result)
+        .expect(
+            "save_implementation_result must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+
+    let stored = repository
+        .get_task_implementation_result(task.id())
+        .expect("get_task_implementation_result after save must reach the real repository")
+        .expect("the implementation result just saved must be persisted and readable back");
+    assert_eq!(stored.outcome, ImplementationResultOutcome::Completed);
+    assert_eq!(stored.turn_count, Some(4));
+}
+
+#[test]
+fn review_result_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("review-result");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+    advance(&mut repository, &mut task, TaskState::Reviewing, 180);
+
+    assert_eq!(
+        repository.get_task_review_result(task.id()).expect(
+            "get_task_review_result must reach the real repository, not the trait's \
+                 OperationFailed default"
+        ),
+        None,
+        "no review result has been recorded yet"
+    );
+
+    let expected_version = task.version();
+    let previous_state = task.state();
+    task.transition_to(TaskState::AwaitingUserDiffApproval, 190)
+        .expect("Reviewing -> AwaitingUserDiffApproval is a valid domain transition");
+    let result_transition = transition_record(&task, previous_state, 190);
+    let result = TaskReviewResultRecord {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Review,
+        outcome: ReviewResultOutcome::Completed,
+        exit_code: Some(0),
+        turn_count: Some(4),
+        started_at_ms: 175,
+        completed_at_ms: 190,
+        review_text: Some("masked review text".to_owned()),
+    };
+    repository
+        .save_review_result(expected_version, &task, &result_transition, &result, false)
+        .expect(
+            "save_review_result must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+
+    let stored = repository
+        .get_task_review_result(task.id())
+        .expect("get_task_review_result after save must reach the real repository")
+        .expect("the review result just saved must be persisted and readable back");
+    assert_eq!(stored.outcome, ReviewResultOutcome::Completed);
+    assert_eq!(stored.review_text.as_deref(), Some("masked review text"));
+    assert_eq!(stored.turn_count, Some(4));
+}
+
+#[test]
+fn validation_command_approval_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("validation-command-approval");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+
+    assert_eq!(
+        repository
+            .list_validation_command_approvals(task.id(), task.version())
+            .expect(
+                "list_validation_command_approvals must reach the real repository, not the \
+                 trait's OperationFailed default"
+            ),
+        Vec::new(),
+        "no validation command has been approved yet"
+    );
+
+    let approval = ValidationCommandApprovalRecord {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        kind: ValidationCommandKind::Test,
+        executable: "cargo".to_owned(),
+        arguments: vec!["test".to_owned(), "--workspace".to_owned()],
+        approved_executable_path: "C:/tools/cargo/bin/cargo.exe".to_owned(),
+        executable_volume_serial_hex: "0000000000000002".to_owned(),
+        executable_file_id_hex: "00000000000000000000000000000002".to_owned(),
+        tool_directory_path: "C:/tools/cargo/bin".to_owned(),
+        tool_directory_volume_serial_hex: "0000000000000001".to_owned(),
+        tool_directory_file_id_hex: "00000000000000000000000000000001".to_owned(),
+        approved_cargo_home_path: Some("C:/tools/cargo-home".to_owned()),
+        cargo_home_volume_serial_hex: Some("0000000000000003".to_owned()),
+        cargo_home_file_id_hex: Some("00000000000000000000000000000003".to_owned()),
+        approved_rustup_home_path: Some("C:/tools/rustup-home".to_owned()),
+        rustup_home_volume_serial_hex: Some("0000000000000004".to_owned()),
+        rustup_home_file_id_hex: Some("00000000000000000000000000000004".to_owned()),
+        approved_at_ms: 175,
+    };
+    repository
+        .save_validation_command_approval(&approval)
+        .expect(
+            "save_validation_command_approval must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+
+    let stored = repository
+        .list_validation_command_approvals(task.id(), task.version())
+        .expect("list_validation_command_approvals after save must reach the real repository");
+    assert_eq!(stored, vec![approval]);
+}
+
+#[test]
+fn validation_command_result_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("validation-command-result");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+
+    assert_eq!(
+        repository
+            .list_validation_command_results(task.id(), task.version(), ValidationCommandKind::Test)
+            .expect(
+                "list_validation_command_results must reach the real repository, not the \
+                 trait's OperationFailed default"
+            ),
+        Vec::new(),
+        "no validation command has been run yet"
+    );
+
+    let approval = ValidationCommandApprovalRecord {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        kind: ValidationCommandKind::Test,
+        executable: "cargo".to_owned(),
+        arguments: vec!["test".to_owned(), "--workspace".to_owned()],
+        approved_executable_path: "C:/tools/cargo/bin/cargo.exe".to_owned(),
+        executable_volume_serial_hex: "0000000000000002".to_owned(),
+        executable_file_id_hex: "00000000000000000000000000000002".to_owned(),
+        tool_directory_path: "C:/tools/cargo/bin".to_owned(),
+        tool_directory_volume_serial_hex: "0000000000000001".to_owned(),
+        tool_directory_file_id_hex: "00000000000000000000000000000001".to_owned(),
+        approved_cargo_home_path: None,
+        cargo_home_volume_serial_hex: None,
+        cargo_home_file_id_hex: None,
+        approved_rustup_home_path: None,
+        rustup_home_volume_serial_hex: None,
+        rustup_home_file_id_hex: None,
+        approved_at_ms: 175,
+    };
+    repository
+        .save_validation_command_approval(&approval)
+        .expect("seed the approval this result attempt is bound to");
+
+    let attempt = ValidationCommandResultAttempt {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        kind: ValidationCommandKind::Test,
+        outcome: ValidationCommandResultOutcome::Success,
+        exit_code: Some(0),
+        safe_summary: "cargo test passed".to_owned(),
+        started_at_ms: 180,
+        completed_at_ms: 190,
+    };
+    let appended = repository
+        .append_validation_command_result(&attempt)
+        .expect(
+            "append_validation_command_result must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(appended.attempt_sequence, 1);
+
+    let stored = repository
+        .list_validation_command_results(task.id(), task.version(), ValidationCommandKind::Test)
+        .expect("list_validation_command_results after append must reach the real repository");
+    assert_eq!(stored, vec![appended]);
+}
+
+#[test]
+fn finalize_validation_command_batch_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("validation-command-batch-finalize");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+    let expected_version = task.version();
+
+    let approval = ValidationCommandApprovalRecord {
+        task_id: task.id(),
+        approved_task_version: expected_version,
+        kind: ValidationCommandKind::Test,
+        executable: "cargo".to_owned(),
+        arguments: vec!["test".to_owned(), "--workspace".to_owned()],
+        approved_executable_path: "C:/tools/cargo/bin/cargo.exe".to_owned(),
+        executable_volume_serial_hex: "0000000000000002".to_owned(),
+        executable_file_id_hex: "00000000000000000000000000000002".to_owned(),
+        tool_directory_path: "C:/tools/cargo/bin".to_owned(),
+        tool_directory_volume_serial_hex: "0000000000000001".to_owned(),
+        tool_directory_file_id_hex: "00000000000000000000000000000001".to_owned(),
+        approved_cargo_home_path: None,
+        cargo_home_volume_serial_hex: None,
+        cargo_home_file_id_hex: None,
+        approved_rustup_home_path: None,
+        rustup_home_volume_serial_hex: None,
+        rustup_home_file_id_hex: None,
+        approved_at_ms: 175,
+    };
+    repository
+        .save_validation_command_approval(&approval)
+        .expect("seed the approval this final result attempt is bound to");
+
+    let attempt = ValidationCommandResultAttempt {
+        task_id: task.id(),
+        approved_task_version: expected_version,
+        kind: ValidationCommandKind::Test,
+        outcome: ValidationCommandResultOutcome::Success,
+        exit_code: Some(0),
+        safe_summary: "cargo test passed".to_owned(),
+        started_at_ms: 180,
+        completed_at_ms: 190,
+    };
+    let previous_state = task.state();
+    task.transition_to(TaskState::Reviewing, 200)
+        .expect("Testing -> Reviewing");
+    let record = transition_record(&task, previous_state, 200);
+
+    repository
+        .finalize_validation_command_batch(expected_version, &task, &record, &attempt)
+        .expect(
+            "finalize_validation_command_batch must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+
+    let reloaded = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task exists");
+    assert_eq!(reloaded.state(), TaskState::Reviewing);
+    let stored = repository
+        .list_validation_command_results(task.id(), expected_version, ValidationCommandKind::Test)
+        .expect("list_validation_command_results after finalize must reach the real repository");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].outcome, ValidationCommandResultOutcome::Success);
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active_lease through both wrapper layers")
+            .map(|lease| lease.task_id),
+        Some(task.id()),
+        "Reviewing is not terminal and must keep the lease"
+    );
 }

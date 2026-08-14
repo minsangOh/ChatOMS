@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use chatoms_domain::{ProjectId, Task, TaskId, TaskStateTransition, WorkKind};
+use chatoms_domain::{
+    ProjectId, Task, TaskId, TaskStateTransition, ValidationCommandKind, WorkKind,
+};
 use chatoms_ports::{
     DatabaseBootstrapPort, DatabaseBootstrapState, LoggingBootstrapPort, LoggingBootstrapState,
     error::{CategorizedFailure, FailureCategory, PortFailure},
@@ -14,7 +16,9 @@ use chatoms_ports::{
         ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
         GitOperationReceipt, GitOperationReceiptKind, ProjectFilesystemIdentityRecord,
         ProjectRecord, ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError,
-        RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation, TaskPlanningResultRecord,
+        RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
+        TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
+        ValidationCommandResultAttempt, ValidationCommandResultRecord,
     },
 };
 
@@ -475,6 +479,20 @@ impl FoundationRepository for SharedFoundationRepository {
         self.with_repository(|repository| repository.get_task_planning_result(task_id))
     }
 
+    fn get_task_implementation_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskImplementationResultRecord>, RepositoryError> {
+        self.with_repository(|repository| repository.get_task_implementation_result(task_id))
+    }
+
+    fn get_task_review_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskReviewResultRecord>, RepositoryError> {
+        self.with_repository(|repository| repository.get_task_review_result(task_id))
+    }
+
     fn get_provider_consent(
         &mut self,
         task_id: TaskId,
@@ -499,6 +517,29 @@ impl FoundationRepository for SharedFoundationRepository {
         })
     }
 
+    fn save_implementation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        consent: Option<&ProviderConsent>,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_implementation_transition(expected_version, task, transition, consent)
+        })
+    }
+
+    fn save_review_consent(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        consented_at_ms: i64,
+    ) -> Result<ProviderConsent, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_review_consent(expected_version, task_id, consented_at_ms)
+        })
+    }
+
     fn save_planning_result(
         &mut self,
         expected_version: u64,
@@ -509,6 +550,83 @@ impl FoundationRepository for SharedFoundationRepository {
     ) -> Result<(), RepositoryError> {
         self.with_repository(|repository| {
             repository.save_planning_result(expected_version, task, transition, result, terminal)
+        })
+    }
+
+    fn save_implementation_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskImplementationResultRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_implementation_result(expected_version, task, transition, result)
+        })
+    }
+
+    fn save_review_result(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        result: &TaskReviewResultRecord,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_review_result(expected_version, task, transition, result, terminal)
+        })
+    }
+
+    fn save_validation_command_approval(
+        &mut self,
+        approval: &ValidationCommandApprovalRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| repository.save_validation_command_approval(approval))
+    }
+
+    fn list_validation_command_approvals(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.list_validation_command_approvals(task_id, approved_task_version)
+        })
+    }
+
+    fn append_validation_command_result(
+        &mut self,
+        attempt: &ValidationCommandResultAttempt,
+    ) -> Result<ValidationCommandResultRecord, RepositoryError> {
+        self.with_repository(|repository| repository.append_validation_command_result(attempt))
+    }
+
+    fn list_validation_command_results(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        kind: ValidationCommandKind,
+    ) -> Result<Vec<ValidationCommandResultRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.list_validation_command_results(task_id, approved_task_version, kind)
+        })
+    }
+
+    fn finalize_validation_command_batch(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        attempt: &ValidationCommandResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.finalize_validation_command_batch(
+                expected_version,
+                task,
+                transition,
+                attempt,
+            )
         })
     }
 

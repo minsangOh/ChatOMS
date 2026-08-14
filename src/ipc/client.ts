@@ -2,11 +2,23 @@ import { invoke } from "@tauri-apps/api/core";
 import { FrontendError, isRecord, toFrontendError } from "./errors";
 import { isNullablePlanningResultDto } from "./planning_result";
 import { isProviderEligibilityDtoArray } from "./provider_eligibility";
+import { isCancelReviewDto, isNullableReviewResultDto } from "./review_result";
+import {
+  isApproveValidationCommandResultDto,
+  isCancelTestingDto,
+  isValidationCommandApprovalStatusDto,
+  isValidationCommandCandidateDtoArray,
+} from "./validation_command";
 import type {
   ActiveTaskDto,
   ActiveTaskStatusDto,
+  ApproveValidationCommandInput,
+  ApproveValidationCommandResultDto,
   BootstrapStatusDto,
+  CancelImplementationDto,
   CancelPlanningDto,
+  CancelReviewDto,
+  CancelTestingDto,
   CapabilityDto,
   DatabaseStatus,
   HealthDto,
@@ -20,6 +32,7 @@ import type {
   ProjectStatusDto,
   RefreshClaudeCapabilityDto,
   RefreshOutcome,
+  ReviewResultDto,
   SetClaudeExecutablePathDto,
   TaskIsolationDto,
   StorageStatus,
@@ -29,6 +42,8 @@ import type {
   TaskDto,
   TaskState,
   TaskTransitionDto,
+  ValidationCommandApprovalStatusDto,
+  ValidationCommandCandidateDto,
   VersionDto,
 } from "./types";
 
@@ -55,6 +70,16 @@ export const IPC_COMMANDS = {
   startClaudePlanning: "start_claude_planning",
   cancelClaudePlanning: "cancel_claude_planning",
   getPlanningResult: "get_planning_result",
+  startClaudeImplementation: "start_claude_implementation",
+  cancelClaudeImplementation: "cancel_claude_implementation",
+  startValidationTesting: "start_validation_testing",
+  cancelValidationTesting: "cancel_validation_testing",
+  getValidationCommandCandidates: "get_validation_command_candidates",
+  getValidationCommandApprovalStatus: "get_validation_command_approval_status",
+  approveValidationCommand: "approve_validation_command",
+  startClaudeReview: "start_claude_review",
+  cancelClaudeReview: "cancel_claude_review",
+  getReviewResult: "get_review_result",
 } as const;
 
 export type InvokeTransport = (
@@ -85,6 +110,20 @@ export interface IpcClient {
   startClaudePlanning(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudePlanning(taskId: string): Promise<CancelPlanningDto>;
   getPlanningResult(taskId: string): Promise<PlanningResultDto | null>;
+  startClaudeImplementation(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  cancelClaudeImplementation(taskId: string): Promise<CancelImplementationDto>;
+  getValidationCommandCandidates(taskId: string): Promise<readonly ValidationCommandCandidateDto[]>;
+  getValidationCommandApprovalStatus(taskId: string): Promise<ValidationCommandApprovalStatusDto>;
+  approveValidationCommand(
+    taskId: string,
+    expectedVersion: number,
+    input: ApproveValidationCommandInput,
+  ): Promise<ApproveValidationCommandResultDto>;
+  startValidationTesting(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  cancelValidationTesting(taskId: string): Promise<CancelTestingDto>;
+  startClaudeReview(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  cancelClaudeReview(taskId: string): Promise<CancelReviewDto>;
+  getReviewResult(taskId: string): Promise<ReviewResultDto | null>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -147,6 +186,36 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
       request(IPC_COMMANDS.cancelClaudePlanning, isCancelPlanningDto, { taskId }),
     getPlanningResult: (taskId) =>
       request(IPC_COMMANDS.getPlanningResult, isNullablePlanningResultDto, { taskId }),
+    startClaudeImplementation: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudeImplementation, isTaskDto, { taskId, expectedVersion }),
+    cancelClaudeImplementation: (taskId) =>
+      request(IPC_COMMANDS.cancelClaudeImplementation, isCancelImplementationDto, { taskId }),
+    getValidationCommandCandidates: (taskId) =>
+      request(IPC_COMMANDS.getValidationCommandCandidates, isValidationCommandCandidateDtoArray, {
+        taskId,
+      }),
+    getValidationCommandApprovalStatus: (taskId) =>
+      request(
+        IPC_COMMANDS.getValidationCommandApprovalStatus,
+        isValidationCommandApprovalStatusDto,
+        { taskId },
+      ),
+    approveValidationCommand: (taskId, expectedVersion, input) =>
+      request(IPC_COMMANDS.approveValidationCommand, isApproveValidationCommandResultDto, {
+        taskId,
+        expectedVersion,
+        input,
+      }),
+    startValidationTesting: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startValidationTesting, isTaskDto, { taskId, expectedVersion }),
+    cancelValidationTesting: (taskId) =>
+      request(IPC_COMMANDS.cancelValidationTesting, isCancelTestingDto, { taskId }),
+    startClaudeReview: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudeReview, isTaskDto, { taskId, expectedVersion }),
+    cancelClaudeReview: (taskId) =>
+      request(IPC_COMMANDS.cancelClaudeReview, isCancelReviewDto, { taskId }),
+    getReviewResult: (taskId) =>
+      request(IPC_COMMANDS.getReviewResult, isNullableReviewResultDto, { taskId }),
   };
 }
 
@@ -356,6 +425,10 @@ function isSetClaudeExecutablePathDto(
 }
 
 function isCancelPlanningDto(value: unknown): value is CancelPlanningDto {
+  return isRecord(value) && typeof value.requested === "boolean";
+}
+
+function isCancelImplementationDto(value: unknown): value is CancelImplementationDto {
   return isRecord(value) && typeof value.requested === "boolean";
 }
 

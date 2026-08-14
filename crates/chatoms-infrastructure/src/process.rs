@@ -94,7 +94,28 @@ impl StreamingProcessRunner for StdProcessRunner {
         let mut command = Command::new(&spec.executable);
         command
             .args(&spec.arguments)
-            .current_dir(&spec.working_directory)
+            .current_dir(&spec.working_directory);
+        if let Some(vars) = &spec.environment {
+            // A stricter contract than the default: no inherited parent
+            // variable may reach the child, only exactly what the caller
+            // listed. Used by validation command execution's controlled
+            // PATH/CARGO_HOME/RUSTUP_HOME environment.
+            command.env_clear();
+            for (key, value) in vars {
+                command.env(key, value);
+            }
+        } else {
+            // Never let this inherited parent-process environment variable
+            // opt a `--add-dir` directory (a task worktree, for Claude
+            // Planning/Implementation) into loading its CLAUDE.md — that
+            // additional-directory content is untrusted, and CWD isolation
+            // alone does not gate it. Removed unconditionally, not just for
+            // Claude callers, since no current or planned caller of this
+            // shared runner ever wants worktree content auto-loaded as
+            // trusted instructions.
+            command.env_remove("CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD");
+        }
+        command
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {

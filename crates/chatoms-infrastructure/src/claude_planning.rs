@@ -34,6 +34,31 @@
 //!   schema parser and [`crate::redaction::SecretRedactor`]. The masked,
 //!   size-capped result string that comes back out is the only content
 //!   [`ClaudePlanningResult`] ever carries.
+//!
+//! Unit 4e-8b brought Planning's argv hardening and stdin bound up to the
+//! same level already approved for Claude Implementation/Review (confirmed
+//! against the same official Claude Code CLI docs those adapters cite:
+//! code.claude.com/docs/en/{permission-modes,cli-reference,headless,permissions}):
+//!
+//! * `--strict-mcp-config` passed with no `--mcp-config` value restricts the
+//!   session to the (empty) server set `--mcp-config` would have supplied
+//!   and ignores every other MCP source, so no MCP server loads — closing
+//!   off a spawn side-effect that existed independently of the `--tools`
+//!   allowlist.
+//! * `--setting-sources project,local` (omitting `user`) stops
+//!   `~/.claude/settings.json` — including any hooks it defines — from
+//!   loading. Hooks run on session events, not on tool use, so they were
+//!   never gated by `--tools Read,Glob,Grep` in the first place. Project/
+//!   local sources are harmless here because the CWD is an app-owned
+//!   preflight directory with no `.claude/` folder of its own. Managed
+//!   (org-deployed) settings are not gated by this flag at all and can
+//!   still apply; that residual is the same "회사 장비 정책 우선" principle
+//!   `docs/SECURITY_POLICY.md` already accepts elsewhere, not a new gap.
+//! * `--disable-slash-commands` additionally disables skills and custom
+//!   commands for the session, closing one more customization surface.
+//! * [`MAX_STDIN_BYTES`] bounds the composed stdin payload; exceeding it is
+//!   a typed [`ClaudePlanningStartOutcome::StdinTooLarge`] fail-closed
+//!   result checked before any spawn, never a truncated send.
 
 use std::{
     ffi::OsString,
@@ -62,6 +87,11 @@ const ALLOWED_TOOLS: &str = "Read,Glob,Grep";
 /// this adapter counting turns after the fact.
 const MAX_TURNS: &str = "12";
 
+/// `user` is deliberately omitted so `~/.claude/settings.json` (and any
+/// hooks it defines) never loads — see the module doc for why hooks are not
+/// already covered by the `--tools` allowlist.
+const SETTING_SOURCES: &str = "project,local";
+
 /// Fixed, non-parameterized instruction: the only positional prompt text
 /// sent to the CLI. It never contains task-specific or user-supplied
 /// content — the actual `TaskBrief` fields travel exclusively through
@@ -77,6 +107,17 @@ const FIXED_INSTRUCTION: &str = "Follow the requirements, completion criteria, a
 /// A read-only plan response is text; a few hundred KiB is already
 /// generous for that, so this leaves headroom without being unbounded.
 const MAX_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Bound on the total stdin payload this adapter will ever send. Checked
+/// before a spawn is attempted: exceeding it is a
+/// [`ClaudePlanningStartOutcome::StdinTooLarge`] fail-closed result, never a
+/// truncated send. Planning's stdin carries only the three
+/// [`chatoms_domain::TaskBrief`] fields (unlike Claude Implementation's
+/// stdin, which also carries a stored plan of up to 100,000 bytes), so this
+/// is set well below [`crate::claude_implementation`]'s 512 KiB cap while
+/// still leaving generous headroom for realistic `TaskBrief` field lengths,
+/// and far under the CLI's own 10 MiB piped-stdin cap.
+const MAX_STDIN_BYTES: usize = 256 * 1024;
 
 /// The three fixed [`chatoms_domain::TaskBrief`] fields, borrowed rather
 /// than owned so callers do not need to clone brief text just to start a
@@ -97,11 +138,13 @@ pub trait ClaudePlanningObserver {
 
 /// Result of attempting to start a Claude Planning invocation.
 /// `PreflightRejected` means the fresh trust/compatibility/login/preflight
-/// gate failed immediately before spawn, so no subprocess was started.
+/// gate failed immediately before spawn. `StdinTooLarge` means the composed
+/// stdin payload exceeded [`MAX_STDIN_BYTES`]. Neither starts a subprocess.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaudePlanningStartOutcome {
     Completed(ClaudePlanningResult),
     PreflightRejected,
+    StdinTooLarge,
 }
 
 /// A Claude Planning attempt reduced to the safe, Task-state-machine-ready
@@ -174,12 +217,17 @@ where
             return Ok(ClaudePlanningStartOutcome::PreflightRejected);
         }
 
+        let stdin = format_stdin(&brief);
+        if stdin.len() > MAX_STDIN_BYTES {
+            return Ok(ClaudePlanningStartOutcome::StdinTooLarge);
+        }
+
         let spec = ProcessSpec {
             executable: self.claude_executable.clone(),
             arguments: planning_arguments(worktree),
             working_directory: self.preflight_dir.clone(),
+            environment: None,
         };
-        let stdin = format_stdin(&brief);
         let mut relay = ResultCapturingRelay {
             inner: observer,
             buffer: Vec::new(),
@@ -238,6 +286,13 @@ where
     C: ProviderCapabilityPort,
     S: StreamingProcessRunner,
 {
+    /// Maps this adapter's three-way [`ClaudePlanningStartOutcome`] onto the
+    /// port's two-way
+    /// [`chatoms_ports::planning::PlanningExecutionStartOutcome`]:
+    /// `StdinTooLarge` folds into `PreflightRejected` because both mean "no
+    /// subprocess was started" and an application-layer orchestrator treats
+    /// them identically (fail-closed to `RecoveryRequired`), mirroring
+    /// [`crate::claude_implementation`]'s identical fold.
     fn start_planning(
         &mut self,
         worktree: &Path,
@@ -257,7 +312,8 @@ where
             cancellation,
             &mut observer,
         )? {
-            ClaudePlanningStartOutcome::PreflightRejected => {
+            ClaudePlanningStartOutcome::PreflightRejected
+            | ClaudePlanningStartOutcome::StdinTooLarge => {
                 Ok(chatoms_ports::planning::PlanningExecutionStartOutcome::PreflightRejected)
             }
             ClaudePlanningStartOutcome::Completed(result) => Ok(
@@ -287,6 +343,10 @@ fn planning_arguments(worktree: &Path) -> Vec<OsString> {
         worktree.as_os_str().to_owned(),
         OsString::from("--max-turns"),
         OsString::from(MAX_TURNS),
+        OsString::from("--strict-mcp-config"),
+        OsString::from("--setting-sources"),
+        OsString::from(SETTING_SOURCES),
+        OsString::from("--disable-slash-commands"),
         OsString::from(FIXED_INSTRUCTION),
     ]
 }
@@ -562,6 +622,9 @@ mod tests {
             ClaudePlanningStartOutcome::PreflightRejected => {
                 panic!("expected a completed run, got PreflightRejected")
             }
+            ClaudePlanningStartOutcome::StdinTooLarge => {
+                panic!("expected a completed run, got StdinTooLarge")
+            }
         }
     }
 
@@ -607,6 +670,10 @@ mod tests {
                 OsString::from("C:/managed/task-worktree"),
                 OsString::from("--max-turns"),
                 OsString::from("12"),
+                OsString::from("--strict-mcp-config"),
+                OsString::from("--setting-sources"),
+                OsString::from("project,local"),
+                OsString::from("--disable-slash-commands"),
                 OsString::from(FIXED_INSTRUCTION),
             ]
         );
@@ -994,6 +1061,66 @@ mod tests {
     }
 
     #[test]
+    fn oversized_stdin_is_rejected_before_any_spawn() {
+        let oversized_requirements = "a".repeat(MAX_STDIN_BYTES);
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(FakeCapabilityPort::supported(), streaming);
+        let oversized_brief = PlanningBrief {
+            requirements: &oversized_requirements,
+            completion_criteria: "c",
+            prohibited_scope: "p",
+        };
+
+        let outcome = adapter
+            .start_planning(
+                Path::new("C:/managed/task-worktree"),
+                oversized_brief,
+                &never_cancelled(),
+                &mut SpyObserver::default(),
+            )
+            .expect("typed fail-closed result, not an error");
+
+        assert_eq!(outcome, ClaudePlanningStartOutcome::StdinTooLarge);
+        assert!(
+            observed.lock().expect("observed lock").is_empty(),
+            "no subprocess may be started when stdin exceeds the cap"
+        );
+    }
+
+    #[test]
+    fn stdin_at_or_under_the_cap_is_accepted() {
+        let requirements_within_cap = "a".repeat(MAX_STDIN_BYTES / 4);
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            emit_stdout: Some(success_json("plan", 1)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(FakeCapabilityPort::supported(), streaming);
+        let within_cap_brief = PlanningBrief {
+            requirements: &requirements_within_cap,
+            completion_criteria: "c",
+            prohibited_scope: "p",
+        };
+
+        let outcome = adapter
+            .start_planning(
+                Path::new("C:/managed/task-worktree"),
+                within_cap_brief,
+                &never_cancelled(),
+                &mut SpyObserver::default(),
+            )
+            .expect("start planning");
+
+        assert!(matches!(outcome, ClaudePlanningStartOutcome::Completed(_)));
+        assert_eq!(observed.lock().expect("observed lock").len(), 1);
+    }
+
+    #[test]
     fn run_streaming_failure_after_passed_preflight_still_surfaces_as_an_error() {
         let mut adapter = make_adapter(
             FakeCapabilityPort::supported(),
@@ -1074,5 +1201,37 @@ mod tests {
         .expect("typed fail-closed result, not an error");
 
         assert_eq!(outcome, PlanningExecutionStartOutcome::PreflightRejected);
+    }
+
+    #[test]
+    fn claude_planning_executor_port_impl_folds_stdin_too_large_into_preflight_rejected() {
+        use chatoms_ports::planning::{
+            ClaudePlanningExecutor, PlanningExecutionBrief, PlanningExecutionStartOutcome,
+        };
+
+        let oversized_requirements = "a".repeat(MAX_STDIN_BYTES);
+        let mut adapter = make_adapter(
+            FakeCapabilityPort::supported(),
+            FakeStreamingRunner::default(),
+        );
+        let cancellation = never_cancelled();
+
+        let outcome = ClaudePlanningExecutor::start_planning(
+            &mut adapter,
+            Path::new("C:/managed/task-worktree"),
+            PlanningExecutionBrief {
+                requirements: &oversized_requirements,
+                completion_criteria: "c",
+                prohibited_scope: "p",
+            },
+            &cancellation,
+        )
+        .expect("typed fail-closed result, not an error");
+
+        assert_eq!(
+            outcome,
+            PlanningExecutionStartOutcome::PreflightRejected,
+            "StdinTooLarge must fold into PreflightRejected at the port boundary, matching Implementation"
+        );
     }
 }

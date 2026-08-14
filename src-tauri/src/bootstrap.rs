@@ -40,9 +40,10 @@ use chatoms_ports::{
 };
 
 use crate::state::{
-    AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle, ManagedRuntime,
-    PlanningRunRegistry, ProviderCapabilityHandle, RepositoryHandle, RuntimePorts,
-    RuntimeResources, TimeProviderHandle, WorktreePathHandle,
+    AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle,
+    ImplementationRunRegistry, ManagedRuntime, PlanningRunRegistry, ProviderCapabilityHandle,
+    RepositoryHandle, ReviewRunRegistry, RuntimePorts, RuntimeResources, TestingRunRegistry,
+    TimeProviderHandle, WorktreePathHandle,
 };
 
 pub fn compose_runtime<S, D, L, R, T, C>(
@@ -110,6 +111,21 @@ where
             {
                 return ManagedRuntime::unavailable(error, Some(status));
             }
+            if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_implementation()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
+            if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_testing()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
+            if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_reviewing()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
             let preflight_dir = prepare_preflight_directory();
             ManagedRuntime::ready(AppRuntime::new(
                 status,
@@ -123,6 +139,9 @@ where
                     provider_capabilities: ProviderCapabilityHandle::new(),
                     preflight_dir,
                     planning_runs: PlanningRunRegistry::new(),
+                    implementation_runs: ImplementationRunRegistry::new(),
+                    testing_runs: TestingRunRegistry::new(),
+                    review_runs: ReviewRunRegistry::new(),
                 },
                 resources,
             ))
@@ -675,7 +694,10 @@ mod tests {
         ));
         assert_eq!(
             calls,
-            ["storage", "database", "logging", "lease", "lease", "lease"]
+            [
+                "storage", "database", "logging", "lease", "lease", "lease", "lease", "lease",
+                "lease"
+            ]
         );
 
         let (runtime, calls) = compose(
@@ -693,7 +715,10 @@ mod tests {
         );
         assert_eq!(
             calls,
-            ["storage", "database", "logging", "lease", "lease", "lease"]
+            [
+                "storage", "database", "logging", "lease", "lease", "lease", "lease", "lease",
+                "lease"
+            ]
         );
     }
 

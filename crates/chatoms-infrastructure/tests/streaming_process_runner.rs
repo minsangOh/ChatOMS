@@ -20,6 +20,7 @@ fn shell_spec(script: &str) -> ProcessSpec {
         executable: PathBuf::from("cmd.exe"),
         arguments: vec!["/C".into(), script.into()],
         working_directory: current_directory(),
+        environment: None,
     }
 }
 
@@ -29,6 +30,7 @@ fn shell_spec(script: &str) -> ProcessSpec {
         executable: PathBuf::from("/bin/sh"),
         arguments: vec!["-c".into(), script.into()],
         working_directory: current_directory(),
+        environment: None,
     }
 }
 
@@ -59,6 +61,7 @@ fn script_file_spec(path: &Path) -> ProcessSpec {
         executable: PathBuf::from("cmd.exe"),
         arguments: vec!["/C".into(), path.as_os_str().to_owned()],
         working_directory: current_directory(),
+        environment: None,
     }
 }
 
@@ -68,6 +71,7 @@ fn script_file_spec(path: &Path) -> ProcessSpec {
         executable: PathBuf::from("/bin/sh"),
         arguments: vec![path.as_os_str().to_owned()],
         working_directory: current_directory(),
+        environment: None,
     }
 }
 
@@ -142,6 +146,7 @@ fn missing_executable_is_a_safe_unsupported_failure() {
         executable: PathBuf::from("chatoms-streaming-runner-nonexistent-executable"),
         arguments: vec![],
         working_directory: current_directory(),
+        environment: None,
     };
     let mut runner = StdProcessRunner::new();
     let mut observer = RecordingObserver::default();
@@ -261,12 +266,14 @@ fn malformed_utf8_stdout_bytes_pass_through_unmodified_without_panicking() {
             executable: PathBuf::from("cmd.exe"),
             arguments: vec!["/C".into(), "type".into(), byte_path.as_os_str().to_owned()],
             working_directory: current_directory(),
+            environment: None,
         }
     } else {
         ProcessSpec {
             executable: PathBuf::from("cat"),
             arguments: vec![byte_path.as_os_str().to_owned()],
             working_directory: current_directory(),
+            environment: None,
         }
     };
     let mut runner = StdProcessRunner::new();
@@ -498,6 +505,93 @@ fn cancel_racing_with_natural_exit_reports_the_actual_outcome() {
     cancellation.cancel();
     assert_eq!(completion.outcome, StreamingOutcome::Completed);
     assert_eq!(completion.exit_code, Some(0));
+}
+
+#[cfg(windows)]
+fn print_env_var_script(name: &str) -> String {
+    format!("echo %{name}%")
+}
+
+#[cfg(not(windows))]
+fn print_env_var_script(name: &str) -> String {
+    format!("echo ${name}")
+}
+
+#[cfg(windows)]
+fn print_two_env_vars_script(first: &str, second: &str) -> String {
+    format!(
+        "{} & {}",
+        print_env_var_script(first),
+        print_env_var_script(second)
+    )
+}
+
+#[cfg(not(windows))]
+fn print_two_env_vars_script(first: &str, second: &str) -> String {
+    format!(
+        "{}; {}",
+        print_env_var_script(first),
+        print_env_var_script(second)
+    )
+}
+
+#[test]
+fn spec_environment_none_still_inherits_the_parent_environment() {
+    let marker_name = "CHATOMS_STREAMING_RUNNER_ENV_TEST_MARKER";
+    // No other test in this file reads or writes an environment variable, so
+    // this set/remove pair around a single synchronous spawn below cannot
+    // race with anything else in this test binary.
+    unsafe {
+        std::env::set_var(marker_name, "inherited-value");
+    }
+    let spec = shell_spec(&print_env_var_script(marker_name));
+    let mut runner = StdProcessRunner::new();
+    let mut observer = RecordingObserver::default();
+
+    let completion = runner
+        .run_streaming(&spec, None, 1024, &never_cancelled(), &mut observer)
+        .expect("echo succeeds");
+
+    assert_eq!(completion.outcome, StreamingOutcome::Completed);
+    let stdout = String::from_utf8_lossy(&observer.stdout()).into_owned();
+    assert!(
+        stdout.contains("inherited-value"),
+        "spec.environment == None must keep inheriting the parent environment, got: {stdout:?}"
+    );
+    unsafe {
+        std::env::remove_var(marker_name);
+    }
+}
+
+#[test]
+fn spec_environment_some_clears_everything_not_explicitly_listed() {
+    let marker_name = "CHATOMS_STREAMING_RUNNER_ENV_TEST_MARKER_CLEARED";
+    unsafe {
+        std::env::set_var(marker_name, "must-not-be-inherited");
+    }
+    let allowed_name = "CHATOMS_STREAMING_RUNNER_ENV_TEST_ALLOWED";
+    let mut spec = shell_spec(&print_two_env_vars_script(marker_name, allowed_name));
+    spec.environment = Some(vec![(allowed_name.into(), "explicitly-set".into())]);
+    let mut runner = StdProcessRunner::new();
+    let mut observer = RecordingObserver::default();
+
+    let completion = runner
+        .run_streaming(&spec, None, 1024, &never_cancelled(), &mut observer)
+        .expect("echo succeeds");
+
+    assert_eq!(completion.outcome, StreamingOutcome::Completed);
+    let stdout = String::from_utf8_lossy(&observer.stdout()).into_owned();
+    assert!(
+        !stdout.contains("must-not-be-inherited"),
+        "an env_clear'd child must not inherit any parent variable, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("explicitly-set"),
+        "a variable explicitly listed in spec.environment must reach the child, got: {stdout:?}"
+    );
+    unsafe {
+        std::env::remove_var(marker_name);
+    }
 }
 
 #[test]

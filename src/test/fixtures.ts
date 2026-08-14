@@ -70,6 +70,16 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
     startClaudePlanning: async () => { throw new Error("not implemented in frontend tests"); },
     cancelClaudePlanning: async () => { throw new Error("not implemented in frontend tests"); },
     getPlanningResult: async () => null,
+    startClaudeImplementation: async () => { throw new Error("not implemented in frontend tests"); },
+    cancelClaudeImplementation: async () => { throw new Error("not implemented in frontend tests"); },
+    getValidationCommandCandidates: async () => [],
+    getValidationCommandApprovalStatus: async () => ({ approvedKinds: [] }),
+    approveValidationCommand: async () => { throw new Error("not implemented in frontend tests"); },
+    startValidationTesting: async () => { throw new Error("not implemented in frontend tests"); },
+    cancelValidationTesting: async () => { throw new Error("not implemented in frontend tests"); },
+    startClaudeReview: async () => { throw new Error("not implemented in frontend tests"); },
+    cancelClaudeReview: async () => { throw new Error("not implemented in frontend tests"); },
+    getReviewResult: async () => null,
     ...overrides,
   };
 }

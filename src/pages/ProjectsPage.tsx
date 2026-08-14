@@ -6,7 +6,7 @@ import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
 import type { IpcClient } from "../ipc/client";
 import { FrontendError, toFrontendError } from "../ipc/errors";
-import type { EligibilityBlockingReason, PlanningResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, TaskBriefInput, TaskIsolationDto } from "../ipc/types";
+import type { ApproveValidationCommandInput, EligibilityBlockingReason, PlanningResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, ReviewResultDto, TaskBriefInput, TaskIsolationDto, ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKind } from "../ipc/types";
 
 interface ProjectsPageProps { client: IpcClient; }
 type ProjectsPageState = { kind: "loading" } | { kind: "error"; error: FrontendError } | { kind: "ready"; projects: ProjectDto[] };
@@ -15,6 +15,30 @@ type PlanningResultLoadState =
   | { kind: "loading" }
   | { kind: "ready"; result: PlanningResultDto | null }
   | { kind: "error" };
+type ReviewResultLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; result: ReviewResultDto | null }
+  | { kind: "error" };
+type ValidationCandidatesLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; candidates: readonly ValidationCommandCandidateDto[] }
+  | { kind: "error" };
+type ValidationApprovalLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; status: ValidationCommandApprovalStatusDto }
+  | { kind: "error" };
+interface ValidationCommandForm {
+  executablePath: string;
+  cargoHomePath: string;
+  rustupHomePath: string;
+  selectedKinds: readonly ValidationCommandKind[];
+}
+const emptyValidationCommandForm: ValidationCommandForm = {
+  executablePath: "",
+  cargoHomePath: "",
+  rustupHomePath: "",
+  selectedKinds: [],
+};
 
 export function ProjectsPage({ client }: ProjectsPageProps) {
   const [requestId, setRequestId] = useState(0);
@@ -30,8 +54,14 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [briefForm, setBriefForm] = useState<TaskBriefForm>({ requirements: "", completionCriteria: "", prohibitedScope: "" });
   const [briefError, setBriefError] = useState<string | null>(null);
   const [eligibilities, setEligibilities] = useState<Record<string, readonly ProviderEligibilityDto[]>>({});
-  const [consentDialog, setConsentDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
+  const [consentDialog, setConsentDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; workKind: "planning" | "implementation" | "review" } | null>(null);
   const [planningResults, setPlanningResults] = useState<Record<string, PlanningResultLoadState>>({});
+  const [reviewResults, setReviewResults] = useState<Record<string, ReviewResultLoadState>>({});
+  const [validationCandidates, setValidationCandidates] = useState<Record<string, ValidationCandidatesLoadState>>({});
+  const [validationApprovals, setValidationApprovals] = useState<Record<string, ValidationApprovalLoadState>>({});
+  const [validationForm, setValidationForm] = useState<ValidationCommandForm>(emptyValidationCommandForm);
+  const [testingRuns, setTestingRuns] = useState<Record<string, boolean>>({});
+  const [reviewRuns, setReviewRuns] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     let active = true;
@@ -60,7 +90,9 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
 
   useEffect(() => {
     const pending = Object.values(isolations).filter(
-      (isolation) => isolation.taskState === "worktreeReady" && eligibilities[isolation.taskId] === undefined,
+      (isolation) =>
+        (isolation.taskState === "worktreeReady" || isolation.taskState === "awaitingDesignApproval" || isolation.taskState === "reviewing") &&
+        eligibilities[isolation.taskId] === undefined,
     );
     if (pending.length === 0) return;
     let active = true;
@@ -98,11 +130,89 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   }, [client, isolations, planningResults]);
 
   useEffect(() => {
-    const planningEntries = Object.entries(isolations).filter(([, isolation]) => isolation.taskState === "planning");
-    if (planningEntries.length === 0) return;
+    const pending = Object.values(isolations).filter(
+      (isolation) => isolation.taskState === "awaitingUserDiffApproval" && reviewResults[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setReviewResults((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const result = await client.getReviewResult(isolation.taskId);
+          if (active) setReviewResults((current) => ({ ...current, [isolation.taskId]: { kind: "ready", result } }));
+        } catch {
+          if (active) setReviewResults((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, reviewResults]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) => isolation.taskState === "testing" && validationCandidates[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setValidationCandidates((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const candidates = await client.getValidationCommandCandidates(isolation.taskId);
+          if (active) setValidationCandidates((current) => ({ ...current, [isolation.taskId]: { kind: "ready", candidates } }));
+        } catch {
+          if (active) setValidationCandidates((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, validationCandidates]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) => isolation.taskState === "testing" && validationApprovals[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setValidationApprovals((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getValidationCommandApprovalStatus(isolation.taskId);
+          if (active) setValidationApprovals((current) => ({ ...current, [isolation.taskId]: { kind: "ready", status } }));
+        } catch {
+          if (active) setValidationApprovals((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, validationApprovals]);
+
+  useEffect(() => {
+    setValidationForm(emptyValidationCommandForm);
+  }, [activeTaskId]);
+
+  useEffect(() => {
+    const activeExecutionEntries = Object.entries(isolations).filter(
+      ([, isolation]) => isolation.taskState === "planning" || isolation.taskState === "implementing" || isolation.taskState === "testing" || isolation.taskState === "reviewing",
+    );
+    if (activeExecutionEntries.length === 0) return;
     const interval = setInterval(() => {
       void Promise.all(
-        planningEntries.map(async ([projectId, isolation]) => {
+        activeExecutionEntries.map(async ([projectId, isolation]) => {
           const next = await client.getTaskIsolation(isolation.taskId);
           setIsolations((current) => ({ ...current, [projectId]: next }));
         }),
@@ -169,17 +279,24 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
     const next = await client.createTaskWorktree(isolation.taskId, isolation.taskVersion);
     setIsolations((current) => ({ ...current, [projectId]: next }));
   });
-  const startPlanning = async () => {
+  const startWork = async () => {
     if (!consentDialog) return;
     const dialog = consentDialog;
     await run(async () => {
-      const result = await client.startClaudePlanning(dialog.taskId, dialog.taskVersion);
+      const result = dialog.workKind === "planning"
+        ? await client.startClaudePlanning(dialog.taskId, dialog.taskVersion)
+        : dialog.workKind === "implementation"
+        ? await client.startClaudeImplementation(dialog.taskId, dialog.taskVersion)
+        : await client.startClaudeReview(dialog.taskId, dialog.taskVersion);
       setConsentDialog(null);
       setIsolations((current) => {
         const existing = current[dialog.projectId];
         if (!existing) return current;
         return { ...current, [dialog.projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
       });
+      if (dialog.workKind === "review") {
+        setReviewRuns((current) => ({ ...current, [dialog.taskId]: true }));
+      }
     });
   };
   const cancelPlanning = async (taskId: string) => run(async () => {
@@ -188,6 +305,69 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       throw new FrontendError({
         code: "PLANNING_RUN_NOT_FOUND",
         message: "No active Claude Planning execution was found for this task. Refresh to check its current status.",
+        severity: "error",
+        retry: "afterStateRefresh",
+      });
+    }
+  });
+  const cancelImplementation = async (taskId: string) => run(async () => {
+    const result = await client.cancelClaudeImplementation(taskId);
+    if (!result.requested) {
+      throw new FrontendError({
+        code: "IMPLEMENTATION_RUN_NOT_FOUND",
+        message: "No active Claude Implementation execution was found for this task. Refresh to check its current status.",
+        severity: "error",
+        retry: "afterStateRefresh",
+      });
+    }
+  });
+  const cancelReview = async (taskId: string) => run(async () => {
+    const result = await client.cancelClaudeReview(taskId);
+    if (!result.requested) {
+      throw new FrontendError({
+        code: "REVIEW_RUN_NOT_FOUND",
+        message: "No active Claude Review execution was found for this task. Refresh to check its current status.",
+        severity: "error",
+        retry: "afterStateRefresh",
+      });
+    }
+  });
+  const toggleValidationCommandKind = (kind: ValidationCommandKind, checked: boolean) => {
+    setValidationForm((current) => ({
+      ...current,
+      selectedKinds: checked
+        ? [...current.selectedKinds, kind]
+        : current.selectedKinds.filter((selected) => selected !== kind),
+    }));
+  };
+  const approveValidationCommands = async (taskId: string, expectedVersion: number) => {
+    const input: ApproveValidationCommandInput = {
+      kinds: validationForm.selectedKinds,
+      executablePath: validationForm.executablePath,
+      cargoHomePath: validationForm.cargoHomePath.trim() === "" ? null : validationForm.cargoHomePath,
+      rustupHomePath: validationForm.rustupHomePath.trim() === "" ? null : validationForm.rustupHomePath,
+    };
+    await run(async () => {
+      try {
+        const result = await client.approveValidationCommand(taskId, expectedVersion, input);
+        setValidationApprovals((current) => ({ ...current, [taskId]: { kind: "ready", status: result } }));
+        setValidationForm(emptyValidationCommandForm);
+      } catch (error) {
+        setValidationForm((current) => ({ ...current, executablePath: "", cargoHomePath: "", rustupHomePath: "" }));
+        throw error;
+      }
+    });
+  };
+  const startValidationTesting = async (taskId: string, expectedVersion: number) => run(async () => {
+    await client.startValidationTesting(taskId, expectedVersion);
+    setTestingRuns((current) => ({ ...current, [taskId]: true }));
+  });
+  const cancelValidationTesting = async (taskId: string) => run(async () => {
+    const result = await client.cancelValidationTesting(taskId);
+    if (!result.requested) {
+      throw new FrontendError({
+        code: "TESTING_RUN_NOT_FOUND",
+        message: "No active validation run was found for this task. Refresh to check its current status.",
         severity: "error",
         retry: "afterStateRefresh",
       });
@@ -219,13 +399,14 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   }
 
   if (consentDialog) {
+    const consentCopy = consentDialogCopy(consentDialog.workKind);
     return <div className="page-stack">
-      <header className="page-header"><div><p className="eyebrow">Provider consent</p><h1>Send task brief to Claude</h1><p>Claude Planning will read this task's requirements, completion criteria, and prohibited scope from a read-only copy of the worktree. It runs read-only and cannot create, edit, or delete files.</p></div></header>
+      <header className="page-header"><div><p className="eyebrow">Provider consent</p><h1>{consentCopy.title}</h1><p>{consentCopy.description}</p></div></header>
       <section className="content-card" aria-labelledby="consent-form"><h2 id="consent-form">Provider transmission consent</h2>
         {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
         <div className="form-actions">
           <button className="button button--secondary" type="button" onClick={() => setConsentDialog(null)} disabled={busy}>Cancel</button>
-          <button className="button" type="button" disabled={busy} onClick={() => void startPlanning()}>Confirm and start</button>
+          <button className="button" type="button" disabled={busy} onClick={() => void startWork()}>Confirm and start</button>
         </div>
       </section>
     </div>;
@@ -258,7 +439,7 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               const eligible = entry?.eligible ?? false;
               return <div className="planning-panel">
                 {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
-                <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion })}>Start Claude Planning</button>
+                <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "planning" })}>Start Claude Planning</button>
               </div>;
             })()}
             {isolation.taskState === "planning" && <div className="planning-panel">
@@ -268,7 +449,83 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
             {isolation.taskState === "awaitingDesignApproval" && <div className="planning-panel">
               <p className="muted">Claude Planning finished. The plan is awaiting design approval.</p>
               {renderPlanningResult(planningResults[isolation.taskId])}
+              {(() => {
+                const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "implementation" && candidate.provider === "claude");
+                const eligible = entry?.eligible ?? false;
+                return <div className="planning-panel">
+                  {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
+                  <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "implementation" })}>Start Claude Implementation</button>
+                </div>;
+              })()}
             </div>}
+            {isolation.taskState === "implementing" && <div className="planning-panel">
+              <p className="muted">Claude Implementation is applying changes inside this task's isolated worktree. This may take a few minutes.</p>
+              <button className="button button--secondary" disabled={busy} onClick={() => void cancelImplementation(isolation.taskId)}>Cancel implementation</button>
+            </div>}
+            {isolation.taskState === "paused" && <p className="muted">The task is paused. Resuming is not yet available in this build.</p>}
+            {isolation.taskState === "testing" && (() => {
+              const candidateState = validationCandidates[isolation.taskId];
+              const approvalState = validationApprovals[isolation.taskId];
+              const approvedKinds = approvalState?.kind === "ready" ? approvalState.status.approvedKinds : [];
+              const candidates = candidateState?.kind === "ready" ? candidateState.candidates : [];
+              const hasApproved = approvedKinds.length > 0;
+              const running = testingRuns[isolation.taskId] === true;
+              return <div className="testing-panel" aria-label="Testing validation">
+                {running ? <>
+                  <p className="muted">Validation is running inside this task's isolated worktree. This may take a few minutes.</p>
+                  <button className="button button--secondary" disabled={busy} onClick={() => void cancelValidationTesting(isolation.taskId)}>Cancel validation</button>
+                </> : <>
+                  {(candidateState === undefined || candidateState.kind === "loading" || approvalState === undefined || approvalState.kind === "loading") && <p className="muted">Loading validation commands…</p>}
+                  {candidateState?.kind === "error" && <p className="inline-notice">Validation commands could not be loaded. Refresh to try again.</p>}
+                  {approvalState?.kind === "error" && <p className="inline-notice">Approval status could not be loaded. Refresh to try again.</p>}
+                  {candidateState?.kind === "ready" && approvalState?.kind === "ready" && (
+                    candidates.length === 0
+                      ? <p className="muted">No Cargo validation commands were found for this task.</p>
+                      : <form onSubmit={(event) => { event.preventDefault(); void approveValidationCommands(isolation.taskId, isolation.taskVersion); }}>
+                          <label htmlFor="cargo-executable-path">Cargo executable path</label>
+                          <input id="cargo-executable-path" value={validationForm.executablePath} onChange={(event) => setValidationForm((current) => ({ ...current, executablePath: event.target.value }))} placeholder="C:\tools\cargo\bin\cargo.exe" disabled={busy} />
+                          <label htmlFor="cargo-home-path">CARGO_HOME (optional)</label>
+                          <input id="cargo-home-path" value={validationForm.cargoHomePath} onChange={(event) => setValidationForm((current) => ({ ...current, cargoHomePath: event.target.value }))} disabled={busy} />
+                          <label htmlFor="rustup-home-path">RUSTUP_HOME (optional)</label>
+                          <input id="rustup-home-path" value={validationForm.rustupHomePath} onChange={(event) => setValidationForm((current) => ({ ...current, rustupHomePath: event.target.value }))} disabled={busy} />
+                          <fieldset>
+                            <legend>Validation commands</legend>
+                            {candidates.map((candidate) => {
+                              const isApproved = approvedKinds.includes(candidate.kind);
+                              return <label key={candidate.kind} className="checkbox-row">
+                                <input type="checkbox" checked={isApproved || validationForm.selectedKinds.includes(candidate.kind)} disabled={busy || isApproved} onChange={(event) => toggleValidationCommandKind(candidate.kind, event.target.checked)} />
+                                {candidate.label}{isApproved ? " (approved)" : ""}
+                              </label>;
+                            })}
+                          </fieldset>
+                          <button className="button" type="submit" disabled={busy || validationForm.selectedKinds.length === 0 || validationForm.executablePath.trim() === ""}>Approve selected validation commands</button>
+                        </form>
+                  )}
+                  <button className="button" disabled={busy || !hasApproved} onClick={() => void startValidationTesting(isolation.taskId, isolation.taskVersion)}>Start approved validation</button>
+                  {!hasApproved && <p className="muted">Approve at least one validation command before starting.</p>}
+                </>}
+              </div>;
+            })()}
+            {isolation.taskState === "reviewing" && (() => {
+              const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "review" && candidate.provider === "claude");
+              const eligible = entry?.eligible ?? false;
+              const running = reviewRuns[isolation.taskId] === true;
+              return <div className="review-panel" aria-label="Claude Review">
+                {running ? <>
+                  <p className="muted">Claude Review is analyzing the changes in this task's isolated worktree. This may take a few minutes.</p>
+                  <button className="button button--secondary" disabled={busy} onClick={() => void cancelReview(isolation.taskId)}>Cancel review</button>
+                </> : <>
+                  {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
+                  <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "review" })}>Start Claude Review</button>
+                </>}
+              </div>;
+            })()}
+            {isolation.taskState === "awaitingUserDiffApproval" && <div className="review-panel" aria-label="Claude Review result">
+              <p className="muted">Claude Review finished. The review is awaiting your decision on the diff.</p>
+              {renderReviewResult(reviewResults[isolation.taskId])}
+            </div>}
+            {isolation.taskState === "completed" && <p className="muted">This task is completed. Its active task lease has been released.</p>}
+            {isolation.taskState === "recoveryRequired" && <p className="muted">This task requires manual recovery before continuing. Review the task before proceeding.</p>}
             {isolation.taskState === "failed" && <p className="inline-notice">Claude Planning failed. Review the task before retrying.</p>}
             {isolation.taskState === "cancelled" && <p className="muted">Claude Planning was cancelled.</p>}
             <button className="button button--secondary" disabled={busy} onClick={() => void run(async () => { const next = await client.getTaskIsolation(isolation.taskId); setIsolations((current) => ({ ...current, [project.id]: next })); })}>Refresh isolation</button>
@@ -276,6 +533,27 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
         </li>;
       })}</ul>}
   </div>;
+}
+
+function consentDialogCopy(workKind: "planning" | "implementation" | "review"): { title: string; description: string } {
+  switch (workKind) {
+    case "implementation":
+      return {
+        title: "Send task brief and plan to Claude",
+        description: "Claude Implementation will read this task's requirements, completion criteria, prohibited scope, and the approved plan, then create, edit, and delete files inside the isolated task worktree. It cannot run Bash or other shell commands.",
+      };
+    case "review":
+      return {
+        title: "Send task brief and diff to Claude",
+        description: "Claude Review will read this task's requirements, completion criteria, prohibited scope, and the current Git diff of changes inside the isolated task worktree. It runs read-only and cannot create, edit, or delete files.",
+      };
+    case "planning":
+    default:
+      return {
+        title: "Send task brief to Claude",
+        description: "Claude Planning will read this task's requirements, completion criteria, and prohibited scope from a read-only copy of the worktree. It runs read-only and cannot create, edit, or delete files.",
+      };
+  }
 }
 
 function blockerMessage(blocker: TaskIsolationDto["blocker"]): string {
@@ -313,6 +591,21 @@ function renderPlanningResult(state: PlanningResultLoadState | undefined) {
   }
   return <div className="plan-text-panel" aria-label="Claude Planning result">
     <pre className="plan-text">{state.result.planText}</pre>
+  </div>;
+}
+
+function renderReviewResult(state: ReviewResultLoadState | undefined) {
+  if (state === undefined || state.kind === "loading") {
+    return <p className="muted">Loading the review…</p>;
+  }
+  if (state.kind === "error") {
+    return <p className="inline-notice">The review could not be loaded. Refresh to try again.</p>;
+  }
+  if (state.result === null || state.result.reviewText === null) {
+    return <p className="muted">No review is available for this task.</p>;
+  }
+  return <div className="review-text-panel" aria-label="Claude Review result">
+    <pre className="review-text">{state.result.reviewText}</pre>
   </div>;
 }
 

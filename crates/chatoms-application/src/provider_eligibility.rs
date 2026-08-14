@@ -89,10 +89,11 @@ const fn capability_for(
 
 const fn contract_for(provider: ProviderKind, work_kind: WorkKind) -> ContractStatus {
     match (provider, work_kind) {
-        (ProviderKind::Claude, WorkKind::Planning | WorkKind::Review) => ContractStatus::Approved,
-        (ProviderKind::Claude, WorkKind::Implementation) | (ProviderKind::Codex, _) => {
-            ContractStatus::NotApproved
-        }
+        (
+            ProviderKind::Claude,
+            WorkKind::Planning | WorkKind::Implementation | WorkKind::Review,
+        ) => ContractStatus::Approved,
+        (ProviderKind::Codex, _) => ContractStatus::NotApproved,
     }
 }
 

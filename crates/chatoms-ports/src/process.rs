@@ -11,11 +11,20 @@ use crate::error::PortFailure;
 
 /// Structured invocation request. Defining this type spawns nothing; a
 /// future `ProcessRunner` port owns spawning, streaming, and cancellation.
+///
+/// `environment` is `None` for every existing Claude Planning/Implementation
+/// caller, which keeps inheriting the parent process environment exactly as
+/// before (minus the one variable `StdProcessRunner::run_streaming` already
+/// removes unconditionally). `Some(vars)` is a stricter contract: the
+/// implementation must `env_clear()` the child's environment first and set
+/// exactly `vars`, nothing inherited. Validation command execution is the
+/// first caller that uses `Some`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessSpec {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub working_directory: PathBuf,
+    pub environment: Option<Vec<(OsString, OsString)>>,
 }
 
 /// Whether a completed invocation's effect could be confirmed, mirroring
@@ -141,6 +150,10 @@ impl CancellationSignal for AtomicCancellationSignal {
 /// implementations terminate the child and, where the platform allows,
 /// its descendants. This is a separate contract from [`ProcessRunner`] so
 /// the existing one-shot capability-probe behavior never changes.
+///
+/// When `spec.environment` is `Some(vars)`, implementations must clear the
+/// child's environment entirely and set exactly `vars` — no inherited parent
+/// variable may reach the child.
 pub trait StreamingProcessRunner {
     fn run_streaming(
         &mut self,

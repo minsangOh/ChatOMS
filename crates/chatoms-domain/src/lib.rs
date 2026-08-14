@@ -7,6 +7,7 @@ mod task;
 mod task_brief;
 mod task_state;
 mod transition;
+mod validation_command;
 mod work_kind;
 
 pub use error::DomainError;
@@ -20,4 +21,5 @@ pub use transition::{
     ACTOR_KIND_MAX_LENGTH, ActorKind, REASON_CODE_MAX_LENGTH, ReasonCode, TaskStateTransition,
     TaskStateTransitionSnapshot,
 };
+pub use validation_command::ValidationCommandKind;
 pub use work_kind::WorkKind;

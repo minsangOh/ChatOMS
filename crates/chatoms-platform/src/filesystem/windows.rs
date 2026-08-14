@@ -86,6 +86,17 @@ impl FilesystemIdentityPort for WindowsFilesystemIdentity {
         Ok(())
     }
 
+    fn inspect_supported_file(&mut self, path: &Path) -> Result<DirectoryIdentity, PortFailure> {
+        let canonical = fs::canonicalize(path).map_err(map_io)?;
+        ensure_fixed_drive(&canonical)?;
+        reject_cloud_ancestors(&canonical)?;
+        let handle = open_file(&canonical)?;
+        let identity = identity_from_handle(&handle)?;
+        ensure_fixed_drive(&identity.canonical_path)?;
+        reject_cloud_ancestors(&identity.canonical_path)?;
+        Ok(identity)
+    }
+
     fn acquire_guard(
         &mut self,
         path: &Path,

@@ -35,6 +35,16 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::planning::start_claude_planning,
             commands::planning::cancel_claude_planning,
             commands::planning::get_planning_result,
+            commands::implementation::start_claude_implementation,
+            commands::implementation::cancel_claude_implementation,
+            commands::testing::start_validation_testing,
+            commands::testing::cancel_validation_testing,
+            commands::validation_commands::get_validation_command_candidates,
+            commands::validation_commands::get_validation_command_approval_status,
+            commands::validation_commands::approve_validation_command,
+            commands::review::start_claude_review,
+            commands::review::cancel_claude_review,
+            commands::review::get_review_result,
         ])
         .run(tauri::generate_context!())
 }

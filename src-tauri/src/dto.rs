@@ -1,10 +1,17 @@
 mod planning_result;
 mod provider_eligibility;
+mod review_result;
+mod validation_command;
 
 pub use planning_result::{PlanningOutcomeDto, PlanningResultDto};
 pub use provider_eligibility::{
     ContractStatusDto, EligibilityBlockingReasonDto, ProviderEligibilityDto, ProviderKindDto,
     WorkKindDto,
+};
+pub use review_result::{ReviewOutcomeDto, ReviewResultDto};
+pub use validation_command::{
+    ApproveValidationCommandInputDto, ApproveValidationCommandResultDto,
+    ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKindDto,
 };
 
 use chatoms_application::{
@@ -337,6 +344,24 @@ pub struct TaskDto {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelPlanningDto {
+    pub requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelImplementationDto {
+    pub requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelTestingDto {
+    pub requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelReviewDto {
     pub requested: bool,
 }
 

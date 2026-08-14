@@ -36,7 +36,7 @@ fn run_registry(
 
 #[test]
 fn production_registry_and_checksum_policy_are_valid() {
-    assert_eq!(FOUNDATION_MIGRATION.len(), 7);
+    assert_eq!(FOUNDATION_MIGRATION.len(), 15);
     assert_eq!(FOUNDATION_MIGRATION[0].version, 1);
     assert_eq!(FOUNDATION_MIGRATION[0].name, "foundation");
     assert_eq!(FOUNDATION_MIGRATION[1].version, 2);
@@ -51,6 +51,34 @@ fn production_registry_and_checksum_policy_are_valid() {
     assert_eq!(FOUNDATION_MIGRATION[5].name, "provider_consents");
     assert_eq!(FOUNDATION_MIGRATION[6].version, 7);
     assert_eq!(FOUNDATION_MIGRATION[6].name, "task_planning_results");
+    assert_eq!(FOUNDATION_MIGRATION[7].version, 8);
+    assert_eq!(FOUNDATION_MIGRATION[7].name, "implementation_consents");
+    assert_eq!(FOUNDATION_MIGRATION[8].version, 9);
+    assert_eq!(FOUNDATION_MIGRATION[8].name, "task_implementation_results");
+    assert_eq!(FOUNDATION_MIGRATION[9].version, 10);
+    assert_eq!(
+        FOUNDATION_MIGRATION[9].name,
+        "task_validation_command_approvals"
+    );
+    assert_eq!(FOUNDATION_MIGRATION[10].version, 11);
+    assert_eq!(
+        FOUNDATION_MIGRATION[10].name,
+        "validation_command_executable_binding"
+    );
+    assert_eq!(FOUNDATION_MIGRATION[11].version, 12);
+    assert_eq!(
+        FOUNDATION_MIGRATION[11].name,
+        "validation_command_environment_binding"
+    );
+    assert_eq!(FOUNDATION_MIGRATION[12].version, 13);
+    assert_eq!(
+        FOUNDATION_MIGRATION[12].name,
+        "task_validation_command_results"
+    );
+    assert_eq!(FOUNDATION_MIGRATION[13].version, 14);
+    assert_eq!(FOUNDATION_MIGRATION[13].name, "review_consents");
+    assert_eq!(FOUNDATION_MIGRATION[14].version, 15);
+    assert_eq!(FOUNDATION_MIGRATION[14].name, "task_review_results");
     validate_registry(&FOUNDATION_MIGRATION).expect("production registry must be valid");
 
     for migration in FOUNDATION_MIGRATION {
@@ -554,21 +582,21 @@ fn registry_rejects_zero_non_one_start_duplicates_order_and_empty_fields() {
 fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     let database = TestDatabase::empty();
     let first = run_registry(&database, &FOUNDATION_MIGRATION).expect("first migration run");
-    assert_eq!(first.schema_version, 7);
-    assert_eq!(first.applied_count, 7);
+    assert_eq!(first.schema_version, 15);
+    assert_eq!(first.applied_count, 15);
 
     let connection = database.open_raw();
     let metadata: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations WHERE version = 7",
+             FROM schema_migrations WHERE version = 11",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("read migration metadata");
-    assert_eq!(metadata.0, 7);
-    assert_eq!(metadata.1, "task_planning_results");
-    assert_eq!(metadata.2, FOUNDATION_MIGRATION[6].checksum_sha256());
+    assert_eq!(metadata.0, 11);
+    assert_eq!(metadata.1, "validation_command_executable_binding");
+    assert_eq!(metadata.2, FOUNDATION_MIGRATION[10].checksum_sha256());
     assert!(metadata.3 >= 0);
     let schema_before: String = connection
         .query_row(
@@ -581,7 +609,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     drop(connection);
 
     let second = run_registry(&database, &FOUNDATION_MIGRATION).expect("second migration run");
-    assert_eq!(second.schema_version, 7);
+    assert_eq!(second.schema_version, 15);
     assert_eq!(second.applied_count, 0);
     let connection = database.open_raw();
     let schema_after: String = connection
@@ -593,11 +621,11 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
         )
         .expect("read schema snapshot after reopen");
     assert_eq!(schema_after, schema_before);
-    assert_eq!(count_rows(&connection, "schema_migrations"), 7);
+    assert_eq!(count_rows(&connection, "schema_migrations"), 15);
     let metadata_after: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
-             FROM schema_migrations WHERE version = 7",
+             FROM schema_migrations WHERE version = 11",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -802,6 +830,7 @@ fn foundation_contains_required_tables_and_indexes() {
         "task_briefs",
         "task_provider_consents",
         "task_planning_results",
+        "task_implementation_results",
         "schema_migrations",
     ] {
         assert!(table_exists(&connection, table), "missing table {table}");
@@ -1391,8 +1420,8 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let outcome = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("apply provider-neutral state migration");
-            assert_eq!(outcome.schema_version, 7);
-            assert_eq!(outcome.applied_count, 4);
+            assert_eq!(outcome.schema_version, 15);
+            assert_eq!(outcome.applied_count, 12);
 
             let connection = database.open_raw();
             assert_provider_state_fixture_migrated(
@@ -1407,7 +1436,7 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let rerun = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("re-run provider-neutral state migration");
-            assert_eq!(rerun.schema_version, 7);
+            assert_eq!(rerun.schema_version, 15);
             assert_eq!(rerun.applied_count, 0);
         }
     }
@@ -1451,13 +1480,13 @@ fn v5_adds_task_briefs_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 7);
-    assert_eq!(outcome.applied_count, 7);
+    assert_eq!(outcome.schema_version, 15);
+    assert_eq!(outcome.applied_count, 15);
     assert!(table_exists(&database.open_raw(), "task_briefs"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 7);
+    assert_eq!(rerun.schema_version, 15);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1515,13 +1544,13 @@ fn v6_adds_provider_consents_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 7);
-    assert_eq!(outcome.applied_count, 7);
+    assert_eq!(outcome.schema_version, 15);
+    assert_eq!(outcome.applied_count, 15);
     assert!(table_exists(&database.open_raw(), "task_provider_consents"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 7);
+    assert_eq!(rerun.schema_version, 15);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1532,7 +1561,7 @@ fn provider_consents_reject_unapproved_values_mismatched_task_versions_and_dupli
     insert_project(&connection, "project");
     create_active_task(&mut connection, "consent-task", "project");
 
-    for (provider, work_kind) in [("Codex", "Planning"), ("Claude", "Implementation")] {
+    for (provider, work_kind) in [("Codex", "Planning"), ("Claude", "Testing")] {
         let error = connection
             .execute(
                 "INSERT INTO task_provider_consents (
@@ -1600,13 +1629,13 @@ fn v7_adds_task_planning_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 7);
-    assert_eq!(outcome.applied_count, 7);
+    assert_eq!(outcome.schema_version, 15);
+    assert_eq!(outcome.applied_count, 15);
     assert!(table_exists(&database.open_raw(), "task_planning_results"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 7);
+    assert_eq!(rerun.schema_version, 15);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1709,5 +1738,1376 @@ fn task_planning_results_enforce_outcome_shape_fixed_provider_and_immutability()
     assert!(is_constraint_error(&delete_error));
 
     assert_eq!(count_rows(&connection, "task_planning_results"), 1);
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn v8_widens_provider_consents_to_implementation_forward_only_idempotently_and_preserves_planning_rows()
+ {
+    let database = TestDatabase::empty();
+    let before = run_registry(&database, &FOUNDATION_MIGRATION[..7])
+        .expect("apply v1 through v7 (pre-widening schema)");
+    assert_eq!(before.schema_version, 7);
+    assert_eq!(before.applied_count, 7);
+
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "consent-task", "project");
+    connection
+        .execute(
+            "INSERT INTO task_provider_consents (
+                task_id, provider, work_kind, approved_task_version, consented_at_ms
+             ) VALUES ('consent-task', 'Claude', 'Planning', 0, 100)",
+            [],
+        )
+        .expect("insert pre-existing Planning consent under the old schema");
+    drop(connection);
+
+    let outcome = run_registry(&database, &FOUNDATION_MIGRATION[..8])
+        .expect("apply implementation_consents widening migration");
+    assert_eq!(outcome.schema_version, 8);
+    assert_eq!(outcome.applied_count, 1);
+
+    let connection = database.open_raw();
+    let preserved_consented_at_ms: i64 = connection
+        .query_row(
+            "SELECT consented_at_ms FROM task_provider_consents
+             WHERE task_id = 'consent-task' AND work_kind = 'Planning'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pre-existing Planning consent row must survive the migration");
+    assert_eq!(preserved_consented_at_ms, 100);
+
+    connection
+        .execute(
+            "INSERT INTO task_provider_consents (
+                task_id, provider, work_kind, approved_task_version, consented_at_ms
+             ) VALUES ('consent-task', 'Claude', 'Implementation', 0, 200)",
+            [],
+        )
+        .expect("Implementation consent must now be accepted");
+    assert_eq!(count_rows(&connection, "task_provider_consents"), 2);
+
+    let rejected = connection.execute(
+        "INSERT INTO task_provider_consents (
+            task_id, provider, work_kind, approved_task_version, consented_at_ms
+         ) VALUES ('consent-task', 'Claude', 'Review', 0, 300)",
+        [],
+    );
+    assert!(
+        rejected.as_ref().is_err_and(is_constraint_error),
+        "work_kind values outside the approved set must still be rejected"
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_provider_consents SET consented_at_ms = 999
+             WHERE task_id = 'consent-task' AND work_kind = 'Implementation'",
+            [],
+        )
+        .expect_err("task_provider_consents must remain immutable after widening");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_provider_consents
+             WHERE task_id = 'consent-task' AND work_kind = 'Implementation'",
+            [],
+        )
+        .expect_err("task_provider_consents rows must remain non-deletable after widening");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+    drop(connection);
+
+    let rerun = run_registry(&database, &FOUNDATION_MIGRATION[..8])
+        .expect("re-run full foundation registry after widening");
+    assert_eq!(rerun.schema_version, 8);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn v14_widens_provider_consents_to_review_forward_only_idempotently_and_preserves_existing_rows() {
+    let database = TestDatabase::empty();
+    let before = run_registry(&database, &FOUNDATION_MIGRATION[..13])
+        .expect("apply v1 through v13 (pre-widening schema)");
+    assert_eq!(before.schema_version, 13);
+    assert_eq!(before.applied_count, 13);
+
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "consent-task", "project");
+    connection
+        .execute(
+            "INSERT INTO task_provider_consents (
+                task_id, provider, work_kind, approved_task_version, consented_at_ms
+             ) VALUES ('consent-task', 'Claude', 'Planning', 0, 100)",
+            [],
+        )
+        .expect("insert pre-existing Planning consent under the old schema");
+    connection
+        .execute(
+            "INSERT INTO task_provider_consents (
+                task_id, provider, work_kind, approved_task_version, consented_at_ms
+             ) VALUES ('consent-task', 'Claude', 'Implementation', 0, 200)",
+            [],
+        )
+        .expect("insert pre-existing Implementation consent under the old schema");
+    drop(connection);
+
+    let outcome = run_registry(&database, &FOUNDATION_MIGRATION[..14])
+        .expect("apply review_consents widening migration");
+    assert_eq!(outcome.schema_version, 14);
+    assert_eq!(outcome.applied_count, 1);
+
+    let connection = database.open_raw();
+    let preserved_planning_consented_at_ms: i64 = connection
+        .query_row(
+            "SELECT consented_at_ms FROM task_provider_consents
+             WHERE task_id = 'consent-task' AND work_kind = 'Planning'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pre-existing Planning consent row must survive the migration");
+    assert_eq!(preserved_planning_consented_at_ms, 100);
+    let preserved_implementation_consented_at_ms: i64 = connection
+        .query_row(
+            "SELECT consented_at_ms FROM task_provider_consents
+             WHERE task_id = 'consent-task' AND work_kind = 'Implementation'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pre-existing Implementation consent row must survive the migration");
+    assert_eq!(preserved_implementation_consented_at_ms, 200);
+
+    connection
+        .execute(
+            "INSERT INTO task_provider_consents (
+                task_id, provider, work_kind, approved_task_version, consented_at_ms
+             ) VALUES ('consent-task', 'Claude', 'Review', 0, 300)",
+            [],
+        )
+        .expect("Review consent must now be accepted");
+    assert_eq!(count_rows(&connection, "task_provider_consents"), 3);
+
+    let rejected = connection.execute(
+        "INSERT INTO task_provider_consents (
+            task_id, provider, work_kind, approved_task_version, consented_at_ms
+         ) VALUES ('consent-task', 'Claude', 'Testing', 0, 400)",
+        [],
+    );
+    assert!(
+        rejected.as_ref().is_err_and(is_constraint_error),
+        "work_kind values outside the approved set must still be rejected"
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_provider_consents SET consented_at_ms = 999
+             WHERE task_id = 'consent-task' AND work_kind = 'Review'",
+            [],
+        )
+        .expect_err("task_provider_consents must remain immutable after widening");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_provider_consents
+             WHERE task_id = 'consent-task' AND work_kind = 'Review'",
+            [],
+        )
+        .expect_err("task_provider_consents rows must remain non-deletable after widening");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+    drop(connection);
+
+    let rerun = run_registry(&database, &FOUNDATION_MIGRATION[..14])
+        .expect("re-run full foundation registry after widening");
+    assert_eq!(rerun.schema_version, 14);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn v15_adds_task_review_results_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 15);
+    assert_eq!(outcome.applied_count, 15);
+    assert!(table_exists(&database.open_raw(), "task_review_results"));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 15);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn task_review_results_enforce_outcome_shape_fixed_provider_and_immutability() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "review-task", "project");
+
+    for (provider, work_kind) in [("Codex", "Review"), ("Claude", "Implementation")] {
+        let error = connection
+            .execute(
+                "INSERT INTO task_review_results (
+                    task_id, provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms, review_text
+                 ) VALUES ('review-task', ?1, ?2, 'Completed', 0, 1, 100, 200, 'review')",
+                params![provider, work_kind],
+            )
+            .expect_err("unapproved provider/work_kind combination must be rejected");
+        assert!(is_constraint_error(&error), "unexpected error: {error:?}");
+    }
+
+    let bad_outcome = connection.execute(
+        "INSERT INTO task_review_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms, review_text
+         ) VALUES ('review-task', 'Claude', 'Review', 'NotAnOutcome', 0, 1, 100, 200, 'review')",
+        [],
+    );
+    assert!(bad_outcome.as_ref().is_err_and(is_constraint_error));
+
+    for (outcome, review_text) in [
+        ("Completed", None),
+        ("Failed", Some("review")),
+        ("Cancelled", Some("review")),
+        ("RecoveryRequired", Some("review")),
+    ] {
+        let error = connection
+            .execute(
+                "INSERT INTO task_review_results (
+                    task_id, provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms, review_text
+                 ) VALUES ('review-task', 'Claude', 'Review', ?1, 0, 1, 100, 200, ?2)",
+                params![outcome, review_text],
+            )
+            .expect_err("review_text presence must match the outcome");
+        assert!(is_constraint_error(&error), "unexpected error: {error:?}");
+    }
+
+    let backwards_timestamps = connection.execute(
+        "INSERT INTO task_review_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms, review_text
+         ) VALUES ('review-task', 'Claude', 'Review', 'Failed', 1, NULL, 200, 100, NULL)",
+        [],
+    );
+    assert!(
+        backwards_timestamps
+            .as_ref()
+            .is_err_and(is_constraint_error)
+    );
+
+    connection
+        .execute(
+            "INSERT INTO task_review_results (
+                task_id, provider, work_kind, outcome, exit_code, turn_count,
+                started_at_ms, completed_at_ms, review_text
+             ) VALUES ('review-task', 'Claude', 'Review', 'Completed', 0, 5, 100, 200, 'the review')",
+            [],
+        )
+        .expect("valid completed result");
+
+    let duplicate = connection.execute(
+        "INSERT INTO task_review_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms, review_text
+         ) VALUES ('review-task', 'Claude', 'Review', 'Failed', 1, NULL, 100, 200, NULL)",
+        [],
+    );
+    assert!(
+        duplicate.as_ref().is_err_and(is_constraint_error),
+        "task_id is 1:1: a second row for the same task must be rejected"
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_review_results SET review_text = 'changed' WHERE task_id = 'review-task'",
+            [],
+        )
+        .expect_err("task_review_results must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_review_results WHERE task_id = 'review-task'",
+            [],
+        )
+        .expect_err("task_review_results rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(count_rows(&connection, "task_review_results"), 1);
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn v9_adds_task_implementation_results_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 15);
+    assert_eq!(outcome.applied_count, 15);
+    assert!(table_exists(
+        &database.open_raw(),
+        "task_implementation_results"
+    ));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 15);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn task_implementation_results_enforce_outcome_shape_fixed_provider_and_immutability() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "implementation-task", "project");
+
+    for (provider, work_kind) in [("Codex", "Implementation"), ("Claude", "Planning")] {
+        let error = connection
+            .execute(
+                "INSERT INTO task_implementation_results (
+                    task_id, provider, work_kind, outcome, exit_code, turn_count,
+                    started_at_ms, completed_at_ms
+                 ) VALUES ('implementation-task', ?1, ?2, 'Completed', 0, 1, 100, 200)",
+                params![provider, work_kind],
+            )
+            .expect_err("unapproved provider/work_kind combination must be rejected");
+        assert!(is_constraint_error(&error), "unexpected error: {error:?}");
+    }
+
+    let bad_outcome = connection.execute(
+        "INSERT INTO task_implementation_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms
+         ) VALUES ('implementation-task', 'Claude', 'Implementation', 'Failed', 0, 1, 100, 200)",
+        [],
+    );
+    assert!(
+        bad_outcome.as_ref().is_err_and(is_constraint_error),
+        "Failed is not an approved Implementation outcome"
+    );
+
+    let backwards_timestamps = connection.execute(
+        "INSERT INTO task_implementation_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms
+         ) VALUES ('implementation-task', 'Claude', 'Implementation', 'RecoveryRequired', 1, NULL, 200, 100)",
+        [],
+    );
+    assert!(
+        backwards_timestamps
+            .as_ref()
+            .is_err_and(is_constraint_error)
+    );
+
+    connection
+        .execute(
+            "INSERT INTO task_implementation_results (
+                task_id, provider, work_kind, outcome, exit_code, turn_count,
+                started_at_ms, completed_at_ms
+             ) VALUES ('implementation-task', 'Claude', 'Implementation', 'Completed', 0, 5, 100, 200)",
+            [],
+        )
+        .expect("valid completed result");
+
+    let duplicate = connection.execute(
+        "INSERT INTO task_implementation_results (
+            task_id, provider, work_kind, outcome, exit_code, turn_count,
+            started_at_ms, completed_at_ms
+         ) VALUES ('implementation-task', 'Claude', 'Implementation', 'Cancelled', NULL, NULL, 100, 200)",
+        [],
+    );
+    assert!(
+        duplicate.as_ref().is_err_and(is_constraint_error),
+        "task_id is 1:1: a second row for the same task must be rejected"
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_implementation_results SET exit_code = 1
+             WHERE task_id = 'implementation-task'",
+            [],
+        )
+        .expect_err("task_implementation_results must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_implementation_results WHERE task_id = 'implementation-task'",
+            [],
+        )
+        .expect_err("task_implementation_results rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(count_rows(&connection, "task_implementation_results"), 1);
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn v10_adds_task_validation_command_approvals_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 15);
+    assert_eq!(outcome.applied_count, 15);
+    assert!(table_exists(
+        &database.open_raw(),
+        "task_validation_command_approvals"
+    ));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 15);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn v11_widens_task_validation_command_approvals_with_executable_binding_forward_only_idempotently_and_drops_pre_binding_rows()
+ {
+    let database = TestDatabase::empty();
+    let before = run_registry(&database, &FOUNDATION_MIGRATION[..10])
+        .expect("apply v1 through v10 (pre-binding schema)");
+    assert_eq!(before.schema_version, 10);
+    assert_eq!(before.applied_count, 10);
+
+    let outcome = run_registry(&database, &FOUNDATION_MIGRATION[..11])
+        .expect("apply validation_command_executable_binding widening migration with no pre-existing approvals");
+    assert_eq!(outcome.schema_version, 11);
+    assert_eq!(outcome.applied_count, 1);
+
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "validation-task", "project");
+    assert_eq!(
+        count_rows(&connection, "task_validation_command_approvals"),
+        0,
+        "migration 0011 succeeds when no pre-binding rows exist"
+    );
+
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, command_kind, executable,
+                arguments_json, worktree_scope, approved_executable_path,
+                executable_volume_serial_hex, executable_file_id_hex,
+                tool_directory_path, tool_directory_volume_serial_hex,
+                tool_directory_file_id_hex, approved_at_ms
+             ) VALUES (
+                'validation-task', 0, 'Test', 'cargo', '[\"test\"]', 'TaskWorktree',
+                'C:/tools/cargo/bin/cargo.exe', '0000000000000002',
+                '00000000000000000000000000000002', 'C:/tools/cargo/bin',
+                '0000000000000001', '00000000000000000000000000000001', 100
+             )",
+            [],
+        )
+        .expect("the widened shape accepts a fully-populated binding row");
+    let missing_binding = connection.execute(
+        "INSERT INTO task_validation_command_approvals (
+            task_id, approved_task_version, command_kind, executable,
+            arguments_json, worktree_scope, approved_at_ms
+         ) VALUES ('validation-task', 0, 'Build', 'cargo', '[\"build\"]', 'TaskWorktree', 100)",
+        [],
+    );
+    assert!(
+        missing_binding.as_ref().is_err_and(is_constraint_error),
+        "the pre-binding column set is no longer sufficient after widening"
+    );
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+    drop(connection);
+
+    let rerun = run_registry(&database, &FOUNDATION_MIGRATION[..11])
+        .expect("re-run full foundation registry after widening");
+    assert_eq!(rerun.schema_version, 11);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn v12_widens_task_validation_command_approvals_with_environment_binding_forward_only_and_idempotently()
+ {
+    let database = TestDatabase::empty();
+    let before = run_registry(&database, &FOUNDATION_MIGRATION[..11])
+        .expect("apply v1 through v11 (pre-environment-binding schema)");
+    assert_eq!(before.schema_version, 11);
+    assert_eq!(before.applied_count, 11);
+
+    let outcome = run_registry(&database, &FOUNDATION_MIGRATION[..12]).expect(
+        "apply validation_command_environment_binding widening migration with no pre-existing \
+         approvals",
+    );
+    assert_eq!(outcome.schema_version, 12);
+    assert_eq!(outcome.applied_count, 1);
+
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "validation-task", "project");
+    assert_eq!(
+        count_rows(&connection, "task_validation_command_approvals"),
+        0,
+        "migration 0012 succeeds when no pre-binding rows exist"
+    );
+
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, command_kind, executable,
+                arguments_json, worktree_scope, approved_executable_path,
+                executable_volume_serial_hex, executable_file_id_hex,
+                tool_directory_path, tool_directory_volume_serial_hex,
+                tool_directory_file_id_hex, approved_at_ms
+             ) VALUES (
+                'validation-task', 0, 'Test', 'cargo', '[\"test\"]', 'TaskWorktree',
+                'C:/tools/cargo/bin/cargo.exe', '0000000000000002',
+                '00000000000000000000000000000002', 'C:/tools/cargo/bin',
+                '0000000000000001', '00000000000000000000000000000001', 100
+             )",
+            [],
+        )
+        .expect("a row with no environment binding (all NULL) is still accepted");
+
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, command_kind, executable,
+                arguments_json, worktree_scope, approved_executable_path,
+                executable_volume_serial_hex, executable_file_id_hex,
+                tool_directory_path, tool_directory_volume_serial_hex,
+                tool_directory_file_id_hex,
+                approved_cargo_home_path, cargo_home_volume_serial_hex, cargo_home_file_id_hex,
+                approved_rustup_home_path, rustup_home_volume_serial_hex,
+                rustup_home_file_id_hex, approved_at_ms
+             ) VALUES (
+                'validation-task', 0, 'Build', 'cargo', '[\"build\"]', 'TaskWorktree',
+                'C:/tools/cargo/bin/cargo.exe', '0000000000000002',
+                '00000000000000000000000000000002', 'C:/tools/cargo/bin',
+                '0000000000000001', '00000000000000000000000000000001',
+                'C:/tools/cargo-home', '0000000000000003', '00000000000000000000000000000003',
+                'C:/tools/rustup-home', '0000000000000004', '00000000000000000000000000000004',
+                100
+             )",
+            [],
+        )
+        .expect("a fully-populated environment binding row is accepted");
+
+    let partial_binding = connection.execute(
+        "INSERT INTO task_validation_command_approvals (
+            task_id, approved_task_version, command_kind, executable,
+            arguments_json, worktree_scope, approved_executable_path,
+            executable_volume_serial_hex, executable_file_id_hex,
+            tool_directory_path, tool_directory_volume_serial_hex,
+            tool_directory_file_id_hex, approved_cargo_home_path, approved_at_ms
+         ) VALUES (
+            'validation-task', 0, 'Lint', 'cargo', '[\"clippy\"]', 'TaskWorktree',
+            'C:/tools/cargo/bin/cargo.exe', '0000000000000002',
+            '00000000000000000000000000000002', 'C:/tools/cargo/bin',
+            '0000000000000001', '00000000000000000000000000000001',
+            'C:/tools/cargo-home', 100
+         )",
+        [],
+    );
+    assert!(
+        partial_binding.as_ref().is_err_and(is_constraint_error),
+        "a home binding with only its path column set must be rejected"
+    );
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+    drop(connection);
+
+    let rerun = run_registry(&database, &FOUNDATION_MIGRATION[..12])
+        .expect("re-run full foundation registry after widening");
+    assert_eq!(rerun.schema_version, 12);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn v13_adds_task_validation_command_results_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 15);
+    assert_eq!(outcome.applied_count, 15);
+    assert!(table_exists(
+        &database.open_raw(),
+        "task_validation_command_results"
+    ));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 15);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_validation_command_approval_sql(
+    connection: &Connection,
+    task_id: &str,
+    approved_task_version: i64,
+    command_kind: &str,
+    executable: &str,
+    arguments_json: &str,
+    worktree_scope: &str,
+    approved_executable_path: &str,
+    executable_volume_serial_hex: &str,
+    executable_file_id_hex: &str,
+    tool_directory_path: &str,
+    tool_directory_volume_serial_hex: &str,
+    tool_directory_file_id_hex: &str,
+    approved_at_ms: i64,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO task_validation_command_approvals (
+            task_id, approved_task_version, command_kind, executable,
+            arguments_json, worktree_scope, approved_executable_path,
+            executable_volume_serial_hex, executable_file_id_hex,
+            tool_directory_path, tool_directory_volume_serial_hex,
+            tool_directory_file_id_hex, approved_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            task_id,
+            approved_task_version,
+            command_kind,
+            executable,
+            arguments_json,
+            worktree_scope,
+            approved_executable_path,
+            executable_volume_serial_hex,
+            executable_file_id_hex,
+            tool_directory_path,
+            tool_directory_volume_serial_hex,
+            tool_directory_file_id_hex,
+            approved_at_ms,
+        ],
+    )
+}
+
+const VALID_EXECUTABLE_PATH: &str = "C:/tools/cargo/bin/cargo.exe";
+const VALID_EXECUTABLE_VOLUME_HEX: &str = "0000000000000002";
+const VALID_EXECUTABLE_FILE_ID_HEX: &str = "00000000000000000000000000000002";
+const VALID_TOOL_DIRECTORY_PATH: &str = "C:/tools/cargo/bin";
+const VALID_TOOL_DIRECTORY_VOLUME_HEX: &str = "0000000000000001";
+const VALID_TOOL_DIRECTORY_FILE_ID_HEX: &str = "00000000000000000000000000000001";
+
+#[test]
+fn task_validation_command_approvals_enforce_shape_binding_duplicates_and_immutability() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "validation-task", "project");
+
+    let bad_kind = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "NotAKind",
+        "cargo",
+        "[\"test\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    );
+    assert!(bad_kind.as_ref().is_err_and(is_constraint_error));
+
+    let empty_executable = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "",
+        "[\"test\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    );
+    assert!(empty_executable.as_ref().is_err_and(is_constraint_error));
+
+    let bad_scope = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\"]",
+        "ProjectRoot",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    );
+    assert!(bad_scope.as_ref().is_err_and(is_constraint_error));
+
+    let empty_path = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\"]",
+        "TaskWorktree",
+        "",
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    );
+    assert!(empty_path.as_ref().is_err_and(is_constraint_error));
+
+    let bad_volume_hex = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        "not-hex",
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    );
+    assert!(
+        bad_volume_hex.as_ref().is_err_and(is_constraint_error),
+        "a malformed volume serial hex must be rejected"
+    );
+
+    let uppercase_file_id_hex = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        "AB000000000000000000000000000002",
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    );
+    assert!(
+        uppercase_file_id_hex
+            .as_ref()
+            .is_err_and(is_constraint_error),
+        "an uppercase file id hex must be rejected: the format is lowercase-only"
+    );
+
+    let mismatched_version = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        1,
+        "Test",
+        "cargo",
+        "[\"test\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    );
+    assert!(
+        mismatched_version.as_ref().is_err_and(is_constraint_error),
+        "approval bound to a task version other than the task's current version must be rejected"
+    );
+
+    insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\",\"--workspace\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    )
+    .expect("approval bound to the exact current task version");
+
+    insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Build",
+        "cargo",
+        "[\"build\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    )
+    .expect("a different command_kind for the same task/version is not a duplicate");
+
+    let duplicate = insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        200,
+    );
+    assert!(
+        duplicate.as_ref().is_err_and(is_constraint_error),
+        "duplicate (task_id, approved_task_version, command_kind) must be rejected"
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_validation_command_approvals SET executable = 'changed'
+             WHERE task_id = 'validation-task' AND command_kind = 'Test'",
+            [],
+        )
+        .expect_err("task_validation_command_approvals must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_validation_command_approvals WHERE task_id = 'validation-task'",
+            [],
+        )
+        .expect_err("task_validation_command_approvals rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(
+        count_rows(&connection, "task_validation_command_approvals"),
+        2
+    );
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn migration_0011_validation_command_executable_binding_aborts_when_existing_approvals_present() {
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    let registry_up_to_0010 = &FOUNDATION_MIGRATION[..10];
+    MigrationRunner::new(registry_up_to_0010)
+        .run(&mut connection)
+        .expect("apply migrations up to 0010");
+    drop(connection);
+
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "task-with-approval", "project");
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, command_kind, executable, arguments_json,
+                worktree_scope, approved_at_ms
+             ) VALUES (
+                'task-with-approval', 0, 'Format', 'cargo', '[]',
+                'TaskWorktree', 100
+             )",
+            [],
+        )
+        .expect("insert existing approval record");
+    drop(connection);
+
+    let mut connection = DatabaseConnection::open(database.path()).expect("reopen database");
+    let result = MigrationRunner::default().run(&mut connection);
+    assert!(matches!(
+        result,
+        Err(DatabaseError::ValidationCommandApprovalMigrationFailed { .. })
+    ));
+
+    let connection = database.open_raw();
+    assert_eq!(
+        count_rows(&connection, "task_validation_command_approvals"),
+        1,
+        "existing approval record must be preserved"
+    );
+    assert_eq!(
+        count_rows(&connection, "schema_migrations"),
+        10,
+        "0011 must not be recorded in migration history"
+    );
+    let has_executable_columns: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('task_validation_command_approvals')
+                WHERE name = 'approved_executable_path'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check executable columns");
+    assert!(
+        !has_executable_columns,
+        "0011 migration must not have been applied"
+    );
+}
+
+#[test]
+fn migration_0011_validation_command_executable_binding_applies_when_no_existing_approvals() {
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    let registry_up_to_0010 = &FOUNDATION_MIGRATION[..10];
+    MigrationRunner::new(registry_up_to_0010)
+        .run(&mut connection)
+        .expect("apply migrations up to 0010");
+    drop(connection);
+
+    let mut connection = DatabaseConnection::open(database.path()).expect("reopen database");
+    let result = MigrationRunner::new(&FOUNDATION_MIGRATION[..11]).run(&mut connection);
+    assert!(
+        result.is_ok(),
+        "migration 0011 should succeed with no existing approvals"
+    );
+
+    let connection = database.open_raw();
+    assert_eq!(count_rows(&connection, "schema_migrations"), 11);
+    let has_executable_columns: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('task_validation_command_approvals')
+                WHERE name = 'approved_executable_path'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check executable columns");
+    assert!(
+        has_executable_columns,
+        "0011 migration should add executable binding columns"
+    );
+}
+
+#[test]
+fn migration_0012_validation_command_environment_binding_aborts_when_existing_approvals_present() {
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    let registry_up_to_0011 = &FOUNDATION_MIGRATION[..11];
+    MigrationRunner::new(registry_up_to_0011)
+        .run(&mut connection)
+        .expect("apply migrations up to 0011");
+    drop(connection);
+
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "task-with-approval", "project");
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, command_kind, executable,
+                arguments_json, worktree_scope, approved_executable_path,
+                executable_volume_serial_hex, executable_file_id_hex,
+                tool_directory_path, tool_directory_volume_serial_hex,
+                tool_directory_file_id_hex, approved_at_ms
+             ) VALUES (
+                'task-with-approval', 0, 'Format', 'cargo', '[]', 'TaskWorktree',
+                'C:/tools/cargo/bin/cargo.exe', '0000000000000002',
+                '00000000000000000000000000000002', 'C:/tools/cargo/bin',
+                '0000000000000001', '00000000000000000000000000000001', 100
+             )",
+            [],
+        )
+        .expect("insert existing approval record under the pre-environment-binding schema");
+    drop(connection);
+
+    let mut connection = DatabaseConnection::open(database.path()).expect("reopen database");
+    let result = MigrationRunner::default().run(&mut connection);
+    assert!(matches!(
+        result,
+        Err(DatabaseError::ValidationCommandEnvironmentBindingMigrationFailed { .. })
+    ));
+
+    let connection = database.open_raw();
+    assert_eq!(
+        count_rows(&connection, "task_validation_command_approvals"),
+        1,
+        "existing approval record must be preserved"
+    );
+    assert_eq!(
+        count_rows(&connection, "schema_migrations"),
+        11,
+        "0012 must not be recorded in migration history"
+    );
+    let has_environment_binding_columns: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('task_validation_command_approvals')
+                WHERE name = 'approved_cargo_home_path'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check environment binding columns");
+    assert!(
+        !has_environment_binding_columns,
+        "0012 migration must not have been applied"
+    );
+}
+
+#[test]
+fn migration_0012_validation_command_environment_binding_applies_when_no_existing_approvals() {
+    let database = TestDatabase::empty();
+    let mut connection = DatabaseConnection::open(database.path()).expect("open database");
+    let registry_up_to_0011 = &FOUNDATION_MIGRATION[..11];
+    MigrationRunner::new(registry_up_to_0011)
+        .run(&mut connection)
+        .expect("apply migrations up to 0011");
+    drop(connection);
+
+    let mut connection = DatabaseConnection::open(database.path()).expect("reopen database");
+    let result = MigrationRunner::new(&FOUNDATION_MIGRATION[..12]).run(&mut connection);
+    assert!(
+        result.is_ok(),
+        "migration 0012 should succeed with no existing approvals"
+    );
+
+    let connection = database.open_raw();
+    assert_eq!(count_rows(&connection, "schema_migrations"), 12);
+    let has_environment_binding_columns: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('task_validation_command_approvals')
+                WHERE name = 'approved_cargo_home_path'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check environment binding columns");
+    assert!(
+        has_environment_binding_columns,
+        "0012 migration should add environment binding columns"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_validation_command_result_sql(
+    connection: &Connection,
+    task_id: &str,
+    approved_task_version: i64,
+    command_kind: &str,
+    attempt_sequence: i64,
+    outcome: &str,
+    exit_code: Option<i32>,
+    safe_summary: &str,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO task_validation_command_results (
+            task_id, approved_task_version, command_kind, attempt_sequence,
+            outcome, exit_code, safe_summary, started_at_ms, completed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            task_id,
+            approved_task_version,
+            command_kind,
+            attempt_sequence,
+            outcome,
+            exit_code,
+            safe_summary,
+            started_at_ms,
+            completed_at_ms,
+        ],
+    )
+}
+
+#[test]
+fn task_validation_command_results_enforce_shape_sequence_fk_and_immutability() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "validation-task", "project");
+    insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\",\"--workspace\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    )
+    .expect("seed an approval for the Test kind");
+    insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Build",
+        "cargo",
+        "[\"build\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    )
+    .expect("seed an approval for the Build kind");
+
+    let no_approval = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Lint",
+        1,
+        "Success",
+        Some(0),
+        "ok",
+        100,
+        200,
+    );
+    assert!(
+        no_approval.as_ref().is_err_and(is_constraint_error),
+        "a result with no matching approval must be rejected by the foreign key"
+    );
+
+    let wrong_first_sequence = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        2,
+        "Success",
+        Some(0),
+        "ok",
+        100,
+        200,
+    );
+    assert!(
+        wrong_first_sequence
+            .as_ref()
+            .is_err_and(is_constraint_error),
+        "the first attempt for an approval must be sequence 1"
+    );
+
+    insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        1,
+        "Success",
+        Some(0),
+        "cargo test passed",
+        100,
+        200,
+    )
+    .expect("the first attempt succeeds at sequence 1");
+
+    let duplicate_sequence = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        1,
+        "Success",
+        Some(0),
+        "ok",
+        200,
+        300,
+    );
+    assert!(
+        duplicate_sequence.as_ref().is_err_and(is_constraint_error),
+        "a duplicate attempt_sequence for the same approval must be rejected"
+    );
+
+    let skipped_sequence = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        3,
+        "Success",
+        Some(0),
+        "ok",
+        200,
+        300,
+    );
+    assert!(
+        skipped_sequence.as_ref().is_err_and(is_constraint_error),
+        "attempt_sequence must not skip ahead of the next expected value"
+    );
+
+    insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        2,
+        "ExitFailure",
+        Some(101),
+        "cargo test failed",
+        200,
+        300,
+    )
+    .expect("the second attempt succeeds at sequence 2");
+
+    insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Build",
+        1,
+        "TimedOut",
+        None,
+        "cargo build timed out",
+        100,
+        200,
+    )
+    .expect("a different command kind has its own independent sequence starting at 1");
+
+    for (outcome, exit_code) in [
+        ("Success", None),
+        ("ExitFailure", None),
+        ("TimedOut", Some(0)),
+        ("StdoutBoundExceeded", Some(1)),
+        ("Cancelled", Some(0)),
+        ("Uncertain", Some(0)),
+    ] {
+        let bad_exit_code = insert_validation_command_result_sql(
+            &connection,
+            "validation-task",
+            0,
+            "Build",
+            2,
+            outcome,
+            exit_code,
+            "ok",
+            100,
+            200,
+        );
+        assert!(
+            bad_exit_code.as_ref().is_err_and(is_constraint_error),
+            "exit_code must be present only for a confirmed Success/ExitFailure: outcome={outcome}"
+        );
+    }
+
+    let bad_outcome = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Build",
+        2,
+        "NotAnOutcome",
+        None,
+        "ok",
+        100,
+        200,
+    );
+    assert!(bad_outcome.as_ref().is_err_and(is_constraint_error));
+
+    let empty_summary = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Build",
+        2,
+        "Success",
+        Some(0),
+        "",
+        100,
+        200,
+    );
+    assert!(empty_summary.as_ref().is_err_and(is_constraint_error));
+
+    let oversized_summary = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Build",
+        2,
+        "Success",
+        Some(0),
+        &"x".repeat(2001),
+        100,
+        200,
+    );
+    assert!(oversized_summary.as_ref().is_err_and(is_constraint_error));
+
+    let backwards_timestamps = insert_validation_command_result_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Build",
+        2,
+        "Success",
+        Some(0),
+        "ok",
+        200,
+        100,
+    );
+    assert!(
+        backwards_timestamps
+            .as_ref()
+            .is_err_and(is_constraint_error)
+    );
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_validation_command_results SET safe_summary = 'changed'
+             WHERE task_id = 'validation-task' AND command_kind = 'Test' AND attempt_sequence = 1",
+            [],
+        )
+        .expect_err("task_validation_command_results must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_validation_command_results WHERE task_id = 'validation-task'",
+            [],
+        )
+        .expect_err("task_validation_command_results rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    assert_eq!(
+        count_rows(&connection, "task_validation_command_results"),
+        3,
+        "only Test attempts 1+2 and Build attempt 1 ever actually persisted"
+    );
     assert_eq!(foreign_key_violation_count(&connection), 0);
 }

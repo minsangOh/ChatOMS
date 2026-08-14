@@ -17,7 +17,12 @@ impl WorkKind {
         match self {
             Self::Planning => TaskState::WorktreeReady,
             Self::Implementation => TaskState::AwaitingDesignApproval,
-            Self::Review => TaskState::Testing,
+            // `Testing -> Reviewing` is already an automatic transition
+            // (`TaskService::finalize_validation_command_batch` on full
+            // validation success), so by the time a Claude Review run can
+            // actually be started the task is already `Reviewing`, not
+            // `Testing`.
+            Self::Review => TaskState::Reviewing,
         }
     }
 
@@ -27,7 +32,7 @@ impl WorkKind {
             (self, state),
             (Self::Planning, TaskState::WorktreeReady)
                 | (Self::Implementation, TaskState::AwaitingDesignApproval)
-                | (Self::Review, TaskState::Testing)
+                | (Self::Review, TaskState::Reviewing)
         )
     }
 }
