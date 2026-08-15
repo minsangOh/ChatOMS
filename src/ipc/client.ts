@@ -1,14 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
 import { FrontendError, isRecord, toFrontendError } from "./errors";
+import { isHighRiskApprovalDto, isHighRiskApprovalStatusDto } from "./high_risk_approval";
 import { isNullablePlanningResultDto } from "./planning_result";
 import { isProviderEligibilityDtoArray } from "./provider_eligibility";
 import { isCancelReviewDto, isNullableReviewResultDto } from "./review_result";
+import { isRawUserDiffForReviewDto, isUserDiffApprovalDto } from "./user_diff_review";
 import {
   isApproveValidationCommandResultDto,
   isCancelTestingDto,
   isValidationCommandApprovalStatusDto,
   isValidationCommandCandidateDtoArray,
 } from "./validation_command";
+import {
+  isContextPackageImplementationReadinessDto,
+  isContextPackagePlanningReadinessDto,
+  isContextPackagePreparationDto,
+  isContextPackageReviewReadinessDto,
+} from "./types";
 import type {
   ActiveTaskDto,
   ActiveTaskStatusDto,
@@ -20,9 +28,16 @@ import type {
   CancelReviewDto,
   CancelTestingDto,
   CapabilityDto,
+  ContextPackageImplementationReadinessDto,
+  ContextPackagePlanningReadinessDto,
+  ContextPackagePreparationDto,
+  ContextPackageReviewReadinessDto,
   DatabaseStatus,
   HealthDto,
   HealthState,
+  HighRiskApprovalDto,
+  HighRiskApprovalStatusDto,
+  HighRiskCategory,
   LoggingStatus,
   LegacyMigrationDiagnosticDto,
   PlanningResultDto,
@@ -30,6 +45,7 @@ import type {
   ProviderEligibilityDto,
   ProjectCandidateDto,
   ProjectStatusDto,
+  RawUserDiffForReviewDto,
   RefreshClaudeCapabilityDto,
   RefreshOutcome,
   ReviewResultDto,
@@ -42,6 +58,7 @@ import type {
   TaskDto,
   TaskState,
   TaskTransitionDto,
+  UserDiffApprovalDto,
   ValidationCommandApprovalStatusDto,
   ValidationCommandCandidateDto,
   VersionDto,
@@ -70,8 +87,12 @@ export const IPC_COMMANDS = {
   startClaudePlanning: "start_claude_planning",
   cancelClaudePlanning: "cancel_claude_planning",
   getPlanningResult: "get_planning_result",
+  getContextPackagePlanningReadiness: "get_context_package_planning_readiness",
+  startClaudePlanningContextPackage: "start_claude_planning_context_package",
   startClaudeImplementation: "start_claude_implementation",
   cancelClaudeImplementation: "cancel_claude_implementation",
+  getContextPackageImplementationReadiness: "get_context_package_implementation_readiness",
+  startClaudeImplementationContextPackage: "start_claude_implementation_context_package",
   startValidationTesting: "start_validation_testing",
   cancelValidationTesting: "cancel_validation_testing",
   getValidationCommandCandidates: "get_validation_command_candidates",
@@ -80,6 +101,15 @@ export const IPC_COMMANDS = {
   startClaudeReview: "start_claude_review",
   cancelClaudeReview: "cancel_claude_review",
   getReviewResult: "get_review_result",
+  preparePlanningContextPackage: "prepare_planning_context_package",
+  prepareImplementationContextPackage: "prepare_implementation_context_package",
+  prepareReviewContextPackage: "prepare_review_context_package",
+  getContextPackageReviewReadiness: "get_context_package_review_readiness",
+  startClaudeReviewContextPackage: "start_claude_review_context_package",
+  getHighRiskApprovalStatus: "get_high_risk_approval_status",
+  approveHighRiskOperation: "approve_high_risk_operation",
+  getUserDiffForReview: "get_user_diff_for_review",
+  approveUserDiff: "approve_user_diff",
 } as const;
 
 export type InvokeTransport = (
@@ -110,8 +140,18 @@ export interface IpcClient {
   startClaudePlanning(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudePlanning(taskId: string): Promise<CancelPlanningDto>;
   getPlanningResult(taskId: string): Promise<PlanningResultDto | null>;
+  getContextPackagePlanningReadiness(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePlanningReadinessDto>;
+  startClaudePlanningContextPackage(taskId: string, expectedVersion: number): Promise<TaskDto>;
   startClaudeImplementation(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudeImplementation(taskId: string): Promise<CancelImplementationDto>;
+  getContextPackageImplementationReadiness(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackageImplementationReadinessDto>;
+  startClaudeImplementationContextPackage(taskId: string, expectedVersion: number): Promise<TaskDto>;
   getValidationCommandCandidates(taskId: string): Promise<readonly ValidationCommandCandidateDto[]>;
   getValidationCommandApprovalStatus(taskId: string): Promise<ValidationCommandApprovalStatusDto>;
   approveValidationCommand(
@@ -124,6 +164,39 @@ export interface IpcClient {
   startClaudeReview(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudeReview(taskId: string): Promise<CancelReviewDto>;
   getReviewResult(taskId: string): Promise<ReviewResultDto | null>;
+  preparePlanningContextPackage(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePreparationDto>;
+  prepareImplementationContextPackage(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePreparationDto>;
+  prepareReviewContextPackage(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePreparationDto>;
+  getContextPackageReviewReadiness(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackageReviewReadinessDto>;
+  startClaudeReviewContextPackage(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  getHighRiskApprovalStatus(
+    taskId: string,
+    expectedVersion: number,
+    riskCategory: HighRiskCategory,
+  ): Promise<HighRiskApprovalStatusDto>;
+  approveHighRiskOperation(
+    taskId: string,
+    expectedVersion: number,
+    riskCategory: HighRiskCategory,
+  ): Promise<HighRiskApprovalDto>;
+  getUserDiffForReview(taskId: string, expectedVersion: number): Promise<RawUserDiffForReviewDto>;
+  approveUserDiff(
+    taskId: string,
+    expectedVersion: number,
+    expectedDiffContentHash: string,
+  ): Promise<UserDiffApprovalDto>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -186,10 +259,32 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
       request(IPC_COMMANDS.cancelClaudePlanning, isCancelPlanningDto, { taskId }),
     getPlanningResult: (taskId) =>
       request(IPC_COMMANDS.getPlanningResult, isNullablePlanningResultDto, { taskId }),
+    getContextPackagePlanningReadiness: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.getContextPackagePlanningReadiness,
+        isContextPackagePlanningReadinessDto,
+        { taskId, expectedVersion },
+      ),
+    startClaudePlanningContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudePlanningContextPackage, isTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
     startClaudeImplementation: (taskId, expectedVersion) =>
       request(IPC_COMMANDS.startClaudeImplementation, isTaskDto, { taskId, expectedVersion }),
     cancelClaudeImplementation: (taskId) =>
       request(IPC_COMMANDS.cancelClaudeImplementation, isCancelImplementationDto, { taskId }),
+    getContextPackageImplementationReadiness: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.getContextPackageImplementationReadiness,
+        isContextPackageImplementationReadinessDto,
+        { taskId, expectedVersion },
+      ),
+    startClaudeImplementationContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudeImplementationContextPackage, isTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
     getValidationCommandCandidates: (taskId) =>
       request(IPC_COMMANDS.getValidationCommandCandidates, isValidationCommandCandidateDtoArray, {
         taskId,
@@ -216,6 +311,55 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
       request(IPC_COMMANDS.cancelClaudeReview, isCancelReviewDto, { taskId }),
     getReviewResult: (taskId) =>
       request(IPC_COMMANDS.getReviewResult, isNullableReviewResultDto, { taskId }),
+    preparePlanningContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.preparePlanningContextPackage, isContextPackagePreparationDto, {
+        taskId,
+        expectedVersion,
+      }),
+    prepareImplementationContextPackage: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.prepareImplementationContextPackage,
+        isContextPackagePreparationDto,
+        { taskId, expectedVersion },
+      ),
+    prepareReviewContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.prepareReviewContextPackage, isContextPackagePreparationDto, {
+        taskId,
+        expectedVersion,
+      }),
+    getContextPackageReviewReadiness: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.getContextPackageReviewReadiness, isContextPackageReviewReadinessDto, {
+        taskId,
+        expectedVersion,
+      }),
+    startClaudeReviewContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudeReviewContextPackage, isTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
+    getHighRiskApprovalStatus: (taskId, expectedVersion, riskCategory) =>
+      request(IPC_COMMANDS.getHighRiskApprovalStatus, isHighRiskApprovalStatusDto, {
+        taskId,
+        expectedVersion,
+        riskCategory,
+      }),
+    approveHighRiskOperation: (taskId, expectedVersion, riskCategory) =>
+      request(IPC_COMMANDS.approveHighRiskOperation, isHighRiskApprovalDto, {
+        taskId,
+        expectedVersion,
+        riskCategory,
+      }),
+    getUserDiffForReview: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.getUserDiffForReview, isRawUserDiffForReviewDto, {
+        taskId,
+        expectedVersion,
+      }),
+    approveUserDiff: (taskId, expectedVersion, expectedDiffContentHash) =>
+      request(IPC_COMMANDS.approveUserDiff, isUserDiffApprovalDto, {
+        taskId,
+        expectedVersion,
+        expectedDiffContentHash,
+      }),
   };
 }
 

@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
 use chatoms_application::{
+    context_package_planning_execution::{
+        BeginContextPackagePlanningExecutionRequest, ContextPackagePlanningExecutionRecorder,
+        ContextPackagePlanningExecutionStarter,
+    },
     error::ApplicationError,
     planning_execution::{
         BeginPlanningExecutionRequest, PlanningExecutionRecorder, PlanningExecutionStarter,
@@ -153,6 +157,129 @@ pub fn handle_start_claude_planning(
     Ok(task_dto)
 }
 
+/// Starts a Context Package v1 Claude Planning activation: fresh-checks
+/// capability and commits the `WorktreeReady -> Planning` transition
+/// synchronously exactly like [`handle_start_claude_planning`], the only
+/// difference being that
+/// [`ContextPackagePlanningExecutionStarter::begin`] requires an
+/// already-prepared Context Package v1 consent/manifest pair rather than
+/// creating a `LegacyPhase4` one. Runs the actual provider process and
+/// records its outcome on the same kind of detached background thread,
+/// sharing the exact same [`PlanningRunRegistry`] `handle_start_claude_planning`
+/// uses — a task can only ever have one `Planning` attempt in flight
+/// regardless of which path started it, so no second registry or cancel
+/// command is needed; [`handle_cancel_claude_planning`] and
+/// [`crate::commands::tasks`]'s startup reconciliation already work
+/// unchanged for this path.
+pub fn handle_start_claude_planning_context_package(
+    runtime: &ManagedRuntime,
+    task_id: &str,
+    expected_version: u64,
+) -> Result<TaskDto, IpcErrorDto> {
+    let id = parse_task_id(task_id)?;
+    let ready = runtime.ready_snapshot()?;
+
+    let Some(executable_path) = claude_executable_path(&ready)? else {
+        return Err(unsupported_capability_error());
+    };
+    let preflight_dir_handle = ready.preflight_dir.clone();
+    let Some(preflight_dir_path) = preflight_dir_handle
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+    else {
+        return Err(unsupported_capability_error());
+    };
+    let redactor = SecretRedactor::new().map_err(|_| IpcErrorDto::internal())?;
+
+    let mut precheck_capability = StdProviderCapabilityAdapter::new(
+        Some(executable_path.clone()),
+        preflight_dir_handle.clone(),
+        StdProcessRunner::new(),
+    );
+
+    let mut repository = ready.repository.clone();
+    let mut time = ready.time.clone();
+    let inputs = ContextPackagePlanningExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut precheck_capability,
+    )
+    .begin(BeginContextPackagePlanningExecutionRequest::new(
+        id,
+        expected_version,
+    ))
+    .map_err(IpcErrorDto::from)?;
+
+    let started_at_ms = time.now_ms().map_err(|_| IpcErrorDto::internal())?;
+    let task_dto = TaskDto::from(inputs.task.clone());
+
+    let Some(cancellation) = ready.planning_runs.register(id) else {
+        // Same reasoning as `handle_start_claude_planning`: the transition
+        // above already committed, so this is no longer a "nothing written"
+        // rejection, and a live registry entry for this task id should be
+        // impossible here (the version-conflict guard in
+        // `TaskService::start_context_package_planning` already fails
+        // closed before a second Planning attempt could reach this point).
+        let mut repository = ready.repository.clone();
+        let mut time = ready.time.clone();
+        let started_at_ms = time.now_ms().unwrap_or(started_at_ms);
+        let _ = TaskService::new(&mut repository, &mut time).record_planning_result(
+            RecordPlanningResultRequest::new(
+                id,
+                inputs.task.version,
+                PlanningResultOutcome::RecoveryRequired,
+                None,
+                None,
+                None,
+                started_at_ms,
+                "application".to_owned(),
+                "task.planning.context_package.registry-conflict".to_owned(),
+            ),
+        );
+        return Err(registry_conflict_error());
+    };
+    let planning_runs = ready.planning_runs.clone();
+    let expected_version = inputs.task.version;
+    let worktree_path = inputs.worktree_path;
+    let brief = inputs.brief;
+    let mut repository_for_thread = ready.repository.clone();
+    let mut time_for_thread = ready.time.clone();
+
+    std::thread::spawn(move || {
+        let _unregister_guard = UnregisterOnDrop {
+            planning_runs,
+            task_id: id,
+        };
+        let executor_capability = StdProviderCapabilityAdapter::new(
+            Some(executable_path.clone()),
+            preflight_dir_handle,
+            StdProcessRunner::new(),
+        );
+        let mut adapter = ClaudePlanningAdapter::new(
+            executor_capability,
+            StdProcessRunner::new(),
+            executable_path,
+            preflight_dir_path,
+            redactor,
+        );
+        let _ = ContextPackagePlanningExecutionRecorder::new(
+            &mut repository_for_thread,
+            &mut time_for_thread,
+        )
+        .run_and_record_with_panic_containment(
+            id,
+            expected_version,
+            &worktree_path,
+            &brief,
+            started_at_ms,
+            &mut adapter,
+            &cancellation,
+        );
+    });
+
+    Ok(task_dto)
+}
+
 /// Requests cancellation of an in-flight Claude Planning run for `task_id`.
 /// Returns whether a matching run was found; it does not itself change task
 /// state — only a subsequently *confirmed* process exit is ever recorded as
@@ -231,6 +358,15 @@ pub fn start_claude_planning(
     expected_version: u64,
 ) -> Result<TaskDto, IpcErrorDto> {
     handle_start_claude_planning(&state, &task_id, expected_version)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn start_claude_planning_context_package(
+    state: tauri::State<'_, ManagedRuntime>,
+    task_id: String,
+    expected_version: u64,
+) -> Result<TaskDto, IpcErrorDto> {
+    handle_start_claude_planning_context_package(&state, &task_id, expected_version)
 }
 
 #[tauri::command(rename_all = "camelCase")]

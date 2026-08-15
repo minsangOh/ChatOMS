@@ -11,7 +11,7 @@ use chatoms_application::{
     bootstrap::{ActiveTaskStatus, BootstrapStatus, DatabaseStatus, LoggingStatus, StorageStatus},
     error::ApplicationError,
 };
-use chatoms_domain::{Task, TaskId, TaskStateTransition};
+use chatoms_domain::{HighRiskCategory, Task, TaskId, TaskStateTransition};
 use chatoms_ports::{
     PlatformCapabilities, PlatformCapabilityPort, PlatformCapabilityStatus, TimeProvider,
     error::{FailureCategory, PortFailure},
@@ -21,15 +21,15 @@ use chatoms_ports::{
     },
     provider::ProviderKind,
     repository::{
-        ActiveLease, FoundationRepository, ProjectSummary, ProviderBindingRecord, RepositoryError,
-        RepositoryErrorCode, TaskGitIsolation, TaskPlanningResultRecord,
-        ValidationCommandApprovalRecord,
+        ActiveLease, ContextPackagePreparation, FoundationRepository, HighRiskApprovalRecord,
+        ProjectSummary, ProviderBindingRecord, RepositoryError, RepositoryErrorCode,
+        TaskGitIsolation, TaskPlanningResultRecord, ValidationCommandApprovalRecord,
     },
 };
 
 use super::{
-    REGISTERED_HANDLERS, implementation, planning, projects, provider_eligibility, review, system,
-    tasks, testing, validation_commands,
+    REGISTERED_HANDLERS, context_package, high_risk_approval, implementation, planning, projects,
+    provider_eligibility, review, system, tasks, testing, user_diff_review, validation_commands,
 };
 use crate::{
     dto::HealthStateDto,
@@ -54,6 +54,11 @@ struct RepositoryFake {
     review_result: Option<chatoms_ports::repository::TaskReviewResultRecord>,
     isolation: Option<TaskGitIsolation>,
     approvals: Vec<ValidationCommandApprovalRecord>,
+    high_risk_approvals: Vec<HighRiskApprovalRecord>,
+    /// Scripted result for whichever `prepare_*_context_package` method a
+    /// test calls. `None` falls through to `operation_failed()`, matching
+    /// every other not-yet-scripted method on this fake.
+    prepare_context_package_outcome: Option<Result<ContextPackagePreparation, RepositoryErrorCode>>,
 }
 
 impl FoundationRepository for RepositoryFake {
@@ -165,6 +170,122 @@ impl FoundationRepository for RepositoryFake {
             })
             .cloned()
             .collect())
+    }
+    fn prepare_planning_context_package(
+        &mut self,
+        _expected_version: u64,
+        _task_id: TaskId,
+        _prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.scripted_context_package_preparation()
+    }
+    fn prepare_implementation_context_package(
+        &mut self,
+        _expected_version: u64,
+        _task_id: TaskId,
+        _prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.scripted_context_package_preparation()
+    }
+    fn prepare_review_context_package(
+        &mut self,
+        _expected_version: u64,
+        _task_id: TaskId,
+        _prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.scripted_context_package_preparation()
+    }
+    /// Derived from `prepare_context_package_outcome` rather than a
+    /// dedicated field: a scripted successful preparation already carries
+    /// exactly the `ProviderConsent` a readiness check would need to find,
+    /// so reusing it keeps this fake minimal. Absent or errored scripting
+    /// reports "not found", never an error, matching a plain lookup miss.
+    fn get_provider_consent(
+        &mut self,
+        _task_id: TaskId,
+        _provider: ProviderKind,
+        _work_kind: chatoms_domain::WorkKind,
+        _approved_task_version: u64,
+        _data_scope: chatoms_domain::ContextDataScope,
+    ) -> Result<Option<chatoms_ports::repository::ProviderConsent>, RepositoryError> {
+        Ok(match self.prepare_context_package_outcome {
+            Some(Ok(preparation)) => Some(preparation.consent),
+            _ => None,
+        })
+    }
+    /// See [`Self::get_provider_consent`]; same derivation from
+    /// `prepare_context_package_outcome`.
+    fn get_context_package_manifest(
+        &mut self,
+        _task_id: TaskId,
+        _provider: ProviderKind,
+        _work_kind: chatoms_domain::WorkKind,
+        _approved_task_version: u64,
+        _data_scope: chatoms_domain::ContextDataScope,
+    ) -> Result<Option<chatoms_ports::repository::ContextPackageManifestRecord>, RepositoryError>
+    {
+        Ok(match self.prepare_context_package_outcome {
+            Some(Ok(preparation)) => Some(preparation.manifest),
+            _ => None,
+        })
+    }
+    fn get_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        risk_category: HighRiskCategory,
+    ) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+        Ok(self
+            .high_risk_approvals
+            .iter()
+            .find(|approval| {
+                approval.task_id == task_id
+                    && approval.approved_task_version == approved_task_version
+                    && approval.risk_category == risk_category
+            })
+            .copied())
+    }
+    fn ensure_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+        approved_at_ms: i64,
+    ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        let task = self
+            .task
+            .clone()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if let Some(existing) = self.high_risk_approvals.iter().find(|approval| {
+            approval.task_id == task_id
+                && approval.approved_task_version == expected_version
+                && approval.risk_category == risk_category
+        }) {
+            return Ok(*existing);
+        }
+        let approval = HighRiskApprovalRecord {
+            task_id,
+            approved_task_version: expected_version,
+            risk_category,
+            approved_at_ms,
+        };
+        self.high_risk_approvals.push(approval);
+        Ok(approval)
+    }
+}
+
+impl RepositoryFake {
+    fn scripted_context_package_preparation(
+        &self,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        match self.prepare_context_package_outcome {
+            Some(Ok(preparation)) => Ok(preparation),
+            Some(Err(code)) => Err(RepositoryError::new(code)),
+            None => Err(operation_failed()),
+        }
     }
 }
 
@@ -361,6 +482,8 @@ fn ready_runtime_with_git_and_claude_binding(
                 review_result: None,
                 isolation: None,
                 approvals: Vec::new(),
+                high_risk_approvals: Vec::new(),
+                prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
             capabilities: CapabilityHandle::new(CapabilityFake),
@@ -406,6 +529,8 @@ fn ready_runtime_with_task(
                 review_result: None,
                 isolation: None,
                 approvals: Vec::new(),
+                high_risk_approvals: Vec::new(),
+                prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
             capabilities: CapabilityHandle::new(CapabilityFake),
@@ -456,6 +581,64 @@ fn ready_runtime_with_task_and_review_result(
                 review_result,
                 isolation: None,
                 approvals: Vec::new(),
+                high_risk_approvals: Vec::new(),
+                prepare_context_package_outcome: None,
+            }),
+            time: TimeProviderHandle::new(TimeFake),
+            capabilities: CapabilityHandle::new(CapabilityFake),
+            git: crate::state::GitServiceHandle::new(GitCapabilityFake {
+                available: Ok(true),
+            }),
+            filesystem: crate::state::FilesystemIdentityHandle::new(
+                chatoms_platform::filesystem::WindowsFilesystemIdentity,
+            ),
+            worktree_paths: crate::state::WorktreePathHandle::new(
+                chatoms_platform::ManagedWorktreePaths::windows_from_environment()
+                    .expect("test worktree paths"),
+            ),
+            provider_capabilities: crate::state::ProviderCapabilityHandle::new(),
+            preflight_dir: None,
+            planning_runs: crate::state::PlanningRunRegistry::new(),
+            implementation_runs: crate::state::ImplementationRunRegistry::new(),
+            testing_runs: crate::state::TestingRunRegistry::new(),
+            review_runs: crate::state::ReviewRunRegistry::new(),
+        },
+        RuntimeResources::default(),
+    ))
+}
+
+/// Mirrors `ready_runtime_with_task`, but additionally seeds an optional
+/// `TaskGitIsolation` (Planning's `prepare_planning_context_package`
+/// precondition needs one; Implementation's/Review's do not) and a scripted
+/// `prepare_*_context_package` outcome — needed for
+/// `commands::context_package` tests, none of which spawn a background
+/// thread or touch any provider/executable/preflight state.
+fn ready_runtime_with_task_isolation_and_context_package_outcome(
+    calls: Arc<CallCounts>,
+    task: Option<Task>,
+    isolation: Option<TaskGitIsolation>,
+    prepare_context_package_outcome: Option<Result<ContextPackagePreparation, RepositoryErrorCode>>,
+) -> ManagedRuntime {
+    ManagedRuntime::ready(AppRuntime::new(
+        BootstrapStatus {
+            storage_status: StorageStatus::Ready,
+            database_status: DatabaseStatus::Ready,
+            logging_status: LoggingStatus::Ready,
+            active_task_status: ActiveTaskStatus::None,
+            application_version: APPLICATION_VERSION,
+            ready: true,
+        },
+        RuntimePorts {
+            repository: RepositoryHandle::new(RepositoryFake {
+                calls,
+                claude_binding: None,
+                task,
+                planning_result: None,
+                review_result: None,
+                isolation,
+                approvals: Vec::new(),
+                high_risk_approvals: Vec::new(),
+                prepare_context_package_outcome,
             }),
             time: TimeProviderHandle::new(TimeFake),
             capabilities: CapabilityHandle::new(CapabilityFake),
@@ -542,6 +725,8 @@ fn ready_runtime_with_task_isolation_filesystem_and_resolved_paths(
                 review_result: None,
                 isolation,
                 approvals: Vec::new(),
+                high_risk_approvals: Vec::new(),
+                prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
             capabilities: CapabilityHandle::new(CapabilityFake),
@@ -602,6 +787,8 @@ fn ready_runtime_with_blocking_git(
                 review_result: None,
                 isolation: None,
                 approvals: Vec::new(),
+                high_risk_approvals: Vec::new(),
+                prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
             capabilities: CapabilityHandle::new(CapabilityFake),
@@ -787,7 +974,7 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 
 #[test]
 fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 32);
+    assert_eq!(REGISTERED_HANDLERS.len(), 45);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -813,8 +1000,12 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "start_claude_planning",
             "cancel_claude_planning",
             "get_planning_result",
+            "get_context_package_planning_readiness",
+            "start_claude_planning_context_package",
             "start_claude_implementation",
             "cancel_claude_implementation",
+            "get_context_package_implementation_readiness",
+            "start_claude_implementation_context_package",
             "start_validation_testing",
             "cancel_validation_testing",
             "get_validation_command_candidates",
@@ -823,6 +1014,15 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "start_claude_review",
             "cancel_claude_review",
             "get_review_result",
+            "prepare_planning_context_package",
+            "prepare_implementation_context_package",
+            "prepare_review_context_package",
+            "get_context_package_review_readiness",
+            "start_claude_review_context_package",
+            "get_high_risk_approval_status",
+            "approve_high_risk_operation",
+            "get_user_diff_for_review",
+            "approve_user_diff",
         ]
     );
     for forbidden in [
@@ -1049,6 +1249,57 @@ fn start_claude_planning_without_a_preflight_directory_is_unsupported_and_starts
 }
 
 #[test]
+fn start_claude_planning_context_package_without_a_configured_executable_is_unsupported_and_starts_nothing()
+ {
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), None);
+
+    let error = planning::handle_start_claude_planning_context_package(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+    )
+    .expect_err("no executable path is configured");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+}
+
+#[test]
+fn start_claude_planning_context_package_without_a_preflight_directory_is_unsupported_and_starts_nothing()
+ {
+    let calls = Arc::new(CallCounts::default());
+    let binding = ProviderBindingRecord {
+        id: "binding-1".to_owned(),
+        app_profile_id: "profile-1".to_owned(),
+        provider_kind: ProviderKind::Claude,
+        display_name: "Claude Code".to_owned(),
+        executable_path: Some("C:\\trusted\\claude.exe".to_owned()),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), Some(binding));
+
+    let error = planning::handle_start_claude_planning_context_package(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+    )
+    .expect_err("no preflight directory is available in this test runtime");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+}
+
+#[test]
 fn cancel_claude_planning_reports_whether_a_matching_run_was_found() {
     let calls = Arc::new(CallCounts::default());
     let runtime = ready_runtime(calls);
@@ -1109,6 +1360,99 @@ fn start_claude_implementation_without_a_preflight_directory_is_unsupported_and_
         0,
         "the task must never be loaded once capability is rejected"
     );
+}
+
+#[test]
+fn start_claude_implementation_context_package_without_a_configured_executable_is_unsupported_and_starts_nothing()
+ {
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), None);
+
+    let error = implementation::handle_start_claude_implementation_context_package(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+    )
+    .expect_err("no executable path is configured");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+}
+
+#[test]
+fn start_claude_implementation_context_package_without_a_preflight_directory_is_unsupported_and_starts_nothing()
+ {
+    let calls = Arc::new(CallCounts::default());
+    let binding = ProviderBindingRecord {
+        id: "binding-1".to_owned(),
+        app_profile_id: "profile-1".to_owned(),
+        provider_kind: ProviderKind::Claude,
+        display_name: "Claude Code".to_owned(),
+        executable_path: Some("C:\\trusted\\claude.exe".to_owned()),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), Some(binding));
+
+    let error = implementation::handle_start_claude_implementation_context_package(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+    )
+    .expect_err("no preflight directory is available in this test runtime");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+}
+
+#[test]
+fn get_context_package_implementation_readiness_is_true_when_the_pair_is_prepared() {
+    let task_id = TaskId::new();
+    let preparation =
+        context_package_preparation(task_id, chatoms_domain::WorkKind::Implementation, 1);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        None,
+        None,
+        Some(Ok(preparation)),
+    );
+
+    let dto = context_package::handle_get_context_package_implementation_readiness(
+        &runtime,
+        &task_id.to_string(),
+        1,
+    )
+    .expect("readiness lookup succeeds");
+
+    assert!(dto.ready);
+}
+
+#[test]
+fn get_context_package_implementation_readiness_is_false_when_nothing_is_prepared() {
+    let task_id = TaskId::new();
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        None,
+        None,
+        None,
+    );
+
+    let dto = context_package::handle_get_context_package_implementation_readiness(
+        &runtime,
+        &task_id.to_string(),
+        1,
+    )
+    .expect("readiness lookup succeeds");
+
+    assert!(!dto.ready);
 }
 
 #[test]
@@ -1634,6 +1978,343 @@ fn start_claude_review_without_a_preflight_directory_is_unsupported_and_starts_n
 }
 
 #[test]
+fn start_claude_review_context_package_without_a_configured_executable_is_unsupported_and_starts_nothing()
+ {
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), None);
+
+    let error =
+        review::handle_start_claude_review_context_package(&runtime, &TaskId::new().to_string(), 1)
+            .expect_err("no executable path is configured");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+    let ready = runtime.ready_snapshot().expect("ready runtime");
+    assert!(
+        !ready.review_runs.request_cancellation(TaskId::new()),
+        "no run may ever be registered when the capability gate rejects"
+    );
+}
+
+#[test]
+fn start_claude_review_context_package_without_a_preflight_directory_is_unsupported_and_starts_nothing()
+ {
+    let calls = Arc::new(CallCounts::default());
+    let binding = ProviderBindingRecord {
+        id: "binding-1".to_owned(),
+        app_profile_id: "profile-1".to_owned(),
+        provider_kind: ProviderKind::Claude,
+        display_name: "Claude Code".to_owned(),
+        executable_path: Some("C:\\trusted\\claude.exe".to_owned()),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), Some(binding));
+
+    let error =
+        review::handle_start_claude_review_context_package(&runtime, &TaskId::new().to_string(), 1)
+            .expect_err("no preflight directory is available in this test runtime");
+
+    assert_eq!(error.code, "APP_UNSUPPORTED");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "the task must never be loaded once capability is rejected"
+    );
+}
+
+#[test]
+fn get_context_package_review_readiness_is_true_when_the_pair_is_prepared() {
+    let task_id = TaskId::new();
+    let preparation = context_package_preparation(task_id, chatoms_domain::WorkKind::Review, 1);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        None,
+        None,
+        Some(Ok(preparation)),
+    );
+
+    let dto = context_package::handle_get_context_package_review_readiness(
+        &runtime,
+        &task_id.to_string(),
+        1,
+    )
+    .expect("readiness lookup succeeds");
+
+    assert!(dto.ready);
+}
+
+#[test]
+fn get_context_package_review_readiness_is_false_when_nothing_is_prepared() {
+    let task_id = TaskId::new();
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        None,
+        None,
+        None,
+    );
+
+    let dto = context_package::handle_get_context_package_review_readiness(
+        &runtime,
+        &task_id.to_string(),
+        1,
+    )
+    .expect("readiness lookup succeeds");
+
+    assert!(!dto.ready);
+}
+
+const ALL_HIGH_RISK_CATEGORY_DTOS: [crate::dto::HighRiskCategoryDto; 13] = [
+    crate::dto::HighRiskCategoryDto::ArchitectureChange,
+    crate::dto::HighRiskCategoryDto::DatabaseSchemaChange,
+    crate::dto::HighRiskCategoryDto::AuthenticationOrAuthorizationChange,
+    crate::dto::HighRiskCategoryDto::SecurityPolicyChange,
+    crate::dto::HighRiskCategoryDto::ExternalNetworkBehaviorAddition,
+    crate::dto::HighRiskCategoryDto::ExternalDataTransmissionAddition,
+    crate::dto::HighRiskCategoryDto::LargeScaleFileMoveOrDeletion,
+    crate::dto::HighRiskCategoryDto::PublicApiOrStorageFormatChange,
+    crate::dto::HighRiskCategoryDto::OperatingSystemConfigurationChange,
+    crate::dto::HighRiskCategoryDto::AdministratorPrivilegesRequired,
+    crate::dto::HighRiskCategoryDto::BreakingCompatibilityChange,
+    crate::dto::HighRiskCategoryDto::DataMigration,
+    crate::dto::HighRiskCategoryDto::DifficultToRecoverChange,
+];
+
+#[test]
+fn get_high_risk_approval_status_is_false_when_nothing_is_approved() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let status = high_risk_approval::handle_get_high_risk_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect("status lookup succeeds");
+
+    assert!(!status.approved);
+}
+
+#[test]
+fn get_high_risk_approval_status_for_a_missing_task_is_a_safe_not_found_error() {
+    let runtime = ready_runtime_with_task(Arc::new(CallCounts::default()), None, None);
+
+    let error = high_risk_approval::handle_get_high_risk_approval_status(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect_err("missing task");
+
+    assert_eq!(error.code, "APP_NOT_FOUND");
+}
+
+#[test]
+fn get_high_risk_approval_status_propagates_a_stale_version_error_instead_of_false() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let error = high_risk_approval::handle_get_high_risk_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version() + 1,
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect_err("a stale expected_version must be rejected, never reported as approved: false");
+
+    assert_eq!(error.code, "APP_VERSION_CONFLICT");
+}
+
+#[test]
+fn approve_high_risk_operation_first_call_creates_the_approval_and_status_then_reports_it() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let approval = high_risk_approval::handle_approve_high_risk_operation(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect("first approval succeeds");
+    assert_eq!(
+        approval.risk_category,
+        crate::dto::HighRiskCategoryDto::DataMigration
+    );
+
+    let status = high_risk_approval::handle_get_high_risk_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect("status lookup succeeds");
+    assert!(status.approved);
+
+    // A different category for the same task/version must remain unapproved
+    // -- approving one category must never mark another as approved.
+    let other = high_risk_approval::handle_get_high_risk_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::ArchitectureChange,
+    )
+    .expect("status lookup succeeds");
+    assert!(!other.approved);
+}
+
+#[test]
+fn approve_high_risk_operation_reuses_the_existing_approval_with_identical_success_semantics() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let first = high_risk_approval::handle_approve_high_risk_operation(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::BreakingCompatibilityChange,
+    )
+    .expect("first call creates the approval");
+    let second = high_risk_approval::handle_approve_high_risk_operation(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::BreakingCompatibilityChange,
+    )
+    .expect("second call must reuse, not fail");
+
+    assert_eq!(
+        first, second,
+        "create and reuse must return the same content-free success result"
+    );
+}
+
+#[test]
+fn approve_high_risk_operation_rejects_a_stale_version_and_creates_nothing() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let error = high_risk_approval::handle_approve_high_risk_operation(
+        &runtime,
+        &task.id().to_string(),
+        task.version() + 1,
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect_err("a stale expected_version must be rejected");
+    assert_eq!(error.code, "APP_VERSION_CONFLICT");
+
+    let status = high_risk_approval::handle_get_high_risk_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect("status lookup succeeds");
+    assert!(
+        !status.approved,
+        "a rejected stale-version approve must never leave an approval behind"
+    );
+}
+
+#[test]
+fn approve_high_risk_operation_for_a_missing_task_is_a_safe_not_found_error() {
+    let runtime = ready_runtime_with_task(Arc::new(CallCounts::default()), None, None);
+
+    let error = high_risk_approval::handle_approve_high_risk_operation(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+        crate::dto::HighRiskCategoryDto::DataMigration,
+    )
+    .expect_err("missing task");
+
+    assert_eq!(error.code, "APP_NOT_FOUND");
+}
+
+#[test]
+fn approve_high_risk_operation_never_changes_task_state_version_history_or_lease() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_task(Arc::clone(&calls), Some(task.clone()), None);
+
+    // `RepositoryFake::save_transition`/`terminate_task`/`save_recovery_target`
+    // all unconditionally return `Err(operation_failed())`; if approving
+    // (or checking) a high-risk category ever drove any of those, this
+    // whole test would fail outright rather than merely leaving stale
+    // assertions unexercised.
+    high_risk_approval::handle_approve_high_risk_operation(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::SecurityPolicyChange,
+    )
+    .expect("approve succeeds");
+    high_risk_approval::handle_get_high_risk_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::HighRiskCategoryDto::SecurityPolicyChange,
+    )
+    .expect("status lookup succeeds");
+
+    assert_eq!(
+        calls.active.load(Ordering::SeqCst),
+        0,
+        "neither approve nor status ever queries the active lease"
+    );
+}
+
+#[test]
+fn high_risk_approval_status_and_approve_round_trip_for_all_thirteen_categories() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    for category in ALL_HIGH_RISK_CATEGORY_DTOS {
+        let before = high_risk_approval::handle_get_high_risk_approval_status(
+            &runtime,
+            &task.id().to_string(),
+            task.version(),
+            category,
+        )
+        .unwrap_or_else(|error| panic!("status lookup for {category:?}: {error:?}"));
+        assert!(!before.approved, "{category:?} must start unapproved");
+
+        let approval = high_risk_approval::handle_approve_high_risk_operation(
+            &runtime,
+            &task.id().to_string(),
+            task.version(),
+            category,
+        )
+        .unwrap_or_else(|error| panic!("approve for {category:?}: {error:?}"));
+        assert_eq!(approval.risk_category, category);
+
+        let after = high_risk_approval::handle_get_high_risk_approval_status(
+            &runtime,
+            &task.id().to_string(),
+            task.version(),
+            category,
+        )
+        .unwrap_or_else(|error| panic!("status lookup after approve for {category:?}: {error:?}"));
+        assert!(
+            after.approved,
+            "{category:?} must be approved after the call"
+        );
+    }
+}
+
+#[test]
 fn cancel_claude_review_reports_whether_a_matching_run_was_found() {
     let calls = Arc::new(CallCounts::default());
     let runtime = ready_runtime(calls);
@@ -1730,4 +2411,340 @@ fn get_review_result_for_a_missing_task_is_a_safe_not_found_error() {
     let error = review::handle_get_review_result(&runtime, &TaskId::new().to_string())
         .expect_err("missing task");
     assert_eq!(error.code, "APP_NOT_FOUND");
+}
+
+fn context_package_preparation(
+    task_id: TaskId,
+    work_kind: chatoms_domain::WorkKind,
+    approved_task_version: u64,
+) -> ContextPackagePreparation {
+    ContextPackagePreparation {
+        consent: chatoms_ports::repository::ProviderConsent {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind,
+            approved_task_version,
+            data_scope: chatoms_domain::ContextDataScope::ContextPackageV1,
+            consented_at_ms: 200,
+        },
+        manifest: chatoms_ports::repository::ContextPackageManifestRecord {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind,
+            approved_task_version,
+            data_scope: chatoms_domain::ContextDataScope::ContextPackageV1,
+            created_at_ms: 210,
+        },
+    }
+}
+
+#[test]
+fn prepare_planning_context_package_succeeds_and_never_touches_task_state_or_version() {
+    let task = task_in_state(chatoms_domain::TaskState::WorktreeReady);
+    let isolation = worktree_ready_isolation(
+        task.id(),
+        task.project_id(),
+        std::path::Path::new("C:/managed/task"),
+        task.version(),
+    );
+    let preparation = context_package_preparation(
+        task.id(),
+        chatoms_domain::WorkKind::Planning,
+        task.version(),
+    );
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        Some(isolation),
+        Some(Ok(preparation)),
+    );
+
+    let dto = context_package::handle_prepare_planning_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("preparation succeeds");
+
+    assert_eq!(dto.work_kind, crate::dto::WorkKindDto::Planning);
+    assert_eq!(
+        dto.data_scope,
+        crate::dto::ContextPackageDataScopeDto::ContextPackageV1
+    );
+    assert_eq!(dto.consented_at_ms, 200);
+    assert_eq!(dto.manifest_created_at_ms, 210);
+
+    // No background execution: this fake never records a state-changing
+    // call, so if the handler had tried to save a transition or terminate
+    // the task, the fake's `save_transition`/`terminate_task` overrides
+    // (both of which unconditionally return `operation_failed()`) would
+    // have made the call above fail instead of succeeding.
+}
+
+#[test]
+fn prepare_planning_context_package_propagates_a_wrong_state_precondition_failure() {
+    let task = task_in_state(chatoms_domain::TaskState::Planning);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        None,
+    );
+
+    let error = context_package::handle_prepare_planning_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("Planning must not be accepted as WorktreeReady");
+    assert_eq!(error.code, "APP_INVALID_STATE");
+}
+
+#[test]
+fn prepare_planning_context_package_propagates_a_stale_version_precondition_failure() {
+    let task = task_in_state(chatoms_domain::TaskState::WorktreeReady);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        None,
+    );
+
+    let error = context_package::handle_prepare_planning_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version() + 41,
+    )
+    .expect_err("a stale expected_version must be rejected");
+    assert_eq!(error.code, "APP_VERSION_CONFLICT");
+}
+
+#[test]
+fn prepare_planning_context_package_propagates_a_repository_failure_without_converting_it_to_success()
+ {
+    let task = task_in_state(chatoms_domain::TaskState::WorktreeReady);
+    let isolation = worktree_ready_isolation(
+        task.id(),
+        task.project_id(),
+        std::path::Path::new("C:/managed/task"),
+        task.version(),
+    );
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        Some(isolation),
+        Some(Err(RepositoryErrorCode::InvalidPersistenceState)),
+    );
+
+    let error = context_package::handle_prepare_planning_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("a repository failure must propagate as an error, never a success");
+    assert_eq!(error.code, "APP_INTERNAL");
+}
+
+#[test]
+fn prepare_implementation_context_package_succeeds_and_never_touches_task_state_or_version() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let preparation = context_package_preparation(
+        task.id(),
+        chatoms_domain::WorkKind::Implementation,
+        task.version(),
+    );
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        Some(Ok(preparation)),
+    );
+
+    let dto = context_package::handle_prepare_implementation_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("preparation succeeds");
+
+    assert_eq!(dto.work_kind, crate::dto::WorkKindDto::Implementation);
+    assert_eq!(
+        dto.data_scope,
+        crate::dto::ContextPackageDataScopeDto::ContextPackageV1
+    );
+}
+
+#[test]
+fn prepare_implementation_context_package_propagates_a_wrong_state_precondition_failure() {
+    let task = task_in_state(chatoms_domain::TaskState::WorktreeReady);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        None,
+    );
+
+    let error = context_package::handle_prepare_implementation_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("WorktreeReady must not be accepted as AwaitingDesignApproval");
+    assert_eq!(error.code, "APP_INVALID_STATE");
+}
+
+#[test]
+fn prepare_implementation_context_package_propagates_a_repository_failure() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingDesignApproval);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        Some(Err(RepositoryErrorCode::InvalidPersistenceState)),
+    );
+
+    let error = context_package::handle_prepare_implementation_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("a repository failure must propagate as an error, never a success");
+    assert_eq!(error.code, "APP_INTERNAL");
+}
+
+#[test]
+fn prepare_review_context_package_succeeds_and_never_touches_task_state_or_version() {
+    let task = task_in_state(chatoms_domain::TaskState::Reviewing);
+    let preparation =
+        context_package_preparation(task.id(), chatoms_domain::WorkKind::Review, task.version());
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        Some(Ok(preparation)),
+    );
+
+    let dto = context_package::handle_prepare_review_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("preparation succeeds");
+
+    assert_eq!(dto.work_kind, crate::dto::WorkKindDto::Review);
+    assert_eq!(
+        dto.data_scope,
+        crate::dto::ContextPackageDataScopeDto::ContextPackageV1
+    );
+}
+
+#[test]
+fn prepare_review_context_package_propagates_a_wrong_state_precondition_failure() {
+    let task = task_in_state(chatoms_domain::TaskState::Testing);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        None,
+    );
+
+    let error = context_package::handle_prepare_review_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("Testing must not be accepted as Reviewing");
+    assert_eq!(error.code, "APP_INVALID_STATE");
+}
+
+#[test]
+fn prepare_review_context_package_propagates_a_repository_failure() {
+    let task = task_in_state(chatoms_domain::TaskState::Reviewing);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        Some(task.clone()),
+        None,
+        Some(Err(RepositoryErrorCode::InvalidPersistenceState)),
+    );
+
+    let error = context_package::handle_prepare_review_context_package(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("a repository failure must propagate as an error, never a success");
+    assert_eq!(error.code, "APP_INTERNAL");
+}
+
+#[test]
+fn get_context_package_planning_readiness_is_true_when_the_pair_is_prepared() {
+    let task_id = TaskId::new();
+    let preparation = context_package_preparation(task_id, chatoms_domain::WorkKind::Planning, 1);
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        None,
+        None,
+        Some(Ok(preparation)),
+    );
+
+    let dto = context_package::handle_get_context_package_planning_readiness(
+        &runtime,
+        &task_id.to_string(),
+        1,
+    )
+    .expect("readiness lookup succeeds");
+
+    assert!(dto.ready);
+}
+
+#[test]
+fn get_context_package_planning_readiness_is_false_when_nothing_is_prepared() {
+    let task_id = TaskId::new();
+    let runtime = ready_runtime_with_task_isolation_and_context_package_outcome(
+        Arc::new(CallCounts::default()),
+        None,
+        None,
+        None,
+    );
+
+    let dto = context_package::handle_get_context_package_planning_readiness(
+        &runtime,
+        &task_id.to_string(),
+        1,
+    )
+    .expect("readiness lookup succeeds");
+
+    assert!(!dto.ready);
+}
+
+#[test]
+fn get_user_diff_for_review_rejects_an_unparseable_task_id_before_touching_git_or_repository() {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error = user_diff_review::handle_get_user_diff_for_review(&runtime, "not-a-task-id", 1)
+        .expect_err("malformed task id must be rejected");
+    assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn approve_user_diff_rejects_an_unparseable_task_id_before_touching_git_or_repository() {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error =
+        user_diff_review::handle_approve_user_diff(&runtime, "not-a-task-id", 1, &"a".repeat(64))
+            .expect_err("malformed task id must be rejected");
+    assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn approve_user_diff_rejects_a_malformed_hash_before_touching_git_or_repository() {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    for malformed in ["", "not-hex", &"a".repeat(63), &"A".repeat(64)] {
+        let error = user_diff_review::handle_approve_user_diff(
+            &runtime,
+            &TaskId::new().to_string(),
+            1,
+            malformed,
+        )
+        .expect_err("malformed hash must be rejected");
+        assert_eq!(error.code, "APP_INVALID_INPUT");
+    }
 }

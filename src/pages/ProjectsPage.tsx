@@ -4,9 +4,28 @@ import type { FormEvent } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
+import { UserDiffReviewModal } from "../components/UserDiffReviewModal";
 import type { IpcClient } from "../ipc/client";
 import { FrontendError, toFrontendError } from "../ipc/errors";
-import type { ApproveValidationCommandInput, EligibilityBlockingReason, PlanningResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, ReviewResultDto, TaskBriefInput, TaskIsolationDto, ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKind } from "../ipc/types";
+import { HIGH_RISK_CATEGORIES } from "../ipc/high_risk_approval";
+import type { ApproveValidationCommandInput, EligibilityBlockingReason, HighRiskCategory, PlanningResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, ReviewResultDto, TaskBriefInput, TaskIsolationDto, ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKind } from "../ipc/types";
+
+type ContextPackagePlanningReadinessLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; ready: boolean }
+  | { kind: "error" };
+type ContextPackageImplementationReadinessLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; ready: boolean }
+  | { kind: "error" };
+type ContextPackageReviewReadinessLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; ready: boolean }
+  | { kind: "error" };
+type HighRiskApprovalLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; approved: boolean }
+  | { kind: "error" };
 
 interface ProjectsPageProps { client: IpcClient; }
 type ProjectsPageState = { kind: "loading" } | { kind: "error"; error: FrontendError } | { kind: "ready"; projects: ProjectDto[] };
@@ -55,6 +74,11 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [briefError, setBriefError] = useState<string | null>(null);
   const [eligibilities, setEligibilities] = useState<Record<string, readonly ProviderEligibilityDto[]>>({});
   const [consentDialog, setConsentDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; workKind: "planning" | "implementation" | "review" } | null>(null);
+  const [contextPackagePrepDialog, setContextPackagePrepDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; workKind: "planning" | "implementation" | "review" } | null>(null);
+  const [contextPackagePreparationNotice, setContextPackagePreparationNotice] = useState<string | null>(null);
+  const [contextPackagePlanningReadiness, setContextPackagePlanningReadiness] = useState<Record<string, ContextPackagePlanningReadinessLoadState>>({});
+  const [contextPackageImplementationReadiness, setContextPackageImplementationReadiness] = useState<Record<string, ContextPackageImplementationReadinessLoadState>>({});
+  const [contextPackageReviewReadiness, setContextPackageReviewReadiness] = useState<Record<string, ContextPackageReviewReadinessLoadState>>({});
   const [planningResults, setPlanningResults] = useState<Record<string, PlanningResultLoadState>>({});
   const [reviewResults, setReviewResults] = useState<Record<string, ReviewResultLoadState>>({});
   const [validationCandidates, setValidationCandidates] = useState<Record<string, ValidationCandidatesLoadState>>({});
@@ -62,6 +86,9 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [validationForm, setValidationForm] = useState<ValidationCommandForm>(emptyValidationCommandForm);
   const [testingRuns, setTestingRuns] = useState<Record<string, boolean>>({});
   const [reviewRuns, setReviewRuns] = useState<Record<string, boolean>>({});
+  const [highRiskApprovals, setHighRiskApprovals] = useState<Record<string, Partial<Record<HighRiskCategory, HighRiskApprovalLoadState>>>>({});
+  const [highRiskApprovalDialog, setHighRiskApprovalDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; category: HighRiskCategory } | null>(null);
+  const [userDiffReviewDialog, setUserDiffReviewDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -104,6 +131,84 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
     ).catch(() => {});
     return () => { active = false; };
   }, [client, isolations, eligibilities]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) =>
+        isolation.taskState === "worktreeReady" &&
+        contextPackagePlanningReadiness[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setContextPackagePlanningReadiness((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getContextPackagePlanningReadiness(isolation.taskId, isolation.taskVersion);
+          if (active) setContextPackagePlanningReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "ready", ready: status.ready } }));
+        } catch {
+          if (active) setContextPackagePlanningReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, contextPackagePlanningReadiness]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) =>
+        isolation.taskState === "awaitingDesignApproval" &&
+        contextPackageImplementationReadiness[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setContextPackageImplementationReadiness((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getContextPackageImplementationReadiness(isolation.taskId, isolation.taskVersion);
+          if (active) setContextPackageImplementationReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "ready", ready: status.ready } }));
+        } catch {
+          if (active) setContextPackageImplementationReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, contextPackageImplementationReadiness]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) =>
+        isolation.taskState === "reviewing" &&
+        contextPackageReviewReadiness[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setContextPackageReviewReadiness((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getContextPackageReviewReadiness(isolation.taskId, isolation.taskVersion);
+          if (active) setContextPackageReviewReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "ready", ready: status.ready } }));
+        } catch {
+          if (active) setContextPackageReviewReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, contextPackageReviewReadiness]);
 
   useEffect(() => {
     const pending = Object.values(isolations).filter(
@@ -202,7 +307,58 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   }, [client, isolations, validationApprovals]);
 
   useEffect(() => {
+    const pending: { taskId: string; taskVersion: number; category: HighRiskCategory }[] = [];
+    for (const isolation of Object.values(isolations)) {
+      if (isolation.taskState !== "awaitingDesignApproval") continue;
+      const existing = highRiskApprovals[isolation.taskId];
+      for (const category of HIGH_RISK_CATEGORIES) {
+        if (existing?.[category] === undefined) {
+          pending.push({ taskId: isolation.taskId, taskVersion: isolation.taskVersion, category });
+        }
+      }
+    }
+    if (pending.length === 0) return;
+    setHighRiskApprovals((current) => {
+      const next = { ...current };
+      for (const item of pending) {
+        next[item.taskId] = { ...next[item.taskId], [item.category]: { kind: "loading" } };
+      }
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (item) => {
+        try {
+          const status = await client.getHighRiskApprovalStatus(item.taskId, item.taskVersion, item.category);
+          if (active) {
+            setHighRiskApprovals((current) => ({
+              ...current,
+              [item.taskId]: { ...current[item.taskId], [item.category]: { kind: "ready", approved: status.approved } },
+            }));
+          }
+        } catch {
+          if (active) {
+            setHighRiskApprovals((current) => ({
+              ...current,
+              [item.taskId]: { ...current[item.taskId], [item.category]: { kind: "error" } },
+            }));
+          }
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, highRiskApprovals]);
+
+  useEffect(() => {
     setValidationForm(emptyValidationCommandForm);
+  }, [activeTaskId]);
+
+  useEffect(() => {
+    setContextPackagePreparationNotice(null);
+  }, [activeTaskId]);
+
+  useEffect(() => {
+    setUserDiffReviewDialog(null);
   }, [activeTaskId]);
 
   useEffect(() => {
@@ -299,6 +455,77 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       }
     });
   };
+  const prepareContextPackage = async () => {
+    if (!contextPackagePrepDialog) return;
+    const dialog = contextPackagePrepDialog;
+    await run(async () => {
+      if (dialog.workKind === "planning") {
+        await client.preparePlanningContextPackage(dialog.taskId, dialog.taskVersion);
+        // The cached readiness read for this task is now stale (it was
+        // "not ready" before this call); clearing it makes the readiness
+        // effect refetch and the activation button below reflect reality.
+        setContextPackagePlanningReadiness((current) => {
+          const next = { ...current };
+          delete next[dialog.taskId];
+          return next;
+        });
+      } else if (dialog.workKind === "implementation") {
+        await client.prepareImplementationContextPackage(dialog.taskId, dialog.taskVersion);
+        // Same reasoning as the planning branch above: this task's cached
+        // Implementation readiness read was "not ready" before this call,
+        // so clearing it makes the readiness effect refetch and the
+        // activation button below reflect reality.
+        setContextPackageImplementationReadiness((current) => {
+          const next = { ...current };
+          delete next[dialog.taskId];
+          return next;
+        });
+      } else {
+        await client.prepareReviewContextPackage(dialog.taskId, dialog.taskVersion);
+        // Same reasoning as the planning/implementation branches above: this
+        // task's cached Review readiness read was "not ready" before this
+        // call, so clearing it makes the readiness effect refetch and the
+        // activation button below reflect reality.
+        setContextPackageReviewReadiness((current) => {
+          const next = { ...current };
+          delete next[dialog.taskId];
+          return next;
+        });
+      }
+      // Deliberately does not update `isolations` (unlike `startWork`, which
+      // does): preparation never starts Claude and never changes this
+      // task's state or version, so there is nothing here to refresh.
+      setContextPackagePrepDialog(null);
+      setContextPackagePreparationNotice(
+        "Context Package v1 consent recorded. Claude was not started and this task's status is unchanged.",
+      );
+    });
+  };
+  const startContextPackagePlanning = async (projectId: string, taskId: string, taskVersion: number) => run(async () => {
+    const result = await client.startClaudePlanningContextPackage(taskId, taskVersion);
+    setIsolations((current) => {
+      const existing = current[projectId];
+      if (!existing) return current;
+      return { ...current, [projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+    });
+  });
+  const startContextPackageImplementation = async (projectId: string, taskId: string, taskVersion: number) => run(async () => {
+    const result = await client.startClaudeImplementationContextPackage(taskId, taskVersion);
+    setIsolations((current) => {
+      const existing = current[projectId];
+      if (!existing) return current;
+      return { ...current, [projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+    });
+  });
+  const startContextPackageReview = async (projectId: string, taskId: string, taskVersion: number) => run(async () => {
+    const result = await client.startClaudeReviewContextPackage(taskId, taskVersion);
+    setIsolations((current) => {
+      const existing = current[projectId];
+      if (!existing) return current;
+      return { ...current, [projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+    });
+    setReviewRuns((current) => ({ ...current, [taskId]: true }));
+  });
   const cancelPlanning = async (taskId: string) => run(async () => {
     const result = await client.cancelClaudePlanning(taskId);
     if (!result.requested) {
@@ -373,6 +600,22 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       });
     }
   });
+  const confirmHighRiskApproval = async () => {
+    if (!highRiskApprovalDialog) return;
+    const dialog = highRiskApprovalDialog;
+    await run(async () => {
+      await client.approveHighRiskOperation(dialog.taskId, dialog.taskVersion, dialog.category);
+      setHighRiskApprovalDialog(null);
+      // Approve and reuse are not distinguished here: either way, only this
+      // category's status for this task changes. Task state/version are
+      // never touched by this call, so `isolations` is deliberately left
+      // alone (mirrors `prepareContextPackage`'s reasoning).
+      setHighRiskApprovals((current) => ({
+        ...current,
+        [dialog.taskId]: { ...current[dialog.taskId], [dialog.category]: { kind: "ready", approved: true } },
+      }));
+    });
+  };
 
   if (state.kind === "loading") return <LoadingState message="Loading projects" />;
   if (state.kind === "error") return <ErrorState error={state.error} onRetry={retry} />;
@@ -412,6 +655,49 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
     </div>;
   }
 
+  if (contextPackagePrepDialog) {
+    const preparationCopy = contextPackagePreparationCopy(contextPackagePrepDialog.workKind);
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">Context Package v1</p><h1>{preparationCopy.title}</h1><p>{preparationCopy.description}</p></div></header>
+      <section className="content-card" aria-labelledby="context-package-prep-form"><h2 id="context-package-prep-form">Context Package v1 data-scope consent</h2>
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => setContextPackagePrepDialog(null)} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy} onClick={() => void prepareContextPackage()}>Confirm preparation</button>
+        </div>
+      </section>
+    </div>;
+  }
+
+  if (userDiffReviewDialog) {
+    const dialog = userDiffReviewDialog;
+    return <UserDiffReviewModal
+      client={client}
+      taskId={dialog.taskId}
+      taskVersion={dialog.taskVersion}
+      onClose={() => setUserDiffReviewDialog(null)}
+    />;
+  }
+
+  if (highRiskApprovalDialog) {
+    const categoryLabel = highRiskCategoryLabel(highRiskApprovalDialog.category);
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">High-risk approval</p><h1>Approve {categoryLabel}</h1></div></header>
+      <section className="content-card" aria-labelledby="high-risk-approval-form"><h2 id="high-risk-approval-form">{categoryLabel}</h2>
+        <ul>
+          <li>This approval applies only to the {categoryLabel} effect category for this task's current version.</li>
+          <li>Approval does not run any provider and does not change this task's status.</li>
+          <li>If the version changes, this approval cannot be reused.</li>
+        </ul>
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => setHighRiskApprovalDialog(null)} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy} onClick={() => void confirmHighRiskApproval()}>Confirm approval</button>
+        </div>
+      </section>
+    </div>;
+  }
+
   return <div className="page-stack">
     <header className="page-header"><div><p className="eyebrow">Git isolation</p><h1>Projects</h1><p>Register a local project and create one isolated branch and worktree per task.</p></div><span className="count-label">{state.projects.length} total</span></header>
 
@@ -437,9 +723,16 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
             {isolation.taskState === "worktreeReady" && (() => {
               const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "planning" && candidate.provider === "claude");
               const eligible = entry?.eligible ?? false;
+              const readinessState = contextPackagePlanningReadiness[isolation.taskId];
+              const contextPackageReady = readinessState?.kind === "ready" && readinessState.ready;
               return <div className="planning-panel">
                 {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
                 <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "planning" })}>Start Claude Planning</button>
+                <button className="button button--secondary" disabled={busy || !eligible} onClick={() => setContextPackagePrepDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "planning" })}>Prepare Context Package v1 consent</button>
+                {contextPackagePreparationNotice && <p className="muted">{contextPackagePreparationNotice}</p>}
+                <button className="button button--secondary" disabled={busy || !eligible || !contextPackageReady} onClick={() => void startContextPackagePlanning(project.id, isolation.taskId, isolation.taskVersion)}>Start Claude Planning (Context Package v1)</button>
+                {readinessState?.kind === "ready" && !readinessState.ready && <p className="muted">Prepare Context Package v1 consent first.</p>}
+                {readinessState?.kind === "error" && <p className="inline-notice">Context Package v1 readiness could not be loaded. Refresh to try again.</p>}
               </div>;
             })()}
             {isolation.taskState === "planning" && <div className="planning-panel">
@@ -452,11 +745,32 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               {(() => {
                 const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "implementation" && candidate.provider === "claude");
                 const eligible = entry?.eligible ?? false;
+                const readinessState = contextPackageImplementationReadiness[isolation.taskId];
+                const contextPackageReady = readinessState?.kind === "ready" && readinessState.ready;
                 return <div className="planning-panel">
                   {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
                   <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "implementation" })}>Start Claude Implementation</button>
+                  <button className="button button--secondary" disabled={busy || !eligible} onClick={() => setContextPackagePrepDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "implementation" })}>Prepare Context Package v1 consent</button>
+                  {contextPackagePreparationNotice && <p className="muted">{contextPackagePreparationNotice}</p>}
+                  <button className="button button--secondary" disabled={busy || !eligible || !contextPackageReady} onClick={() => void startContextPackageImplementation(project.id, isolation.taskId, isolation.taskVersion)}>Start Claude Implementation (Context Package v1)</button>
+                  {readinessState?.kind === "ready" && !readinessState.ready && <p className="muted">Prepare Context Package v1 consent first.</p>}
+                  {readinessState?.kind === "error" && <p className="inline-notice">Context Package v1 readiness could not be loaded. Refresh to try again.</p>}
                 </div>;
               })()}
+              <section className="high-risk-approval-panel" aria-label="High-risk approval">
+                <h3>High-risk approval</h3>
+                <ul>{HIGH_RISK_CATEGORIES.map((category) => {
+                  const approvalState = highRiskApprovals[isolation.taskId]?.[category];
+                  const approved = approvalState?.kind === "ready" && approvalState.approved;
+                  return <li key={category} className="high-risk-approval-row">
+                    <span>{highRiskCategoryLabel(category)}</span>
+                    {approvalState === undefined || approvalState.kind === "loading" ? <span className="muted">Loading…</span>
+                      : approvalState.kind === "error" ? <span className="inline-notice">Status could not be loaded.</span>
+                      : approved ? <span className="muted">Approved</span>
+                      : <button className="button button--secondary" disabled={busy} onClick={() => setHighRiskApprovalDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, category })}>Approve</button>}
+                  </li>;
+                })}</ul>
+              </section>
             </div>}
             {isolation.taskState === "implementing" && <div className="planning-panel">
               <p className="muted">Claude Implementation is applying changes inside this task's isolated worktree. This may take a few minutes.</p>
@@ -510,6 +824,8 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "review" && candidate.provider === "claude");
               const eligible = entry?.eligible ?? false;
               const running = reviewRuns[isolation.taskId] === true;
+              const readinessState = contextPackageReviewReadiness[isolation.taskId];
+              const contextPackageReady = readinessState?.kind === "ready" && readinessState.ready;
               return <div className="review-panel" aria-label="Claude Review">
                 {running ? <>
                   <p className="muted">Claude Review is analyzing the changes in this task's isolated worktree. This may take a few minutes.</p>
@@ -517,12 +833,18 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
                 </> : <>
                   {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
                   <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "review" })}>Start Claude Review</button>
+                  <button className="button button--secondary" disabled={busy || !eligible} onClick={() => setContextPackagePrepDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "review" })}>Prepare Context Package v1 consent</button>
+                  {contextPackagePreparationNotice && <p className="muted">{contextPackagePreparationNotice}</p>}
+                  <button className="button button--secondary" disabled={busy || !eligible || !contextPackageReady} onClick={() => void startContextPackageReview(project.id, isolation.taskId, isolation.taskVersion)}>Start Claude Review (Context Package v1)</button>
+                  {readinessState?.kind === "ready" && !readinessState.ready && <p className="muted">Prepare Context Package v1 consent first.</p>}
+                  {readinessState?.kind === "error" && <p className="inline-notice">Context Package v1 readiness could not be loaded. Refresh to try again.</p>}
                 </>}
               </div>;
             })()}
             {isolation.taskState === "awaitingUserDiffApproval" && <div className="review-panel" aria-label="Claude Review result">
               <p className="muted">Claude Review finished. The review is awaiting your decision on the diff.</p>
               {renderReviewResult(reviewResults[isolation.taskId])}
+              <button className="button button--secondary" disabled={busy} onClick={() => setUserDiffReviewDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion })}>Review current diff</button>
             </div>}
             {isolation.taskState === "completed" && <p className="muted">This task is completed. Its active task lease has been released.</p>}
             {isolation.taskState === "recoveryRequired" && <p className="muted">This task requires manual recovery before continuing. Review the task before proceeding.</p>}
@@ -553,6 +875,37 @@ function consentDialogCopy(workKind: "planning" | "implementation" | "review"): 
         title: "Send task brief to Claude",
         description: "Claude Planning will read this task's requirements, completion criteria, and prohibited scope from a read-only copy of the worktree. It runs read-only and cannot create, edit, or delete files.",
       };
+  }
+}
+
+function contextPackagePreparationCopy(workKind: "planning" | "implementation" | "review"): { title: string; description: string } {
+  const categories = workKind === "implementation"
+    ? "requirements, completion criteria, prohibited scope, and the approved plan"
+    : workKind === "review"
+    ? "requirements, completion criteria, prohibited scope, and the current Git diff"
+    : "requirements, completion criteria, and prohibited scope";
+  return {
+    title: "Prepare Context Package v1 consent",
+    description: `This records a one-time transmission consent and a content-free reference for the Context Package v1 data scope, covering ${categories}. Actual values are never shown here. This does not start Claude and does not change this task's status.`,
+  };
+}
+
+function highRiskCategoryLabel(category: HighRiskCategory): string {
+  switch (category) {
+    case "architectureChange": return "Architecture change";
+    case "databaseSchemaChange": return "Database schema change";
+    case "authenticationOrAuthorizationChange": return "Authentication or authorization change";
+    case "securityPolicyChange": return "Security policy change";
+    case "externalNetworkBehaviorAddition": return "External network behavior addition";
+    case "externalDataTransmissionAddition": return "External data transmission addition";
+    case "largeScaleFileMoveOrDeletion": return "Large-scale file move or deletion";
+    case "publicApiOrStorageFormatChange": return "Public API or storage format change";
+    case "operatingSystemConfigurationChange": return "Operating system configuration change";
+    case "administratorPrivilegesRequired": return "Administrator privileges required";
+    case "breakingCompatibilityChange": return "Breaking compatibility change";
+    case "dataMigration": return "Data migration";
+    case "difficultToRecoverChange": return "Difficult-to-recover change";
+    default: return category;
   }
 }
 

@@ -1,6 +1,9 @@
 #![doc = "Port boundary for persistence, platform, provider, Git, process, and update interfaces."]
 #![forbid(unsafe_code)]
 
+pub mod context_package_implementation;
+pub mod context_package_planning;
+pub mod context_package_review;
 pub mod diff;
 pub mod error;
 pub mod filesystem;

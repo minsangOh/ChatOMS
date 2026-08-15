@@ -1,9 +1,10 @@
+use sha2::{Digest, Sha256};
 use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         Arc,
@@ -18,7 +19,10 @@ use chatoms_platform::git_runtime::TrustedGitRuntime;
 use chatoms_platform::{ensure_supported_directory, supported_directory_identity};
 
 use chatoms_ports::{
-    diff::{WorktreeDiff, WorktreeDiffOutcome, WorktreeDiffPort},
+    diff::{
+        CommitCandidate, CommitCandidateOutcome, CommitCandidatePort, DiffContentHash,
+        WorktreeDiff, WorktreeDiffOutcome, WorktreeDiffPort,
+    },
     error::{FailureCategory, PortFailure},
     filesystem::DirectoryIdentity,
     git::{
@@ -709,6 +713,71 @@ impl GitService for GitCliAdapter {
     }
 }
 
+impl GitCliAdapter {
+    fn verify_task_worktree_with_changes(
+        &mut self,
+        root: &Path,
+        branch: &str,
+        base_commit: &str,
+        worktree: &Path,
+    ) -> Result<bool, PortFailure> {
+        if !worktree.is_dir() || branch_commit(self, root, branch)?.as_deref() != Some(base_commit)
+        {
+            return Ok(false);
+        }
+        let head = self.at_str(worktree, ["rev-parse", "--verify", "HEAD"])?;
+        let actual_branch =
+            self.at_str(worktree, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let reported_root = self.at_str(worktree, ["rev-parse", "--show-toplevel"])?;
+        let common = self.at_str(
+            worktree,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let git_dir = self.at_str(
+            worktree,
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+        )?;
+        if !head.status.success()
+            || !actual_branch.status.success()
+            || !reported_root.status.success()
+            || !common.status.success()
+            || !git_dir.status.success()
+            || trimmed_utf8(&head.stdout)? != base_commit
+            || trimmed_utf8(&actual_branch.stdout)? != branch
+        {
+            return Ok(false);
+        }
+        let actual_root =
+            canonical_local_directory(Path::new(trimmed_utf8(&reported_root.stdout)?))?;
+        let expected_root = canonical_local_directory(worktree)?;
+        let actual_common = canonical_local_directory(Path::new(trimmed_utf8(&common.stdout)?))?;
+        let expected_common = canonical_local_directory(&root.join(".git"))?;
+        let actual_git_dir = canonical_local_directory(Path::new(trimmed_utf8(&git_dir.stdout)?))?;
+        Ok(
+            canonical_key(&actual_root)? == canonical_key(&expected_root)?
+                && canonical_key(&actual_common)? == canonical_key(&expected_common)?
+                && actual_git_dir.starts_with(expected_common.join("worktrees")),
+        )
+    }
+
+    fn capture_candidate_git(
+        &mut self,
+        arguments: Vec<OsString>,
+    ) -> Result<BoundedCaptureOutcome, PortFailure> {
+        self.ensure_control_paths()?;
+        self.validate_runtime()?;
+        self.validate_control_paths()?;
+        let mut command = Command::new(self.runtime.executable());
+        command
+            .env_clear()
+            .current_dir(&self.control.home)
+            .args(self.common_arguments())
+            .args(arguments);
+        configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        capture_bounded_stdout(command, DIFF_MAX_BYTES, DIFF_TIMEOUT)
+    }
+}
+
 /// Reads the current worktree diff via the same trusted Git runtime and
 /// `env_clear`'d control-path machinery every other `GitCliAdapter` command
 /// uses (see `common_arguments`/`configure_controlled_environment`), but
@@ -737,6 +806,148 @@ impl WorktreeDiffPort for GitCliAdapter {
             DIFF_TIMEOUT,
         )?)
     }
+}
+
+/// Read-only approval candidate. Its verifier intentionally permits task
+/// worktree changes, while preserving the clean-only GitService verifier for
+/// planning and review flows.
+impl CommitCandidatePort for GitCliAdapter {
+    fn current_commit_candidate(
+        &mut self,
+        root: &Path,
+        base_branch: &str,
+        task_branch: &str,
+        base_commit: &str,
+        worktree: &Path,
+    ) -> Result<CommitCandidateOutcome, PortFailure> {
+        validate_branch(base_branch)?;
+        validate_branch(task_branch)?;
+        validate_object_id(base_commit)?;
+        if !root.is_absolute() || !worktree.is_absolute() {
+            return Err(PortFailure::new(FailureCategory::InvalidInput));
+        }
+        let source = self.repository_status(root)?;
+        if !source.clean
+            || source.current_branch.as_deref() != Some(base_branch)
+            || source.head_commit.as_deref() != Some(base_commit)
+            || !self.verify_task_worktree_with_changes(root, task_branch, base_commit, worktree)?
+        {
+            return Err(PortFailure::new(FailureCategory::Conflict));
+        }
+        let tracked = match self.capture_candidate_git(diff_arguments(worktree))? {
+            BoundedCaptureOutcome::Success(bytes) => String::from_utf8(bytes)
+                .map_err(|_| PortFailure::new(FailureCategory::InvalidInput))?,
+            BoundedCaptureOutcome::ExitFailure => {
+                return Err(PortFailure::new(FailureCategory::Conflict));
+            }
+            BoundedCaptureOutcome::TooLarge => {
+                return Ok(CommitCandidateOutcome::CandidateTooLarge);
+            }
+            BoundedCaptureOutcome::TimedOut => return Ok(CommitCandidateOutcome::TimedOut),
+            BoundedCaptureOutcome::Uncertain => return Ok(CommitCandidateOutcome::Uncertain),
+        };
+        let listed = match self.capture_candidate_git(untracked_arguments(worktree))? {
+            BoundedCaptureOutcome::Success(bytes) => bytes,
+            BoundedCaptureOutcome::ExitFailure => {
+                return Err(PortFailure::new(FailureCategory::Conflict));
+            }
+            BoundedCaptureOutcome::TooLarge => {
+                return Ok(CommitCandidateOutcome::CandidateTooLarge);
+            }
+            BoundedCaptureOutcome::TimedOut => return Ok(CommitCandidateOutcome::TimedOut),
+            BoundedCaptureOutcome::Uncertain => return Ok(CommitCandidateOutcome::Uncertain),
+        };
+        let paths = canonical_untracked_paths(&listed)?;
+        if tracked.is_empty() && paths.is_empty() {
+            return Ok(CommitCandidateOutcome::NoChanges);
+        }
+        let worktree = canonical_local_directory(worktree)?;
+        let mut canonical = String::from("--- ChatOMS tracked diff ---\n");
+        append_candidate(&mut canonical, &tracked)?;
+        for relative in paths {
+            let candidate = checked_untracked_file(&worktree, &relative)?;
+            let bytes = fs::read(candidate).map_err(map_io_error)?;
+            let content = std::str::from_utf8(&bytes)
+                .map_err(|_| PortFailure::new(FailureCategory::InvalidInput))?;
+            append_candidate(&mut canonical, "\n--- ChatOMS untracked file: ")?;
+            append_candidate(&mut canonical, &relative)?;
+            append_candidate(&mut canonical, "\n")?;
+            append_candidate(&mut canonical, content)?;
+            append_candidate(&mut canonical, "\n--- End ChatOMS untracked file ---\n")?;
+        }
+        let digest = Sha256::digest(canonical.as_bytes());
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&digest);
+        Ok(CommitCandidateOutcome::Candidate(CommitCandidate::new(
+            canonical,
+            DiffContentHash::from_digest_bytes(hash),
+        )))
+    }
+}
+
+fn untracked_arguments(worktree: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("-C"),
+        worktree.as_os_str().to_owned(),
+        OsString::from("ls-files"),
+        OsString::from("--others"),
+        OsString::from("--exclude-standard"),
+        OsString::from("-z"),
+        OsString::from("--"),
+        OsString::from("."),
+    ]
+}
+
+fn canonical_untracked_paths(listed: &[u8]) -> Result<Vec<String>, PortFailure> {
+    let mut paths = Vec::new();
+    for raw in listed
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let path = std::str::from_utf8(raw)
+            .map_err(|_| PortFailure::new(FailureCategory::InvalidInput))?;
+        let relative = Path::new(path);
+        if path.is_empty()
+            || path.contains(['\n', '\r'])
+            || relative.is_absolute()
+            || relative.components().any(
+                |part| !matches!(part, Component::Normal(value) if !value.to_string_lossy().eq_ignore_ascii_case(".git")),
+            )
+        {
+            return Err(PortFailure::new(FailureCategory::InvalidInput));
+        }
+        paths.push(path.to_owned());
+    }
+    paths.sort_unstable();
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    Ok(paths)
+}
+
+fn checked_untracked_file(worktree: &Path, relative: &str) -> Result<PathBuf, PortFailure> {
+    let path = worktree.join(relative);
+    let metadata = fs::symlink_metadata(&path).map_err(map_io_error)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    let canonical = fs::canonicalize(&path).map_err(map_io_error)?;
+    if !canonical.starts_with(worktree) {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    Ok(canonical)
+}
+
+fn append_candidate(target: &mut String, segment: &str) -> Result<(), PortFailure> {
+    if target
+        .len()
+        .checked_add(segment.len())
+        .is_none_or(|size| size > DIFF_MAX_BYTES)
+    {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    target.push_str(segment);
+    Ok(())
 }
 
 /// Fixed, non-caller-influenced argv for a bounded current-worktree diff:
@@ -1421,6 +1632,38 @@ mod tests {
         let error = classify_capture(BoundedCaptureOutcome::Success(vec![0xFF, 0xFE]))
             .expect_err("non-UTF-8 bytes err");
         assert_eq!(error.category(), FailureCategory::InvalidInput);
+    }
+
+    #[test]
+    fn untracked_paths_are_sorted_and_reject_git_or_non_utf8_entries() {
+        assert_eq!(
+            canonical_untracked_paths(b"z.txt\0a.txt\0").expect("valid paths"),
+            vec!["a.txt", "z.txt"]
+        );
+        for invalid in [
+            b".git/config\0".as_slice(),
+            b".GIT/config\0".as_slice(),
+            b"../escape\0".as_slice(),
+            &[0xff, 0][..],
+        ] {
+            assert_eq!(
+                canonical_untracked_paths(invalid)
+                    .expect_err("unsafe path must fail closed")
+                    .category(),
+                FailureCategory::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_append_enforces_the_shared_diff_bound() {
+        let mut candidate = "x".repeat(DIFF_MAX_BYTES);
+        assert_eq!(
+            append_candidate(&mut candidate, "y")
+                .expect_err("combined candidate exceeds bound")
+                .category(),
+            FailureCategory::InvalidInput
+        );
     }
 
     #[test]

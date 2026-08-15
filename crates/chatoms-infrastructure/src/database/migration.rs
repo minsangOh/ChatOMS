@@ -50,7 +50,7 @@ impl Migration {
     }
 }
 
-pub static FOUNDATION_MIGRATION: [Migration; 15] = [
+pub static FOUNDATION_MIGRATION: [Migration; 19] = [
     Migration::new(1, "foundation", schema::FOUNDATION_SQL),
     Migration::new(2, "git_isolation", schema::GIT_ISOLATION_SQL),
     Migration::new(3, "provider_binding", schema::PROVIDER_BINDING_SQL),
@@ -98,6 +98,22 @@ pub static FOUNDATION_MIGRATION: [Migration; 15] = [
     ),
     Migration::new(14, "review_consents", schema::REVIEW_CONSENTS_SQL),
     Migration::new(15, "task_review_results", schema::TASK_REVIEW_RESULTS_SQL),
+    Migration::new(
+        16,
+        "provider_consent_data_scope",
+        schema::PROVIDER_CONSENT_DATA_SCOPE_SQL,
+    ),
+    Migration::new(
+        17,
+        "context_package_manifests",
+        schema::CONTEXT_PACKAGE_MANIFESTS_SQL,
+    ),
+    Migration::new(
+        18,
+        "task_high_risk_approvals",
+        schema::TASK_HIGH_RISK_APPROVALS_SQL,
+    ),
+    Migration::new(19, "task_diff_approvals", schema::TASK_DIFF_APPROVALS_SQL),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

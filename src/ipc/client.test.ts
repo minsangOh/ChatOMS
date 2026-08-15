@@ -30,7 +30,7 @@ describe("typed IPC client", () => {
       ["get_task", { taskId: "task-id" }],
       ["list_task_history", { taskId: "task-id" }],
     ]);
-    expect(Object.values(IPC_COMMANDS)).toHaveLength(32);
+    expect(Object.values(IPC_COMMANDS)).toHaveLength(45);
   });
 
   it("returns a validated result and rejects malformed success data safely", async () => {
@@ -345,6 +345,125 @@ describe("typed IPC client", () => {
     }
   });
 
+  it("uses versioned task-scoped payloads for high-risk approval status and approve", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.getHighRiskApprovalStatus("task-id", 3, "dataMigration");
+    await client.approveHighRiskOperation("task-id", 3, "dataMigration");
+    expect(transport.mock.calls).toEqual([
+      [
+        "get_high_risk_approval_status",
+        { taskId: "task-id", expectedVersion: 3, riskCategory: "dataMigration" },
+      ],
+      [
+        "approve_high_risk_operation",
+        { taskId: "task-id", expectedVersion: 3, riskCategory: "dataMigration" },
+      ],
+    ]);
+  });
+
+  it("validates high-risk approval response shapes and rejects malformed data", async () => {
+    const valid = createIpcClient(async () => responses.get_high_risk_approval_status);
+    await expect(valid.getHighRiskApprovalStatus("task-id", 3, "dataMigration")).resolves.toEqual({
+      approved: false,
+    });
+
+    const validApproval = createIpcClient(async () => responses.approve_high_risk_operation);
+    await expect(
+      validApproval.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).resolves.toEqual({ riskCategory: "dataMigration", approvedAtMs: 100 });
+
+    const malformedStatus = createIpcClient(async () => ({ approved: "yes" }));
+    await expect(
+      malformedStatus.getHighRiskApprovalStatus("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const extraFieldStatus = createIpcClient(async () => ({ approved: true, extra: "leaked" }));
+    await expect(
+      extraFieldStatus.getHighRiskApprovalStatus("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const unknownCategory = createIpcClient(async () => ({
+      riskCategory: "notACategory",
+      approvedAtMs: 1,
+    }));
+    await expect(
+      unknownCategory.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const malformedTimestamp = createIpcClient(async () => ({
+      riskCategory: "dataMigration",
+      approvedAtMs: "not-a-number",
+    }));
+    await expect(
+      malformedTimestamp.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const extraFieldApproval = createIpcClient(async () => ({
+      riskCategory: "dataMigration",
+      approvedAtMs: 1,
+      path: "C:\\leaked",
+    }));
+    await expect(
+      extraFieldApproval.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+  });
+
+  it("uses versioned task-scoped payloads for user diff review and approve", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.getUserDiffForReview("task-id", 3);
+    await client.approveUserDiff("task-id", 3, "a".repeat(64));
+    expect(transport.mock.calls).toEqual([
+      ["get_user_diff_for_review", { taskId: "task-id", expectedVersion: 3 }],
+      [
+        "approve_user_diff",
+        { taskId: "task-id", expectedVersion: 3, expectedDiffContentHash: "a".repeat(64) },
+      ],
+    ]);
+  });
+
+  it("validates user diff review/approval response shapes and rejects malformed data", async () => {
+    const validDiff = createIpcClient(async () => responses.get_user_diff_for_review);
+    await expect(validDiff.getUserDiffForReview("task-id", 3)).resolves.toEqual(
+      responses.get_user_diff_for_review,
+    );
+
+    const validApproval = createIpcClient(async () => responses.approve_user_diff);
+    await expect(
+      validApproval.approveUserDiff("task-id", 3, "a".repeat(64)),
+    ).resolves.toEqual({ approvedAtMs: 100 });
+
+    const malformedHash = createIpcClient(async () => ({
+      diffText: "x",
+      diffContentHash: "not-hex",
+    }));
+    await expect(malformedHash.getUserDiffForReview("task-id", 3)).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+
+    const nonStringDiff = createIpcClient(async () => ({
+      diffText: 1,
+      diffContentHash: "a".repeat(64),
+    }));
+    await expect(nonStringDiff.getUserDiffForReview("task-id", 3)).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+
+    const malformedTimestamp = createIpcClient(async () => ({ approvedAtMs: "not-a-number" }));
+    await expect(
+      malformedTimestamp.approveUserDiff("task-id", 3, "a".repeat(64)),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const approvalWithRawDiff = createIpcClient(async () => ({
+      approvedAtMs: 100,
+      diffText: "leaked diff content",
+    }));
+    await expect(
+      approvalWithRawDiff.approveUserDiff("task-id", 3, "a".repeat(64)),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+  });
+
   it("keeps only approved IPC error fields and masks string or unknown failures", async () => {
     const ipcError = createIpcClient(async () => {
       throw {
@@ -480,4 +599,11 @@ const responses: Record<string, unknown> = {
     completedAtMs: 2,
     reviewText: "The change matches the requirements.",
   },
+  get_high_risk_approval_status: { approved: false },
+  approve_high_risk_operation: { riskCategory: "dataMigration", approvedAtMs: 100 },
+  get_user_diff_for_review: {
+    diffText: "diff --git a/x b/x\n+line\n",
+    diffContentHash: "a".repeat(64),
+  },
+  approve_user_diff: { approvedAtMs: 100 },
 };

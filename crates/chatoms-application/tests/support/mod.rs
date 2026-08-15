@@ -6,18 +6,21 @@ use std::{
 };
 
 use chatoms_domain::{
-    ActorKind, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId, TaskSnapshot, TaskState,
-    TaskStateTransition, TaskStateTransitionId, ValidationCommandKind, WorkKind,
+    ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, Task, TaskBranchIdentity,
+    TaskId, TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
+    ValidationCommandKind, WorkKind,
 };
 use chatoms_ports::{
     TimeProvider,
+    diff::DiffContentHash,
     error::{FailureCategory, PortFailure},
     provider::ProviderKind,
     repository::{
-        ActiveLease, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        ActiveLease, ContextPackageManifestRecord, ContextPackagePreparation, DiffApprovalRecord,
+        FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationAttempt,
         GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
-        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderConsent,
-        RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
+        HighRiskApprovalRecord, ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary,
+        ProviderConsent, RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
         ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
         ValidationCommandResultRecord,
@@ -33,13 +36,19 @@ pub struct FakeRepository {
     pub transitions: HashMap<TaskId, Vec<TaskStateTransition>>,
     pub isolations: HashMap<TaskId, TaskGitIsolation>,
     pub briefs: HashMap<TaskId, TaskBriefRecord>,
-    pub consents: HashMap<(TaskId, ProviderKind, WorkKind, u64), ProviderConsent>,
+    pub consents: HashMap<(TaskId, ProviderKind, WorkKind, u64, ContextDataScope), ProviderConsent>,
+    pub context_package_manifests: HashMap<
+        (TaskId, ProviderKind, WorkKind, u64, ContextDataScope),
+        ContextPackageManifestRecord,
+    >,
     pub planning_results: HashMap<TaskId, TaskPlanningResultRecord>,
     pub implementation_results: HashMap<TaskId, TaskImplementationResultRecord>,
     pub review_results: HashMap<TaskId, TaskReviewResultRecord>,
     pub validation_command_approvals:
         HashMap<(TaskId, u64, ValidationCommandKind), ValidationCommandApprovalRecord>,
     pub validation_command_results: Vec<ValidationCommandResultRecord>,
+    pub high_risk_approvals: HashMap<(TaskId, u64, HighRiskCategory), HighRiskApprovalRecord>,
+    pub diff_approvals: HashMap<(TaskId, u64, DiffContentHash), DiffApprovalRecord>,
     pub approvals: Vec<GitInitApproval>,
     pub attempts: HashMap<chatoms_domain::GitOperationId, GitOperationAttempt>,
     pub receipts: Vec<GitOperationReceipt>,
@@ -91,6 +100,57 @@ impl FakeRepository {
         self.calls.push(operation);
         if let Some(calls) = &self.shared_calls {
             calls.lock().expect("call log lock").push(operation);
+        }
+    }
+
+    /// Shared core of the three `prepare_*_context_package` fakes, mirroring
+    /// `SqliteFoundationRepository`'s `prepare_context_package` helper:
+    /// looks up the exact `(task_id, Claude, work_kind, expected_version,
+    /// ContextPackageV1)` consent and manifest together, and either reuses
+    /// both unchanged, inserts both fresh, or fails closed as
+    /// `InvalidPersistenceState` if exactly one of the pair exists.
+    fn fake_prepare_context_package(
+        &mut self,
+        task_id: TaskId,
+        work_kind: WorkKind,
+        expected_version: u64,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        let key = (
+            task_id,
+            ProviderKind::Claude,
+            work_kind,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        );
+        let existing_consent = self.consents.get(&key).copied();
+        let existing_manifest = self.context_package_manifests.get(&key).copied();
+        match (existing_consent, existing_manifest) {
+            (Some(consent), Some(manifest)) => Ok(ContextPackagePreparation { consent, manifest }),
+            (None, None) => {
+                let consent = ProviderConsent {
+                    task_id,
+                    provider: ProviderKind::Claude,
+                    work_kind,
+                    approved_task_version: expected_version,
+                    data_scope: ContextDataScope::ContextPackageV1,
+                    consented_at_ms: prepared_at_ms,
+                };
+                self.consents.insert(key, consent);
+                let manifest = ContextPackageManifestRecord {
+                    task_id,
+                    provider: ProviderKind::Claude,
+                    work_kind,
+                    approved_task_version: expected_version,
+                    data_scope: ContextDataScope::ContextPackageV1,
+                    created_at_ms: prepared_at_ms,
+                };
+                self.context_package_manifests.insert(key, manifest);
+                Ok(ContextPackagePreparation { consent, manifest })
+            }
+            (Some(_), None) | (None, Some(_)) => Err(RepositoryError::new(
+                RepositoryErrorCode::InvalidPersistenceState,
+            )),
         }
     }
 }
@@ -330,13 +390,145 @@ impl FoundationRepository for FakeRepository {
         provider: ProviderKind,
         work_kind: WorkKind,
         approved_task_version: u64,
+        data_scope: ContextDataScope,
     ) -> Result<Option<ProviderConsent>, RepositoryError> {
         self.record("get_provider_consent");
         self.maybe_fail("get_provider_consent")?;
         Ok(self
             .consents
-            .get(&(task_id, provider, work_kind, approved_task_version))
+            .get(&(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            ))
             .copied())
+    }
+
+    fn get_context_package_manifest(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+        data_scope: ContextDataScope,
+    ) -> Result<Option<ContextPackageManifestRecord>, RepositoryError> {
+        self.record("get_context_package_manifest");
+        self.maybe_fail("get_context_package_manifest")?;
+        Ok(self
+            .context_package_manifests
+            .get(&(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            ))
+            .copied())
+    }
+
+    fn get_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        risk_category: HighRiskCategory,
+    ) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+        self.record("get_high_risk_approval");
+        self.maybe_fail("get_high_risk_approval")?;
+        Ok(self
+            .high_risk_approvals
+            .get(&(task_id, approved_task_version, risk_category))
+            .copied())
+    }
+
+    fn ensure_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+        approved_at_ms: i64,
+    ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        self.record("ensure_high_risk_approval");
+        self.maybe_fail("ensure_high_risk_approval")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        let key = (task_id, expected_version, risk_category);
+        if let Some(existing) = self.high_risk_approvals.get(&key) {
+            return Ok(*existing);
+        }
+        let approval = HighRiskApprovalRecord {
+            task_id,
+            approved_task_version: expected_version,
+            risk_category,
+            approved_at_ms,
+        };
+        self.high_risk_approvals.insert(key, approval);
+        Ok(approval)
+    }
+
+    fn save_diff_approval(&mut self, approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {
+        self.record("save_diff_approval");
+        self.maybe_fail("save_diff_approval")?;
+        let key = (
+            approval.task_id,
+            approval.approved_task_version,
+            approval.diff_content_hash,
+        );
+        if self.diff_approvals.contains_key(&key) {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.diff_approvals.insert(key, *approval);
+        Ok(())
+    }
+
+    fn get_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        diff_content_hash: DiffContentHash,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.record("get_diff_approval");
+        self.maybe_fail("get_diff_approval")?;
+        Ok(self
+            .diff_approvals
+            .get(&(task_id, approved_task_version, diff_content_hash))
+            .copied())
+    }
+
+    fn ensure_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        diff_content_hash: DiffContentHash,
+        approved_at_ms: i64,
+    ) -> Result<DiffApprovalRecord, RepositoryError> {
+        self.record("ensure_diff_approval");
+        self.maybe_fail("ensure_diff_approval")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        let key = (task_id, expected_version, diff_content_hash);
+        if let Some(existing) = self.diff_approvals.get(&key) {
+            return Ok(*existing);
+        }
+        let approval = DiffApprovalRecord {
+            task_id,
+            approved_task_version: expected_version,
+            diff_content_hash,
+            approved_at_ms,
+        };
+        self.diff_approvals.insert(key, approval);
+        Ok(approval)
     }
 
     fn save_planning_transition(
@@ -361,10 +553,137 @@ impl FoundationRepository for FakeRepository {
                     consent.provider,
                     consent.work_kind,
                     consent.approved_task_version,
+                    consent.data_scope,
                 ),
                 *consent,
             );
         }
+        Ok(())
+    }
+
+    fn save_context_package_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_context_package_planning_transition");
+        self.maybe_fail("save_context_package_planning_transition")?;
+        if task.state() != TaskState::Planning {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = self
+            .isolations
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let key = (
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        );
+        let consent = self.consents.get(&key).copied();
+        let manifest = self.context_package_manifests.get(&key).copied();
+        match (consent, manifest) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(RepositoryError::new(
+                    RepositoryErrorCode::InvalidPersistenceState,
+                ));
+            }
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        Ok(())
+    }
+
+    fn save_context_package_implementation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_context_package_implementation_transition");
+        self.maybe_fail("save_context_package_implementation_transition")?;
+        if task.state() != TaskState::Implementing {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::AwaitingDesignApproval {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = self
+            .isolations
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let plan_ready = self.planning_results.get(&task.id()).is_some_and(|result| {
+            result.outcome == chatoms_ports::repository::PlanningResultOutcome::Completed
+                && result
+                    .plan_text
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+        });
+        if !plan_ready {
+            return Err(RepositoryError::new(
+                RepositoryErrorCode::InvalidPersistenceState,
+            ));
+        }
+        let key = (
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        );
+        let consent = self.consents.get(&key).copied();
+        let manifest = self.context_package_manifests.get(&key).copied();
+        match (consent, manifest) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(RepositoryError::new(
+                    RepositoryErrorCode::InvalidPersistenceState,
+                ));
+            }
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
         Ok(())
     }
 
@@ -390,6 +709,7 @@ impl FoundationRepository for FakeRepository {
                     consent.provider,
                     consent.work_kind,
                     consent.approved_task_version,
+                    consent.data_scope,
                 ),
                 *consent,
             );
@@ -401,6 +721,7 @@ impl FoundationRepository for FakeRepository {
         &mut self,
         expected_version: u64,
         task_id: TaskId,
+        data_scope: ContextDataScope,
         consented_at_ms: i64,
     ) -> Result<ProviderConsent, RepositoryError> {
         self.record("save_review_consent");
@@ -420,6 +741,7 @@ impl FoundationRepository for FakeRepository {
             ProviderKind::Claude,
             WorkKind::Review,
             expected_version,
+            data_scope,
         );
         if let Some(existing) = self.consents.get(&key) {
             return Ok(*existing);
@@ -429,10 +751,96 @@ impl FoundationRepository for FakeRepository {
             provider: ProviderKind::Claude,
             work_kind: WorkKind::Review,
             approved_task_version: expected_version,
+            data_scope,
             consented_at_ms,
         };
         self.consents.insert(key, consent);
         Ok(consent)
+    }
+
+    fn prepare_planning_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.record("prepare_planning_context_package");
+        self.maybe_fail("prepare_planning_context_package")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = self
+            .isolations
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.fake_prepare_context_package(
+            task_id,
+            WorkKind::Planning,
+            expected_version,
+            prepared_at_ms,
+        )
+    }
+
+    fn prepare_implementation_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.record("prepare_implementation_context_package");
+        self.maybe_fail("prepare_implementation_context_package")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::AwaitingDesignApproval {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.fake_prepare_context_package(
+            task_id,
+            WorkKind::Implementation,
+            expected_version,
+            prepared_at_ms,
+        )
+    }
+
+    fn prepare_review_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.record("prepare_review_context_package");
+        self.maybe_fail("prepare_review_context_package")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::Reviewing {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.fake_prepare_context_package(
+            task_id,
+            WorkKind::Review,
+            expected_version,
+            prepared_at_ms,
+        )
     }
 
     fn save_planning_result(

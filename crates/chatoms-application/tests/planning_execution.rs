@@ -8,7 +8,7 @@ use chatoms_application::{
         BeginPlanningExecutionRequest, PlanningExecutionRecorder, PlanningExecutionStarter,
     },
 };
-use chatoms_domain::{GitOperationId, ProjectId, TaskId, TaskState, WorkKind};
+use chatoms_domain::{ContextDataScope, GitOperationId, ProjectId, TaskId, TaskState, WorkKind};
 use chatoms_ports::{
     error::{FailureCategory, PortFailure},
     planning::{
@@ -512,7 +512,13 @@ fn begin_then_run_and_record_connects_consent_state_adapter_and_result_end_to_en
     assert_eq!(inputs.task.state, TaskState::Planning);
 
     let consent = repository
-        .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Planning, 1)
+        .get_provider_consent(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            1,
+            ContextDataScope::LegacyPhase4,
+        )
         .expect("consent lookup")
         .expect("consent recorded exactly once by begin");
     assert_eq!(consent.approved_task_version, 1);

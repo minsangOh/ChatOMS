@@ -9,7 +9,7 @@ use chatoms_application::{
         ReviewExecutionStarter,
     },
 };
-use chatoms_domain::{ProjectId, TaskId, TaskState, WorkKind};
+use chatoms_domain::{ContextDataScope, ProjectId, TaskId, TaskState, WorkKind};
 use chatoms_ports::{
     diff::{WorktreeDiff, WorktreeDiffOutcome, WorktreeDiffPort},
     error::{FailureCategory, PortFailure},
@@ -370,7 +370,13 @@ fn begin_records_consent_and_returns_worktree_brief_and_diff_when_every_precondi
     assert!(filesystem.calls >= 1);
 
     let consent = repository
-        .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+        .get_provider_consent(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            3,
+            ContextDataScope::LegacyPhase4,
+        )
         .expect("consent lookup")
         .expect("consent recorded exactly once by begin");
     assert_eq!(consent.approved_task_version, 3);
@@ -404,7 +410,13 @@ fn begin_reuses_an_existing_same_version_review_consent() {
         .expect("first begin succeeds");
     }
     let first_consent = repository
-        .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+        .get_provider_consent(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            3,
+            ContextDataScope::LegacyPhase4,
+        )
         .expect("consent lookup")
         .expect("consent recorded");
 
@@ -432,7 +444,13 @@ fn begin_reuses_an_existing_same_version_review_consent() {
         .expect("second begin also succeeds, reusing the consent");
     }
     let second_consent = repository
-        .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+        .get_provider_consent(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            3,
+            ContextDataScope::LegacyPhase4,
+        )
         .expect("consent lookup")
         .expect("consent recorded");
 
@@ -475,7 +493,13 @@ fn begin_rejects_unsupported_capability_with_no_execution_and_state_preserved() 
     assert_eq!(repository.tasks[&task_id].version(), 3);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -522,7 +546,13 @@ fn begin_rejects_when_task_is_not_reviewing() {
     assert_eq!(diff.called_with, None);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 1)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                1,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -596,7 +626,13 @@ fn begin_rejects_missing_isolation_record_with_no_state_change() {
     assert_eq!(diff.called_with, None);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -642,7 +678,13 @@ fn begin_rejects_missing_brief_with_no_state_change() {
     assert_eq!(diff.called_with, None);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -677,7 +719,13 @@ fn begin_rejects_a_no_changes_diff_with_no_consent_or_state_change() {
     assert_eq!(error.code(), ApplicationErrorCode::Conflict);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -713,7 +761,13 @@ fn begin_rejects_a_too_large_diff_with_no_consent_or_state_change() {
     assert_eq!(error.code(), ApplicationErrorCode::Conflict);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -748,7 +802,13 @@ fn begin_rejects_a_timed_out_diff_read_with_no_consent_or_state_change() {
     assert_eq!(error.code(), ApplicationErrorCode::Conflict);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -783,7 +843,13 @@ fn begin_rejects_an_uncertain_diff_read_with_no_consent_or_state_change() {
     assert_eq!(error.code(), ApplicationErrorCode::Conflict);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -819,7 +885,13 @@ fn begin_rejects_a_git_identity_mismatch_before_the_diff_port_is_ever_called() {
     assert_eq!(diff.called_with, None);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -854,7 +926,13 @@ fn begin_rejects_a_malformed_diff_port_error_with_no_consent_or_state_change() {
     assert_eq!(error.code(), ApplicationErrorCode::InvalidInput);
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none()
     );
@@ -1196,7 +1274,13 @@ fn begin_then_run_and_record_connects_consent_diff_and_result_end_to_end() {
     assert_eq!(inputs.task.version, 3);
 
     let consent = repository
-        .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Review, 3)
+        .get_provider_consent(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            3,
+            ContextDataScope::LegacyPhase4,
+        )
         .expect("consent lookup")
         .expect("consent recorded exactly once by begin");
     assert_eq!(consent.approved_task_version, 3);

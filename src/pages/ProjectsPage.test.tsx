@@ -190,6 +190,12 @@ function eligibility(overrides: Partial<ProviderEligibilityDto> = {}): ProviderE
   };
 }
 
+function firstOf(elements: readonly HTMLElement[]): HTMLElement {
+  const [first] = elements;
+  if (!first) throw new Error("expected at least one matching element");
+  return first;
+}
+
 function renderActiveTask(taskState: TaskDto["state"], client: Partial<IpcClient> = {}) {
   const isolation = restoredIsolation(taskState);
   return {
@@ -291,6 +297,147 @@ it("confirms provider consent before starting Claude Implementation when eligibl
 
   expect(await screen.findByText(/Claude Implementation is applying changes/)).toBeVisible();
   expect(startClaudeImplementation).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion);
+});
+
+const HIGH_RISK_CATEGORY_LABELS = [
+  "Architecture change",
+  "Database schema change",
+  "Authentication or authorization change",
+  "Security policy change",
+  "External network behavior addition",
+  "External data transmission addition",
+  "Large-scale file move or deletion",
+  "Public API or storage format change",
+  "Operating system configuration change",
+  "Administrator privileges required",
+  "Breaking compatibility change",
+  "Data migration",
+  "Difficult-to-recover change",
+];
+
+it("shows all 13 fixed high-risk categories with per-category status in awaitingDesignApproval", async () => {
+  const getHighRiskApprovalStatus = vi.fn().mockResolvedValue({ approved: false });
+  renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => null,
+    getHighRiskApprovalStatus,
+  });
+
+  expect(await screen.findByRole("heading", { name: "High-risk approval" })).toBeVisible();
+  for (const label of HIGH_RISK_CATEGORY_LABELS) {
+    expect(screen.getByText(label)).toBeVisible();
+  }
+  await waitFor(() => expect(getHighRiskApprovalStatus).toHaveBeenCalledTimes(13));
+  expect(await screen.findAllByRole("button", { name: "Approve" })).toHaveLength(13);
+});
+
+it("does not show the high-risk approval panel outside awaitingDesignApproval", async () => {
+  renderActiveTask("worktreeReady");
+  await screen.findByRole("button", { name: "Start Claude Planning" });
+  expect(screen.queryByRole("heading", { name: "High-risk approval" })).toBeNull();
+});
+
+it("does not call approveHighRiskOperation until the confirmation dialog is confirmed", async () => {
+  const approveHighRiskOperation = vi.fn().mockResolvedValue({
+    riskCategory: "architectureChange",
+    approvedAtMs: 100,
+  });
+  renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => null,
+    getHighRiskApprovalStatus: async () => ({ approved: false }),
+    approveHighRiskOperation,
+  });
+
+  const approveButtons = await screen.findAllByRole("button", { name: "Approve" });
+  fireEvent.click(firstOf(approveButtons));
+
+  expect(await screen.findByRole("heading", { name: "Approve Architecture change" })).toBeVisible();
+  expect(approveHighRiskOperation).not.toHaveBeenCalled();
+});
+
+it("shows only the fixed category label and non-execution/version-bound copy in the confirmation dialog", async () => {
+  renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => null,
+    getHighRiskApprovalStatus: async () => ({ approved: false }),
+  });
+
+  const approveButtons = await screen.findAllByRole("button", { name: "Approve" });
+  fireEvent.click(firstOf(approveButtons));
+
+  expect(await screen.findByRole("heading", { name: "Approve Architecture change" })).toBeVisible();
+  expect(
+    screen.getByText(
+      "This approval applies only to the Architecture change effect category for this task's current version.",
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText("Approval does not run any provider and does not change this task's status."),
+  ).toBeVisible();
+  expect(screen.getByText("If the version changes, this approval cannot be reused.")).toBeVisible();
+});
+
+it("updates only the confirmed category to approved after a successful approve, without touching task state or version", async () => {
+  const approveHighRiskOperation = vi.fn().mockResolvedValue({
+    riskCategory: "architectureChange",
+    approvedAtMs: 100,
+  });
+  const { isolation } = renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => null,
+    getHighRiskApprovalStatus: async () => ({ approved: false }),
+    approveHighRiskOperation,
+  });
+
+  const approveButtons = await screen.findAllByRole("button", { name: "Approve" });
+  fireEvent.click(firstOf(approveButtons));
+  fireEvent.click(await screen.findByRole("button", { name: "Confirm approval" }));
+
+  await waitFor(() =>
+    expect(approveHighRiskOperation).toHaveBeenCalledWith(
+      isolation.taskId,
+      isolation.taskVersion,
+      "architectureChange",
+    ),
+  );
+  expect(await screen.findAllByText("Approved")).toHaveLength(1);
+  expect(await screen.findAllByRole("button", { name: "Approve" })).toHaveLength(12);
+  expect(screen.getByText("awaitingDesignApproval")).toBeVisible();
+});
+
+it("never surfaces raw plan text inside the high-risk approval panel or its confirmation dialog", async () => {
+  renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => ({
+      outcome: "completed",
+      exitCode: 0,
+      turnCount: 1,
+      startedAtMs: 1,
+      completedAtMs: 2,
+      planText: "SECRET_PLAN_CONTENT_MARKER",
+    }),
+    getHighRiskApprovalStatus: async () => ({ approved: false }),
+  });
+
+  const approveButtons = await screen.findAllByRole("button", { name: "Approve" });
+  fireEvent.click(firstOf(approveButtons));
+  expect(await screen.findByRole("heading", { name: "Approve Architecture change" })).toBeVisible();
+  expect(document.body.textContent).not.toContain("SECRET_PLAN_CONTENT_MARKER");
+});
+
+it("keeps the existing Claude Implementation start button and Context Package v1 actions working alongside the high-risk approval panel", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "implementation" })]);
+  const startClaudeImplementation = vi.fn().mockResolvedValue(restoredTask("implementing"));
+  renderActiveTask("awaitingDesignApproval", {
+    getProviderEligibility,
+    startClaudeImplementation,
+    getPlanningResult: async () => null,
+    getHighRiskApprovalStatus: async () => ({ approved: false }),
+  });
+
+  expect(await screen.findByRole("heading", { name: "High-risk approval" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Prepare Context Package v1 consent" })).toBeVisible();
+  const startButton = screen.getByRole("button", { name: "Start Claude Implementation" });
+  await waitFor(() => expect(startButton).not.toBeDisabled());
+  fireEvent.click(startButton);
+  fireEvent.click(await screen.findByRole("button", { name: "Confirm and start" }));
+  expect(await screen.findByText(/Claude Implementation is applying changes/)).toBeVisible();
 });
 
 it("requests cancellation of an in-progress Claude Implementation run", async () => {
@@ -450,6 +597,133 @@ it("never fetches or displays the Claude Review result outside awaitingUserDiffA
     expect(document.body.textContent).not.toContain("Should never surface here.");
     unmount();
   }
+});
+
+it("shows the Review current diff action only while awaiting user diff approval", async () => {
+  renderActiveTask("awaitingUserDiffApproval", { getReviewResult: async () => null });
+  expect(await screen.findByRole("button", { name: "Review current diff" })).toBeVisible();
+});
+
+it("does not show the Review current diff action outside awaitingUserDiffApproval", async () => {
+  for (const taskState of ["worktreeReady", "reviewing", "failed", "cancelled"] as const) {
+    const { unmount } = renderActiveTask(taskState);
+    await screen.findByLabelText("Isolation for Foundation");
+    expect(screen.queryByRole("button", { name: "Review current diff" })).toBeNull();
+    unmount();
+  }
+});
+
+it("does not call getUserDiffForReview until the review modal is opened", async () => {
+  const getUserDiffForReview = vi.fn().mockResolvedValue({
+    diffText: "diff --git a/x b/x\n+line\n",
+    diffContentHash: "a".repeat(64),
+  });
+  renderActiveTask("awaitingUserDiffApproval", {
+    getReviewResult: async () => null,
+    getUserDiffForReview,
+  });
+
+  await screen.findByRole("button", { name: "Review current diff" });
+  expect(getUserDiffForReview).not.toHaveBeenCalled();
+});
+
+it("opens the review modal and displays the fetched diff only in local modal scope", async () => {
+  const getUserDiffForReview = vi.fn().mockResolvedValue({
+    diffText: "diff --git a/x b/x\n+added line\n",
+    diffContentHash: "a".repeat(64),
+  });
+  const { isolation } = renderActiveTask("awaitingUserDiffApproval", {
+    getReviewResult: async () => null,
+    getUserDiffForReview,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Review current diff" }));
+
+  expect(await screen.findByRole("heading", { name: "Review current diff" })).toBeVisible();
+  expect(await screen.findByText(/\+added line/)).toBeVisible();
+  expect(getUserDiffForReview).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion);
+});
+
+it("shows a safe error state when the diff cannot be loaded, without exposing the raw error", async () => {
+  const getUserDiffForReview = vi.fn().mockRejectedValue(
+    new FrontendError({
+      code: "APP_STORAGE_UNAVAILABLE",
+      message: "Secure local storage is unavailable.",
+      severity: "error",
+      retry: "immediate",
+    }),
+  );
+  renderActiveTask("awaitingUserDiffApproval", {
+    getReviewResult: async () => null,
+    getUserDiffForReview,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Review current diff" }));
+
+  expect(
+    await screen.findByText("The diff could not be loaded. Close and try again."),
+  ).toBeVisible();
+  expect(document.body.textContent).not.toContain("APP_STORAGE_UNAVAILABLE");
+});
+
+it("does not call approveUserDiff before confirmation, and confirm sends only the digest, never raw diff text", async () => {
+  const diffText = "diff --git a/x b/x\n+added line\n";
+  const diffContentHash = "a".repeat(64);
+  const getUserDiffForReview = vi.fn().mockResolvedValue({ diffText, diffContentHash });
+  const approveUserDiff = vi.fn().mockResolvedValue({ approvedAtMs: 100 });
+  const { isolation } = renderActiveTask("awaitingUserDiffApproval", {
+    getReviewResult: async () => null,
+    getUserDiffForReview,
+    approveUserDiff,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Review current diff" }));
+  await screen.findByText(/\+added line/);
+  expect(approveUserDiff).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Approve this diff" }));
+
+  expect(await screen.findByText("Diff approval recorded for the current task version.")).toBeVisible();
+  expect(approveUserDiff).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion, diffContentHash);
+  expect(approveUserDiff).toHaveBeenCalledTimes(1);
+  expect(approveUserDiff.mock.calls[0]).not.toContain(diffText);
+});
+
+it("closing the review modal discards the diff so reopening fetches it again", async () => {
+  const getUserDiffForReview = vi.fn().mockResolvedValue({
+    diffText: "diff --git a/x b/x\n+line\n",
+    diffContentHash: "a".repeat(64),
+  });
+  renderActiveTask("awaitingUserDiffApproval", {
+    getReviewResult: async () => null,
+    getUserDiffForReview,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Review current diff" }));
+  await screen.findByText(/\+line/);
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+  expect(await screen.findByRole("button", { name: "Review current diff" })).toBeVisible();
+  expect(document.body.textContent).not.toContain("diff --git a/x b/x\n+line\n");
+
+  fireEvent.click(screen.getByRole("button", { name: "Review current diff" }));
+  await screen.findByText(/\+line/);
+  await waitFor(() => expect(getUserDiffForReview).toHaveBeenCalledTimes(2));
+});
+
+it("never disturbs the existing Claude Review result panel or high-risk approval UI elsewhere", async () => {
+  const getReviewResult = vi.fn().mockResolvedValue({
+    outcome: "completed",
+    exitCode: 0,
+    turnCount: 3,
+    startedAtMs: 1,
+    completedAtMs: 2,
+    reviewText: "The change matches the requirements and stays within scope.",
+  });
+  renderActiveTask("awaitingUserDiffApproval", { getReviewResult });
+
+  expect(await screen.findByText(/matches the requirements/)).toBeVisible();
+  expect(await screen.findByRole("button", { name: "Review current diff" })).toBeVisible();
 });
 
 it("shows safe status text for every state Claude Planning can end in", async () => {
@@ -696,6 +970,356 @@ it("shows a safe error state when validation candidates or approval status canno
     await screen.findByText("Validation commands could not be loaded. Refresh to try again."),
   ).toBeVisible();
   expect(document.body.textContent).not.toContain("APP_STORAGE_UNAVAILABLE");
+});
+
+it("shows the Context Package v1 preparation action at each work kind's own gate state", async () => {
+  for (const [taskState, workKind] of [
+    ["worktreeReady", "planning"],
+    ["awaitingDesignApproval", "implementation"],
+    ["reviewing", "review"],
+  ] as const) {
+    const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind })]);
+    const extra = taskState === "awaitingDesignApproval" ? { getPlanningResult: async () => null } : {};
+    const { unmount } = renderActiveTask(taskState, { getProviderEligibility, ...extra });
+    const prepareButton = await screen.findByRole("button", { name: "Prepare Context Package v1 consent" });
+    await waitFor(() => expect(prepareButton).not.toBeDisabled());
+    unmount();
+  }
+});
+
+it("never shows the Context Package v1 preparation action outside its work kind's gate state", async () => {
+  renderActiveTask("planning");
+  await screen.findByLabelText("Isolation for Foundation");
+  expect(screen.queryByRole("button", { name: "Prepare Context Package v1 consent" })).toBeNull();
+});
+
+it("disables the Context Package v1 preparation action using the existing eligibility gate", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([
+    eligibility({ eligible: false, capability: "unsupported", blockingReasons: ["capabilityUnsupported"] }),
+  ]);
+  renderActiveTask("worktreeReady", { getProviderEligibility });
+
+  const prepareButton = await screen.findByRole("button", { name: "Prepare Context Package v1 consent" });
+  await waitFor(() => expect(prepareButton).toBeDisabled());
+  expect(screen.getByRole("button", { name: "Start Claude Planning" })).toBeDisabled();
+});
+
+it("disables the Context Package v1 Planning activation action with a fixed reason when readiness is not yet prepared", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility()]);
+  const getContextPackagePlanningReadiness = vi.fn().mockResolvedValue({ ready: false });
+  renderActiveTask("worktreeReady", { getProviderEligibility, getContextPackagePlanningReadiness });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Planning (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).toBeDisabled());
+  expect(await screen.findByText("Prepare Context Package v1 consent first.")).toBeVisible();
+  // The existing Legacy action and the preparation action must remain
+  // available alongside the new one, unaffected by CPv1 readiness.
+  expect(screen.getByRole("button", { name: "Start Claude Planning" })).not.toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Prepare Context Package v1 consent" }),
+  ).not.toBeDisabled();
+});
+
+it("enables the Context Package v1 Planning activation action once readiness reports ready", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility()]);
+  const getContextPackagePlanningReadiness = vi.fn().mockResolvedValue({ ready: true });
+  renderActiveTask("worktreeReady", { getProviderEligibility, getContextPackagePlanningReadiness });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Planning (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).not.toBeDisabled());
+  expect(screen.queryByText("Prepare Context Package v1 consent first.")).toBeNull();
+});
+
+it("treats a readiness fetch error as not-ready rather than assuming enabled", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility()]);
+  const getContextPackagePlanningReadiness = vi.fn().mockRejectedValue(new Error("boom"));
+  renderActiveTask("worktreeReady", { getProviderEligibility, getContextPackagePlanningReadiness });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Planning (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).toBeDisabled());
+  expect(
+    await screen.findByText("Context Package v1 readiness could not be loaded. Refresh to try again."),
+  ).toBeVisible();
+});
+
+it("activating Context Package v1 Planning calls only the new start command, never the legacy one, and switches to the existing Planning UI", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility()]);
+  const getContextPackagePlanningReadiness = vi.fn().mockResolvedValue({ ready: true });
+  const startClaudePlanningContextPackage = vi.fn().mockResolvedValue(restoredTask("planning"));
+  const startClaudePlanning = vi.fn();
+  const { isolation } = renderActiveTask("worktreeReady", {
+    getProviderEligibility,
+    getContextPackagePlanningReadiness,
+    startClaudePlanningContextPackage,
+    startClaudePlanning,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Planning (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).not.toBeDisabled());
+  fireEvent.click(activateButton);
+
+  await waitFor(() =>
+    expect(startClaudePlanningContextPackage).toHaveBeenCalledWith(
+      isolation.taskId,
+      isolation.taskVersion,
+    ),
+  );
+  expect(startClaudePlanning).not.toHaveBeenCalled();
+  // No re-consent dialog: activation must not reuse the LegacyPhase4
+  // consent screen -- the CPv1 data-scope consent was already recorded by
+  // the separate "Prepare" step.
+  expect(screen.queryByRole("heading", { name: "Send task brief to Claude" })).toBeNull();
+  expect(await screen.findByText(/Claude Planning is analyzing/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Cancel planning" })).toBeVisible();
+});
+
+it("shows only permitted data categories and a non-execution notice in the Review Context Package v1 dialog, without calling the IPC method before confirm", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "review" })]);
+  const prepareReviewContextPackage = vi.fn();
+  renderActiveTask("reviewing", { getProviderEligibility, prepareReviewContextPackage });
+
+  const prepareButton = await screen.findByRole("button", { name: "Prepare Context Package v1 consent" });
+  await waitFor(() => expect(prepareButton).not.toBeDisabled());
+  fireEvent.click(prepareButton);
+
+  expect(
+    await screen.findByRole("heading", { name: "Prepare Context Package v1 consent" }),
+  ).toBeVisible();
+  expect(screen.getByText(/current Git diff/)).toBeVisible();
+  expect(screen.getByText(/does not start Claude/)).toBeVisible();
+  expect(screen.getByText(/Actual values are never shown here/)).toBeVisible();
+  expect(prepareReviewContextPackage).not.toHaveBeenCalled();
+});
+
+it("disables the Context Package v1 Review activation action until readiness is confirmed", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "review" })]);
+  const getContextPackageReviewReadiness = vi.fn().mockResolvedValue({ ready: false });
+  renderActiveTask("reviewing", {
+    getProviderEligibility,
+    getContextPackageReviewReadiness,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Review (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).toBeDisabled());
+  expect(await screen.findByText("Prepare Context Package v1 consent first.")).toBeVisible();
+  // The existing Legacy action and the preparation action must remain
+  // available alongside the new one, unaffected by CPv1 readiness.
+  expect(screen.getByRole("button", { name: "Start Claude Review" })).not.toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Prepare Context Package v1 consent" }),
+  ).not.toBeDisabled();
+});
+
+it("enables the Context Package v1 Review activation action once readiness reports ready", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "review" })]);
+  const getContextPackageReviewReadiness = vi.fn().mockResolvedValue({ ready: true });
+  renderActiveTask("reviewing", {
+    getProviderEligibility,
+    getContextPackageReviewReadiness,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Review (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).not.toBeDisabled());
+  expect(screen.queryByText("Prepare Context Package v1 consent first.")).toBeNull();
+});
+
+it("treats a Review readiness fetch error as not-ready rather than assuming enabled", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "review" })]);
+  const getContextPackageReviewReadiness = vi.fn().mockRejectedValue(new Error("boom"));
+  renderActiveTask("reviewing", {
+    getProviderEligibility,
+    getContextPackageReviewReadiness,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Review (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).toBeDisabled());
+  expect(
+    await screen.findByText("Context Package v1 readiness could not be loaded. Refresh to try again."),
+  ).toBeVisible();
+});
+
+it("activating Context Package v1 Review calls only the new start command, never the legacy one, and switches to the existing Reviewing progress UI", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "review" })]);
+  const getContextPackageReviewReadiness = vi.fn().mockResolvedValue({ ready: true });
+  const startClaudeReviewContextPackage = vi.fn().mockResolvedValue(restoredTask("reviewing"));
+  const startClaudeReview = vi.fn();
+  const { isolation } = renderActiveTask("reviewing", {
+    getProviderEligibility,
+    getContextPackageReviewReadiness,
+    startClaudeReviewContextPackage,
+    startClaudeReview,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Review (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).not.toBeDisabled());
+  fireEvent.click(activateButton);
+
+  await waitFor(() =>
+    expect(startClaudeReviewContextPackage).toHaveBeenCalledWith(
+      isolation.taskId,
+      isolation.taskVersion,
+    ),
+  );
+  expect(startClaudeReview).not.toHaveBeenCalled();
+  // No re-consent dialog: activation must not reuse the LegacyPhase4
+  // consent screen -- the CPv1 data-scope consent was already recorded by
+  // the separate "Prepare" step.
+  expect(screen.queryByRole("heading", { name: "Send task brief and diff to Claude" })).toBeNull();
+  expect(await screen.findByText(/Claude Review is analyzing/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Cancel review" })).toBeVisible();
+});
+
+it("shows the approved plan category in the Implementation Context Package v1 dialog", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "implementation" })]);
+  renderActiveTask("awaitingDesignApproval", { getProviderEligibility, getPlanningResult: async () => null });
+
+  const prepareButton = await screen.findByRole("button", { name: "Prepare Context Package v1 consent" });
+  await waitFor(() => expect(prepareButton).not.toBeDisabled());
+  fireEvent.click(prepareButton);
+
+  expect(await screen.findByText(/the approved plan/)).toBeVisible();
+});
+
+it("confirms Review Context Package v1 preparation without changing task state or calling the real start command", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "review" })]);
+  const prepareReviewContextPackage = vi.fn().mockResolvedValue({
+    workKind: "review",
+    dataScope: "contextPackageV1",
+    consentedAtMs: 200,
+    manifestCreatedAtMs: 210,
+  });
+  const startClaudeReview = vi.fn();
+  const { isolation } = renderActiveTask("reviewing", {
+    getProviderEligibility,
+    prepareReviewContextPackage,
+    startClaudeReview,
+  });
+
+  const prepareButton = await screen.findByRole("button", { name: "Prepare Context Package v1 consent" });
+  await waitFor(() => expect(prepareButton).not.toBeDisabled());
+  fireEvent.click(prepareButton);
+  fireEvent.click(await screen.findByRole("button", { name: "Confirm preparation" }));
+
+  await waitFor(() =>
+    expect(prepareReviewContextPackage).toHaveBeenCalledWith(
+      isolation.taskId,
+      isolation.taskVersion,
+    ),
+  );
+  expect(startClaudeReview).not.toHaveBeenCalled();
+  expect(
+    await screen.findByText(/Claude was not started and this task's status is unchanged/),
+  ).toBeVisible();
+  expect(await screen.findByLabelText("Isolation for Foundation")).toHaveTextContent("reviewing");
+  expect(screen.getByRole("button", { name: "Start Claude Review" })).toBeVisible();
+});
+
+it("disables the Context Package v1 Implementation activation action with a fixed reason when readiness is not yet prepared", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "implementation" })]);
+  const getContextPackageImplementationReadiness = vi.fn().mockResolvedValue({ ready: false });
+  renderActiveTask("awaitingDesignApproval", {
+    getProviderEligibility,
+    getPlanningResult: async () => null,
+    getContextPackageImplementationReadiness,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Implementation (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).toBeDisabled());
+  expect(await screen.findByText("Prepare Context Package v1 consent first.")).toBeVisible();
+  // The existing Legacy action and the preparation action must remain
+  // available alongside the new one, unaffected by CPv1 readiness.
+  expect(screen.getByRole("button", { name: "Start Claude Implementation" })).not.toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Prepare Context Package v1 consent" }),
+  ).not.toBeDisabled();
+});
+
+it("enables the Context Package v1 Implementation activation action once readiness reports ready", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "implementation" })]);
+  const getContextPackageImplementationReadiness = vi.fn().mockResolvedValue({ ready: true });
+  renderActiveTask("awaitingDesignApproval", {
+    getProviderEligibility,
+    getPlanningResult: async () => null,
+    getContextPackageImplementationReadiness,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Implementation (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).not.toBeDisabled());
+  expect(screen.queryByText("Prepare Context Package v1 consent first.")).toBeNull();
+});
+
+it("treats an Implementation readiness fetch error as not-ready rather than assuming enabled", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "implementation" })]);
+  const getContextPackageImplementationReadiness = vi.fn().mockRejectedValue(new Error("boom"));
+  renderActiveTask("awaitingDesignApproval", {
+    getProviderEligibility,
+    getPlanningResult: async () => null,
+    getContextPackageImplementationReadiness,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Implementation (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).toBeDisabled());
+  expect(
+    await screen.findByText("Context Package v1 readiness could not be loaded. Refresh to try again."),
+  ).toBeVisible();
+});
+
+it("activating Context Package v1 Implementation calls only the new start command, never the legacy one, and switches to the existing Implementing UI", async () => {
+  const getProviderEligibility = vi.fn().mockResolvedValue([eligibility({ workKind: "implementation" })]);
+  const getContextPackageImplementationReadiness = vi.fn().mockResolvedValue({ ready: true });
+  const startClaudeImplementationContextPackage = vi.fn().mockResolvedValue(restoredTask("implementing"));
+  const startClaudeImplementation = vi.fn();
+  const { isolation } = renderActiveTask("awaitingDesignApproval", {
+    getProviderEligibility,
+    getPlanningResult: async () => null,
+    getContextPackageImplementationReadiness,
+    startClaudeImplementationContextPackage,
+    startClaudeImplementation,
+  });
+
+  const activateButton = await screen.findByRole("button", {
+    name: "Start Claude Implementation (Context Package v1)",
+  });
+  await waitFor(() => expect(activateButton).not.toBeDisabled());
+  fireEvent.click(activateButton);
+
+  await waitFor(() =>
+    expect(startClaudeImplementationContextPackage).toHaveBeenCalledWith(
+      isolation.taskId,
+      isolation.taskVersion,
+    ),
+  );
+  expect(startClaudeImplementation).not.toHaveBeenCalled();
+  // No re-consent dialog: activation must not reuse the LegacyPhase4
+  // consent screen -- the CPv1 data-scope consent was already recorded by
+  // the separate "Prepare" step.
+  expect(
+    screen.queryByRole("heading", { name: "Send task brief and plan to Claude" }),
+  ).toBeNull();
+  expect(await screen.findByText(/Claude Implementation is applying changes/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Cancel implementation" })).toBeVisible();
 });
 
 it("never renders Testing validation controls outside the testing state", async () => {

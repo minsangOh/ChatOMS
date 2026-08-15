@@ -1,21 +1,23 @@
 use std::str::FromStr;
 
 use chatoms_domain::{
-    ActorKind, GitOperationId, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId,
-    TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
-    TaskStateTransitionSnapshot, ValidationCommandKind, WorkKind,
+    ActorKind, ContextDataScope, GitOperationId, HighRiskCategory, ProjectId, ReasonCode, Task,
+    TaskBranchIdentity, TaskId, TaskSnapshot, TaskState, TaskStateTransition,
+    TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind, WorkKind,
 };
+use chatoms_ports::diff::DiffContentHash;
 use chatoms_ports::git::RepositoryKind;
 use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
-    ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitIsolationStatus,
+    ActiveLease, AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
+    DiffApprovalRecord, FoundationRepository, GitInitApproval, GitIsolationStatus,
     GitOperationAttempt, GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt,
-    GitOperationReceiptKind, ImplementationResultOutcome, PlanningResultOutcome,
-    ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
-    ProviderConsent, RepositoryError, RepositoryErrorCode, ReviewResultOutcome, TaskBriefRecord,
-    TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
-    TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
-    ValidationCommandResultOutcome, ValidationCommandResultRecord,
+    GitOperationReceiptKind, HighRiskApprovalRecord, ImplementationResultOutcome,
+    PlanningResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary,
+    ProviderBindingRecord, ProviderConsent, RepositoryError, RepositoryErrorCode,
+    ReviewResultOutcome, TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
+    TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
+    ValidationCommandResultAttempt, ValidationCommandResultOutcome, ValidationCommandResultRecord,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -427,6 +429,7 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         provider: ProviderKind,
         work_kind: WorkKind,
         approved_task_version: u64,
+        data_scope: ContextDataScope,
     ) -> Result<Option<ProviderConsent>, RepositoryError> {
         load_provider_consent(
             self.database.raw_mut(),
@@ -434,6 +437,7 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
             provider,
             work_kind,
             approved_task_version,
+            data_scope,
         )
     }
 
@@ -478,6 +482,77 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         // approved_task_version (the pre-transition WorktreeReady version).
         if let Some(consent) = consent {
             insert_provider_consent(&transaction, consent)?;
+        }
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn save_context_package_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        if task.state() != TaskState::Planning {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::WorktreeReady {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = load_isolation(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        // Re-verify inside this transaction that the Context Package v1
+        // Planning consent/manifest pair actually exists — never trust the
+        // caller's earlier read-only check alone. Both absent is a normal
+        // "not prepared yet" precondition failure; exactly one present is
+        // the already-corrupted invariant `prepare_planning_context_package`
+        // also guards against.
+        let consent = load_provider_consent(
+            &transaction,
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        )?;
+        let manifest = load_context_package_manifest(
+            &transaction,
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        )?;
+        match (consent, manifest) {
+            (Some(_), Some(_)) => {}
+            (None, None) => return Err(repository_error(RepositoryErrorCode::InvalidAggregate)),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(repository_error(
+                    RepositoryErrorCode::InvalidPersistenceState,
+                ));
+            }
+        }
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
         }
         update_task(&transaction, expected_version, task)?;
         insert_transition(&transaction, transition).map_err(operation_failed)?;
@@ -534,10 +609,106 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         transaction.commit().map_err(operation_failed)
     }
 
+    fn save_context_package_implementation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        if task.state() != TaskState::Implementing {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::AwaitingDesignApproval {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = load_isolation(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        // Re-verify inside this transaction that a Completed, non-empty
+        // Claude Planning result is already stored — never trust the
+        // caller's earlier read-only check alone. `task_planning_results` is
+        // an immutable, insert-only table (no UPDATE/DELETE path exists), so
+        // this can only ever have been true or false at check time and
+        // cannot flip in between; re-checking it here is defense-in-depth
+        // consistent with the consent/manifest re-check below, not a
+        // response to a real race.
+        let planning_result = load_planning_result(&transaction, task.id())?;
+        let plan_text_present = planning_result
+            .as_ref()
+            .map(|result| {
+                result.outcome == PlanningResultOutcome::Completed
+                    && result
+                        .plan_text
+                        .as_deref()
+                        .is_some_and(|text| !text.is_empty())
+            })
+            .unwrap_or(false);
+        if !plan_text_present {
+            return Err(repository_error(
+                RepositoryErrorCode::InvalidPersistenceState,
+            ));
+        }
+        // Re-verify inside this transaction that the Context Package v1
+        // Implementation consent/manifest pair actually exists — never
+        // trust the caller's earlier read-only check alone. Both absent is
+        // a normal "not prepared yet" precondition failure; exactly one
+        // present is the already-corrupted invariant
+        // `prepare_implementation_context_package` also guards against.
+        let consent = load_provider_consent(
+            &transaction,
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        )?;
+        let manifest = load_context_package_manifest(
+            &transaction,
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        )?;
+        match (consent, manifest) {
+            (Some(_), Some(_)) => {}
+            (None, None) => return Err(repository_error(RepositoryErrorCode::InvalidAggregate)),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(repository_error(
+                    RepositoryErrorCode::InvalidPersistenceState,
+                ));
+            }
+        }
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
     fn save_review_consent(
         &mut self,
         expected_version: u64,
         task_id: TaskId,
+        data_scope: ContextDataScope,
         consented_at_ms: i64,
     ) -> Result<ProviderConsent, RepositoryError> {
         if consented_at_ms < 0 {
@@ -562,6 +733,7 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
             ProviderKind::Claude,
             WorkKind::Review,
             expected_version,
+            data_scope,
         )?;
         let consent = match existing {
             Some(consent) => consent,
@@ -571,6 +743,7 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
                     provider: ProviderKind::Claude,
                     work_kind: WorkKind::Review,
                     approved_task_version: expected_version,
+                    data_scope,
                     consented_at_ms,
                 };
                 insert_provider_consent(&transaction, &consent)?;
@@ -579,6 +752,255 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         };
         transaction.commit().map_err(operation_failed)?;
         Ok(consent)
+    }
+
+    fn prepare_planning_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        if prepared_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::WorktreeReady {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = load_isolation(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let preparation = prepare_context_package(
+            &transaction,
+            task_id,
+            WorkKind::Planning,
+            expected_version,
+            prepared_at_ms,
+        )?;
+        transaction.commit().map_err(operation_failed)?;
+        Ok(preparation)
+    }
+
+    fn prepare_implementation_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        if prepared_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::AwaitingDesignApproval {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let preparation = prepare_context_package(
+            &transaction,
+            task_id,
+            WorkKind::Implementation,
+            expected_version,
+            prepared_at_ms,
+        )?;
+        transaction.commit().map_err(operation_failed)?;
+        Ok(preparation)
+    }
+
+    fn prepare_review_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        if prepared_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::Reviewing {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let preparation = prepare_context_package(
+            &transaction,
+            task_id,
+            WorkKind::Review,
+            expected_version,
+            prepared_at_ms,
+        )?;
+        transaction.commit().map_err(operation_failed)?;
+        Ok(preparation)
+    }
+
+    fn save_context_package_manifest(
+        &mut self,
+        record: &ContextPackageManifestRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_context_package_manifest_shape(record)?;
+        insert_context_package_manifest(self.database.raw_mut(), record)
+    }
+
+    fn get_context_package_manifest(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+        data_scope: ContextDataScope,
+    ) -> Result<Option<ContextPackageManifestRecord>, RepositoryError> {
+        load_context_package_manifest(
+            self.database.raw_mut(),
+            task_id,
+            provider,
+            work_kind,
+            approved_task_version,
+            data_scope,
+        )
+    }
+
+    fn save_high_risk_approval(
+        &mut self,
+        approval: &HighRiskApprovalRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_high_risk_approval_shape(approval)?;
+        insert_high_risk_approval(self.database.raw_mut(), approval)
+    }
+
+    fn get_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        risk_category: HighRiskCategory,
+    ) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+        load_high_risk_approval(
+            self.database.raw_mut(),
+            task_id,
+            approved_task_version,
+            risk_category,
+        )
+    }
+
+    fn ensure_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+        approved_at_ms: i64,
+    ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        if approved_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        let existing =
+            load_high_risk_approval(&transaction, task_id, expected_version, risk_category)?;
+        let approval = match existing {
+            Some(approval) => approval,
+            None => {
+                let approval = HighRiskApprovalRecord {
+                    task_id,
+                    approved_task_version: expected_version,
+                    risk_category,
+                    approved_at_ms,
+                };
+                insert_high_risk_approval(&transaction, &approval)?;
+                approval
+            }
+        };
+        transaction.commit().map_err(operation_failed)?;
+        Ok(approval)
+    }
+
+    fn save_diff_approval(&mut self, approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {
+        validate_diff_approval_shape(approval)?;
+        insert_diff_approval(self.database.raw_mut(), approval)
+    }
+
+    fn get_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        diff_content_hash: DiffContentHash,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        load_diff_approval(
+            self.database.raw_mut(),
+            task_id,
+            approved_task_version,
+            diff_content_hash,
+        )
+    }
+
+    fn ensure_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        diff_content_hash: DiffContentHash,
+        approved_at_ms: i64,
+    ) -> Result<DiffApprovalRecord, RepositoryError> {
+        if approved_at_ms < 0 {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        let existing =
+            load_diff_approval(&transaction, task_id, expected_version, diff_content_hash)?;
+        let approval = match existing {
+            Some(approval) => approval,
+            None => {
+                let approval = DiffApprovalRecord {
+                    task_id,
+                    approved_task_version: expected_version,
+                    diff_content_hash,
+                    approved_at_ms,
+                };
+                insert_diff_approval(&transaction, &approval)?;
+                approval
+            }
+        };
+        transaction.commit().map_err(operation_failed)?;
+        Ok(approval)
     }
 
     fn save_planning_result(
@@ -1715,14 +2137,15 @@ fn insert_provider_consent(
     connection
         .execute(
             "INSERT INTO task_provider_consents (
-                task_id, provider, work_kind, approved_task_version, consented_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                task_id, provider, work_kind, approved_task_version, data_scope, consented_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 consent.task_id.to_string(),
                 provider_kind_text(consent.provider),
                 work_kind_text(consent.work_kind),
                 to_sql_integer(consent.approved_task_version)
                     .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                data_scope_text(consent.data_scope),
                 consent.consented_at_ms,
             ],
         )
@@ -1730,34 +2153,54 @@ fn insert_provider_consent(
     Ok(())
 }
 
+/// Looks up the consent row for the exact `(task_id, provider, work_kind,
+/// approved_task_version, data_scope)` 5-tuple: `data_scope` is part of the
+/// `WHERE` filter, never omitted or substituted. As defense in depth against
+/// a corrupted or hand-edited database, the persisted `data_scope` text is
+/// also read back and re-parsed via [`data_scope_from_text`] rather than
+/// blindly trusted to equal the requested value; a mismatch or an
+/// unrecognized value both fail closed as
+/// `RepositoryErrorCode::InvalidPersistenceState` without the raw string
+/// ever appearing in the error.
 fn load_provider_consent(
     connection: &Connection,
     task_id: TaskId,
     provider: ProviderKind,
     work_kind: WorkKind,
     approved_task_version: u64,
+    data_scope: ContextDataScope,
 ) -> Result<Option<ProviderConsent>, RepositoryError> {
-    let consented_at_ms = connection
+    let row = connection
         .query_row(
-            "SELECT consented_at_ms FROM task_provider_consents
+            "SELECT data_scope, consented_at_ms FROM task_provider_consents
              WHERE task_id = ?1 AND provider = ?2 AND work_kind = ?3
-               AND approved_task_version = ?4",
+               AND approved_task_version = ?4 AND data_scope = ?5",
             params![
                 task_id.to_string(),
                 provider_kind_text(provider),
                 work_kind_text(work_kind),
                 to_sql_integer(approved_task_version)
                     .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                data_scope_text(data_scope),
             ],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()
         .map_err(operation_failed)?;
-    Ok(consented_at_ms.map(|consented_at_ms| ProviderConsent {
+    let Some((persisted_data_scope, consented_at_ms)) = row else {
+        return Ok(None);
+    };
+    if data_scope_from_text(&persisted_data_scope)? != data_scope {
+        return Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        ));
+    }
+    Ok(Some(ProviderConsent {
         task_id,
         provider,
         work_kind,
         approved_task_version,
+        data_scope,
         consented_at_ms,
     }))
 }
@@ -1767,6 +2210,345 @@ const fn work_kind_text(kind: WorkKind) -> &'static str {
         WorkKind::Planning => "Planning",
         WorkKind::Implementation => "Implementation",
         WorkKind::Review => "Review",
+    }
+}
+
+const fn data_scope_text(scope: ContextDataScope) -> &'static str {
+    match scope {
+        ContextDataScope::LegacyPhase4 => "LegacyPhase4",
+        ContextDataScope::ContextPackageV1 => "ContextPackageV1",
+    }
+}
+
+fn data_scope_from_text(value: &str) -> Result<ContextDataScope, RepositoryError> {
+    match value {
+        "LegacyPhase4" => Ok(ContextDataScope::LegacyPhase4),
+        "ContextPackageV1" => Ok(ContextDataScope::ContextPackageV1),
+        _ => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+    }
+}
+
+/// Rejects a Context Package v1 manifest before it ever reaches the
+/// database driver: `data_scope` must be exactly
+/// [`ContextDataScope::ContextPackageV1`] (a manifest never exists for
+/// [`ContextDataScope::LegacyPhase4`], which the SQL `CHECK` in
+/// `0017_context_package_manifests.sql` also enforces independently) and
+/// `created_at_ms` must be non-negative.
+fn validate_context_package_manifest_shape(
+    record: &ContextPackageManifestRecord,
+) -> Result<(), RepositoryError> {
+    if record.data_scope != ContextDataScope::ContextPackageV1 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    if record.created_at_ms < 0 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn insert_context_package_manifest(
+    connection: &Connection,
+    record: &ContextPackageManifestRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO context_package_manifests (
+                task_id, provider, work_kind, approved_task_version, data_scope, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.task_id.to_string(),
+                provider_kind_text(record.provider),
+                work_kind_text(record.work_kind),
+                to_sql_integer(record.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                data_scope_text(record.data_scope),
+                record.created_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+/// Looks up the manifest row for the exact `(task_id, provider, work_kind,
+/// approved_task_version, data_scope)` 5-tuple: `data_scope` is part of the
+/// `WHERE` filter, never omitted or substituted. As defense in depth against
+/// a corrupted or hand-edited database, the persisted `data_scope` text is
+/// also read back and re-parsed via [`data_scope_from_text`] rather than
+/// blindly trusted to equal the requested value, mirroring
+/// [`load_provider_consent`]; a mismatch or an unrecognized value both fail
+/// closed as `RepositoryErrorCode::InvalidPersistenceState` without the raw
+/// string ever appearing in the error.
+fn load_context_package_manifest(
+    connection: &Connection,
+    task_id: TaskId,
+    provider: ProviderKind,
+    work_kind: WorkKind,
+    approved_task_version: u64,
+    data_scope: ContextDataScope,
+) -> Result<Option<ContextPackageManifestRecord>, RepositoryError> {
+    let row = connection
+        .query_row(
+            "SELECT data_scope, created_at_ms FROM context_package_manifests
+             WHERE task_id = ?1 AND provider = ?2 AND work_kind = ?3
+               AND approved_task_version = ?4 AND data_scope = ?5",
+            params![
+                task_id.to_string(),
+                provider_kind_text(provider),
+                work_kind_text(work_kind),
+                to_sql_integer(approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                data_scope_text(data_scope),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(operation_failed)?;
+    let Some((persisted_data_scope, created_at_ms)) = row else {
+        return Ok(None);
+    };
+    if data_scope_from_text(&persisted_data_scope)? != data_scope {
+        return Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        ));
+    }
+    Ok(Some(ContextPackageManifestRecord {
+        task_id,
+        provider,
+        work_kind,
+        approved_task_version,
+        data_scope,
+        created_at_ms,
+    }))
+}
+
+fn validate_high_risk_approval_shape(
+    approval: &HighRiskApprovalRecord,
+) -> Result<(), RepositoryError> {
+    if approval.approved_at_ms < 0 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn insert_high_risk_approval(
+    connection: &Connection,
+    approval: &HighRiskApprovalRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_high_risk_approvals (
+                task_id, approved_task_version, risk_category, approved_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.task_id.to_string(),
+                to_sql_integer(approval.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                approval.risk_category.persisted_text(),
+                approval.approved_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+/// Looks up the approval row for the exact `(task_id, approved_task_version,
+/// risk_category)` identity. Scans every row recorded for `(task_id,
+/// approved_task_version)` (at most 13, one per [`HighRiskCategory`]) and
+/// parses each persisted `risk_category` via
+/// [`HighRiskCategory::from_persisted_text`] rather than filtering on the
+/// requested category as a raw SQL string — this way a corrupted or
+/// hand-edited row for that task/version fails the whole lookup closed as
+/// `RepositoryErrorCode::InvalidPersistenceState` (without the raw string
+/// ever appearing in the error) even when a different, well-formed row for
+/// the same task/version would otherwise have satisfied the request; a
+/// corrupted table must never be silently treated as if only the
+/// uncorrupted rows existed.
+fn load_high_risk_approval(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+    risk_category: HighRiskCategory,
+) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT risk_category, approved_at_ms FROM task_high_risk_approvals
+             WHERE task_id = ?1 AND approved_task_version = ?2",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map(params![task_id.to_string(), version], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(operation_failed)?;
+    let mut found_at_ms = None;
+    for row in rows {
+        let (persisted_category, approved_at_ms) = row.map_err(operation_failed)?;
+        let parsed_category = HighRiskCategory::from_persisted_text(&persisted_category)
+            .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        if parsed_category == risk_category {
+            found_at_ms = Some(approved_at_ms);
+        }
+    }
+    Ok(found_at_ms.map(|approved_at_ms| HighRiskApprovalRecord {
+        task_id,
+        approved_task_version,
+        risk_category,
+        approved_at_ms,
+    }))
+}
+
+fn validate_diff_approval_shape(approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {
+    if approval.approved_at_ms < 0 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn insert_diff_approval(
+    connection: &Connection,
+    approval: &DiffApprovalRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_diff_approvals (
+                task_id, approved_task_version, diff_content_hash_hex, approved_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.task_id.to_string(),
+                to_sql_integer(approval.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                approval.diff_content_hash.to_hex(),
+                approval.approved_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+/// Looks up the approval row for the exact `(task_id, approved_task_version,
+/// diff_content_hash)` identity. Scans every row recorded for `(task_id,
+/// approved_task_version)` and parses each persisted
+/// `diff_content_hash_hex` via [`DiffContentHash::from_hex`] rather than
+/// filtering on the requested hash as a raw SQL string — mirroring
+/// [`load_high_risk_approval`]'s reasoning exactly: this way a corrupted or
+/// hand-edited row for that task/version fails the whole lookup closed as
+/// `RepositoryErrorCode::InvalidPersistenceState` (without the raw string
+/// ever appearing in the error) even when a different, well-formed row for
+/// the same task/version would otherwise have satisfied the request. A
+/// SQL-side `WHERE diff_content_hash_hex = ?` filter would make this
+/// defense structurally unreachable — a malformed persisted value could
+/// never text-match a well-formed queried hash in the first place, so
+/// corruption in an unrelated row for the same task/version would silently
+/// never surface.
+fn load_diff_approval(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+    diff_content_hash: DiffContentHash,
+) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT diff_content_hash_hex, approved_at_ms FROM task_diff_approvals
+             WHERE task_id = ?1 AND approved_task_version = ?2",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map(params![task_id.to_string(), version], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(operation_failed)?;
+    let mut found_at_ms = None;
+    for row in rows {
+        let (persisted_hash_hex, approved_at_ms) = row.map_err(operation_failed)?;
+        let parsed_hash = DiffContentHash::from_hex(&persisted_hash_hex)
+            .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        if parsed_hash == diff_content_hash {
+            found_at_ms = Some(approved_at_ms);
+        }
+    }
+    Ok(found_at_ms.map(|approved_at_ms| DiffApprovalRecord {
+        task_id,
+        approved_task_version,
+        diff_content_hash,
+        approved_at_ms,
+    }))
+}
+
+/// Shared core of `prepare_planning_context_package`/
+/// `prepare_implementation_context_package`/`prepare_review_context_package`:
+/// looks up the exact `(task_id, Claude, work_kind, expected_version,
+/// ContextPackageV1)` consent and its FK-bound manifest together, and
+/// either reuses both unchanged, inserts both fresh (consent first, so the
+/// manifest's foreign key always has a row to bind to), or — if exactly one
+/// of the pair exists — fails closed as `InvalidPersistenceState` without
+/// writing anything. `work_kind` is fixed by the caller (one of the three
+/// public methods above, each hardcoding its own), never taken from an
+/// external caller of this private helper.
+fn prepare_context_package(
+    connection: &Connection,
+    task_id: TaskId,
+    work_kind: WorkKind,
+    expected_version: u64,
+    prepared_at_ms: i64,
+) -> Result<ContextPackagePreparation, RepositoryError> {
+    let existing_consent = load_provider_consent(
+        connection,
+        task_id,
+        ProviderKind::Claude,
+        work_kind,
+        expected_version,
+        ContextDataScope::ContextPackageV1,
+    )?;
+    let existing_manifest = load_context_package_manifest(
+        connection,
+        task_id,
+        ProviderKind::Claude,
+        work_kind,
+        expected_version,
+        ContextDataScope::ContextPackageV1,
+    )?;
+    match (existing_consent, existing_manifest) {
+        (Some(consent), Some(manifest)) => Ok(ContextPackagePreparation { consent, manifest }),
+        (None, None) => {
+            let consent = ProviderConsent {
+                task_id,
+                provider: ProviderKind::Claude,
+                work_kind,
+                approved_task_version: expected_version,
+                data_scope: ContextDataScope::ContextPackageV1,
+                consented_at_ms: prepared_at_ms,
+            };
+            insert_provider_consent(connection, &consent)?;
+            let manifest = ContextPackageManifestRecord {
+                task_id,
+                provider: ProviderKind::Claude,
+                work_kind,
+                approved_task_version: expected_version,
+                data_scope: ContextDataScope::ContextPackageV1,
+                created_at_ms: prepared_at_ms,
+            };
+            insert_context_package_manifest(connection, &manifest)?;
+            Ok(ContextPackagePreparation { consent, manifest })
+        }
+        // Exactly one of the pair exists: an already-corrupted invariant
+        // ("분리된 시점에 부분 저장" must never happen) that this method must
+        // never silently repair by inserting the missing half under the
+        // existing one.
+        (Some(_), None) | (None, Some(_)) => Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
     }
 }
 

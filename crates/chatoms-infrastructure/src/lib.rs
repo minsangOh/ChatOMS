@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod claude_implementation;
 pub mod claude_planning;
 pub mod claude_review;
+pub mod context_package;
 pub mod database;
 pub mod error;
 pub mod git;

@@ -1,9 +1,11 @@
 use std::{error::Error, fmt};
 
 use chatoms_domain::{
-    GitOperationId, ProjectId, Task, TaskId, TaskStateTransition, ValidationCommandKind, WorkKind,
+    ContextDataScope, GitOperationId, HighRiskCategory, ProjectId, Task, TaskId,
+    TaskStateTransition, ValidationCommandKind, WorkKind,
 };
 
+use crate::diff::DiffContentHash;
 use crate::git::RepositoryKind;
 use crate::provider::ProviderKind;
 
@@ -153,17 +155,57 @@ pub struct TaskGitIsolation {
 }
 
 /// Immutable evidence that the user granted one-time provider-transmission
-/// consent for a specific `(task, provider, work_kind, task_version)`
-/// combination. A new row is required whenever the task version changes
-/// (e.g. after a resume); existing rows are never updated or reused across
-/// versions.
+/// consent for a specific `(task, provider, work_kind, task_version,
+/// data_scope)` combination. `data_scope` is a fifth identity component,
+/// distinct from `work_kind`: it identifies *what data* the consent covers,
+/// not *which work kind* the provider is performing. A new row is required
+/// whenever the task version changes (e.g. after a resume) or the data
+/// scope changes; existing rows are never updated or reused across either
+/// dimension. See [`ContextDataScope`] for the fixed vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderConsent {
     pub task_id: TaskId,
     pub provider: ProviderKind,
     pub work_kind: WorkKind,
     pub approved_task_version: u64,
+    pub data_scope: ContextDataScope,
     pub consented_at_ms: i64,
+}
+
+/// Immutable, content-free identity record proving a Context Package v1
+/// manifest exists for a specific `(task_id, provider, work_kind,
+/// approved_task_version, data_scope)` provider-transmission consent (see
+/// [`ProviderConsent`]). `data_scope` is always
+/// [`ContextDataScope::ContextPackageV1`] — a manifest never exists for a
+/// [`ContextDataScope::LegacyPhase4`] consent, which has no manifest
+/// concept. Alternative B (`docs/DECISIONS.md`, "Context Package v1 저장
+/// 방식") keeps this record permanently as proof that a package was built
+/// for this exact consent; the actual assembled body (TaskBrief text,
+/// plan/review/validation content, Git diff, file/symbol references, or any
+/// other content) is never stored here or anywhere else — it exists only
+/// momentarily, immediately before a provider call, and is discarded
+/// afterward. This type therefore carries no content field beyond the
+/// consent identity it refers to and the time the row was written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextPackageManifestRecord {
+    pub task_id: TaskId,
+    pub provider: ProviderKind,
+    pub work_kind: WorkKind,
+    pub approved_task_version: u64,
+    pub data_scope: ContextDataScope,
+    pub created_at_ms: i64,
+}
+
+/// The exact `ContextPackageV1` consent and its FK-bound manifest, returned
+/// together because they are always created or reused together — never one
+/// without the other (see [`FoundationRepository::prepare_planning_context_package`]
+/// and its Implementation/Review siblings). Both fields are already
+/// content-free ([`ProviderConsent`]/[`ContextPackageManifestRecord`]), so
+/// this type adds no new content of its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextPackagePreparation {
+    pub consent: ProviderConsent,
+    pub manifest: ContextPackageManifestRecord,
 }
 
 /// Terminal classification of a Claude Planning attempt, already reduced
@@ -390,6 +432,48 @@ pub struct ValidationCommandResultRecord {
     pub safe_summary: String,
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
+}
+
+/// An immutable, content-free approval of one [`HighRiskCategory`] effect for
+/// a specific task version. Unlike [`ValidationCommandApprovalRecord`] or a
+/// [`ProviderConsent`], this record carries no `provider`, `work_kind`, or
+/// `data_scope` at all: whether an operation's effect falls into a high-risk
+/// category (a schema change, a data migration, a difficult-to-recover
+/// change, and so on) is orthogonal to which provider or work kind performs
+/// it. This Unit only stores and reads back this reference — it never
+/// classifies an operation into a category, never gates any execution on
+/// its presence, and is not foreign-keyed to `task_provider_consents` or
+/// `context_package_manifests`, since a task may need both a data-scope
+/// consent and a high-risk approval for the same change at the same time,
+/// entirely independently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HighRiskApprovalRecord {
+    pub task_id: TaskId,
+    pub approved_task_version: u64,
+    pub risk_category: HighRiskCategory,
+    pub approved_at_ms: i64,
+}
+
+/// An immutable, content-free approval binding a specific task version to
+/// the exact [`DiffContentHash`] of the worktree diff the user reviewed and
+/// approved — never the raw diff text itself. Unlike [`HighRiskApprovalRecord`]
+/// (which is keyed by a closed 13-item category vocabulary), the diff this
+/// approval covers has no prior commit to bind to at approval time (the
+/// single work commit is only created once `Merging` starts — see
+/// `docs/DECISIONS.md`'s "병합 이력" entry): the content hash is the only
+/// content-free way to prove "the user approved *this exact* diff, not a
+/// different one at the same task version." Not foreign-keyed to
+/// `task_provider_consents`, `context_package_manifests`, or
+/// `task_high_risk_approvals` — this is an entirely independent approval
+/// axis. This Unit only stores and reads back this reference — it never
+/// starts, blocks, or gates any provider, `AutoFixing`, `ReviewFixing`, or
+/// `Merging` execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiffApprovalRecord {
+    pub task_id: TaskId,
+    pub approved_task_version: u64,
+    pub diff_content_hash: DiffContentHash,
+    pub approved_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,12 +779,20 @@ pub trait FoundationRepository {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
 
+    /// Looks up a consent for the exact `(task_id, provider, work_kind,
+    /// approved_task_version, data_scope)` 5-tuple. Implementations must
+    /// never omit `data_scope` from the lookup, fall back to a different
+    /// scope, or treat a consent recorded under one scope as valid for
+    /// another: a caller asking for `ContextDataScope::ContextPackageV1`
+    /// must never receive a `ContextDataScope::LegacyPhase4` row, and vice
+    /// versa.
     fn get_provider_consent(
         &mut self,
         _task_id: TaskId,
         _provider: ProviderKind,
         _work_kind: WorkKind,
         _approved_task_version: u64,
+        _data_scope: ContextDataScope,
     ) -> Result<Option<ProviderConsent>, RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
@@ -737,7 +829,7 @@ pub trait FoundationRepository {
 
     /// Atomically records or reuses a one-time Claude Review
     /// provider-transmission consent for `(task_id, Claude, Review,
-    /// expected_version)`. Unlike [`Self::save_planning_transition`]/
+    /// expected_version, data_scope)`. Unlike [`Self::save_planning_transition`]/
     /// [`Self::save_implementation_transition`], this never touches task
     /// state, version, transition history, or the `ActiveTaskLease`:
     /// `Testing -> Reviewing` is already an automatic transition (see
@@ -746,14 +838,289 @@ pub trait FoundationRepository {
     /// stays there. Implementations must re-verify inside the same
     /// transaction that the task's current version equals `expected_version`
     /// and its current state is `Reviewing` before reading or inserting the
-    /// consent row, and must return an existing same-version consent
-    /// unchanged rather than inserting a duplicate.
+    /// consent row, and must return an existing same-version-and-scope
+    /// consent unchanged rather than inserting a duplicate. A consent
+    /// recorded under a different `data_scope` must never be returned or
+    /// reused as if it matched.
     fn save_review_consent(
         &mut self,
         _expected_version: u64,
         _task_id: TaskId,
+        _data_scope: ContextDataScope,
         _consented_at_ms: i64,
     ) -> Result<ProviderConsent, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically commits the `WorktreeReady -> Planning` state update and its
+    /// transition history record for a Context Package v1 Planning
+    /// activation, requiring — and re-verifying inside the same `IMMEDIATE`
+    /// transaction — that the exact `(task_id, Claude, Planning,
+    /// expected_version, ContextPackageV1)` consent and its FK-bound manifest
+    /// (see [`Self::prepare_planning_context_package`]) already exist. Unlike
+    /// [`Self::save_planning_transition`], this never inserts a new consent
+    /// row of its own — the [`ContextDataScope::ContextPackageV1`] consent
+    /// must already have been prepared by a prior, separate call — and it
+    /// never shares a write path with `save_planning_transition` or
+    /// `prepare_planning_context_package`. If the consent/manifest pair is
+    /// entirely absent, this is a normal (not corrupted) precondition
+    /// failure: the caller simply has not prepared the package yet, and this
+    /// returns `RepositoryErrorCode::InvalidAggregate` without writing
+    /// anything. If exactly one of the pair exists, that is the same
+    /// already-corrupted invariant `prepare_planning_context_package`
+    /// guards against, and this returns
+    /// `RepositoryErrorCode::InvalidPersistenceState` without writing
+    /// anything. Never touches a [`ContextDataScope::LegacyPhase4`] consent
+    /// under any circumstance.
+    fn save_context_package_planning_transition(
+        &mut self,
+        _expected_version: u64,
+        _task: &Task,
+        _transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically commits the `AwaitingDesignApproval -> Implementing` state
+    /// update and its transition history record for a Context Package v1
+    /// Implementation activation, requiring — and re-verifying inside the
+    /// same `IMMEDIATE` transaction — that the exact `(task_id, Claude,
+    /// Implementation, expected_version, ContextPackageV1)` consent and its
+    /// FK-bound manifest already exist, *and* that a `Completed`
+    /// [`crate::repository::TaskPlanningResultRecord`] with non-empty
+    /// `plan_text` is already stored for this task. Mirrors
+    /// [`Self::save_context_package_planning_transition`], this never
+    /// inserts a new consent row of its own — the
+    /// [`ContextDataScope::ContextPackageV1`] consent must already have been
+    /// prepared by a prior, separate call — and it never shares a write path
+    /// with `save_implementation_transition` or
+    /// `prepare_implementation_context_package`. If the consent/manifest
+    /// pair is entirely absent, this is a normal (not corrupted)
+    /// precondition failure: the caller simply has not prepared the package
+    /// yet, and this returns `RepositoryErrorCode::InvalidAggregate` without
+    /// writing anything. If exactly one of the pair exists, or if the stored
+    /// Planning result is missing, not `Completed`, or has empty
+    /// `plan_text`, that is an already-corrupted invariant and this returns
+    /// `RepositoryErrorCode::InvalidPersistenceState` without writing
+    /// anything. Never touches a [`ContextDataScope::LegacyPhase4`] consent
+    /// under any circumstance.
+    fn save_context_package_implementation_transition(
+        &mut self,
+        _expected_version: u64,
+        _task: &Task,
+        _transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically creates or reuses the exact `(task_id, Claude, Planning,
+    /// expected_version, ContextPackageV1)` consent together with its
+    /// FK-bound manifest, in a single transaction — never one without the
+    /// other. Requires `task.state() == WorktreeReady` at `expected_version`
+    /// *and* a `WorktreeReady` isolation record; neither is relaxed for this
+    /// method. Never touches task state, version, transition history, or
+    /// the `ActiveTaskLease` — this is a pure consent/manifest preparation
+    /// boundary, not a state transition (unlike
+    /// [`Self::save_planning_transition`], which this method does not call,
+    /// extend, or share a write path with). Does not create or reuse a
+    /// [`ContextDataScope::LegacyPhase4`] consent under any circumstance.
+    ///
+    /// If exactly one of the consent/manifest pair already exists for this
+    /// identity, that is an already-corrupted invariant this method must
+    /// never silently repair: it returns
+    /// `RepositoryErrorCode::InvalidPersistenceState` and writes nothing.
+    fn prepare_planning_context_package(
+        &mut self,
+        _expected_version: u64,
+        _task_id: TaskId,
+        _prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically creates or reuses the exact `(task_id, Claude,
+    /// Implementation, expected_version, ContextPackageV1)` consent together
+    /// with its FK-bound manifest, in a single transaction. Requires
+    /// `task.state() == AwaitingDesignApproval` at `expected_version`. See
+    /// [`Self::prepare_planning_context_package`] for the shared contract
+    /// (no state/version/history/lease mutation, no `LegacyPhase4` reuse, no
+    /// silent repair of a partial consent/manifest pair).
+    fn prepare_implementation_context_package(
+        &mut self,
+        _expected_version: u64,
+        _task_id: TaskId,
+        _prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically creates or reuses the exact `(task_id, Claude, Review,
+    /// expected_version, ContextPackageV1)` consent together with its
+    /// FK-bound manifest, in a single transaction. Requires
+    /// `task.state() == Reviewing` at `expected_version` — mirroring
+    /// [`Self::save_review_consent`]'s existing no-transition shape, but
+    /// this method never calls, extends, or shares a write path with
+    /// `save_review_consent`. See [`Self::prepare_planning_context_package`]
+    /// for the shared contract.
+    fn prepare_review_context_package(
+        &mut self,
+        _expected_version: u64,
+        _task_id: TaskId,
+        _prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically persists an immutable Context Package v1 manifest for the
+    /// exact `(task_id, provider, work_kind, approved_task_version,
+    /// data_scope)` consent `record.data_scope` identifies. The SQL foreign
+    /// key (`0017_context_package_manifests.sql`) requires the matching
+    /// [`ContextDataScope::ContextPackageV1`] consent row to already exist,
+    /// so this can never succeed ahead of (or in place of) a real consent
+    /// grant. Implementations must never widen, ignore, or substitute the
+    /// requested scope for another one, and must never treat a duplicate
+    /// identity, a missing consent, or a task version mismatch as success.
+    /// Never validates or changes `Task` state, version, transition history,
+    /// or the `ActiveTaskLease` — this is a pure storage boundary alongside
+    /// an already-recorded consent, not a state transition.
+    fn save_context_package_manifest(
+        &mut self,
+        _record: &ContextPackageManifestRecord,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Looks up the Context Package v1 manifest for the exact `(task_id,
+    /// provider, work_kind, approved_task_version, data_scope)` 5-tuple.
+    /// Implementations must never omit `data_scope` from the lookup, fall
+    /// back to a different scope, or return a manifest recorded under one
+    /// scope as if it matched another. Returns `None` when no manifest has
+    /// been recorded for that exact identity.
+    fn get_context_package_manifest(
+        &mut self,
+        _task_id: TaskId,
+        _provider: ProviderKind,
+        _work_kind: WorkKind,
+        _approved_task_version: u64,
+        _data_scope: ContextDataScope,
+    ) -> Result<Option<ContextPackageManifestRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Immutably inserts one [`HighRiskApprovalRecord`]. The SQL trigger
+    /// (`0018_task_high_risk_approvals.sql`) enforces that
+    /// `approved_task_version` equals the task's current version at insert
+    /// time; a duplicate `(task_id, approved_task_version, risk_category)`
+    /// is rejected by the table's primary key. This Unit performs no
+    /// create-or-reuse logic and no task state check — a duplicate or a
+    /// stale version must surface as a repository error, never be silently
+    /// treated as success. Never validates or changes `Task` state,
+    /// transition history, or the `ActiveTaskLease`.
+    fn save_high_risk_approval(
+        &mut self,
+        _approval: &HighRiskApprovalRecord,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Looks up the high-risk approval for the exact `(task_id,
+    /// approved_task_version, risk_category)` identity. Returns `None` when
+    /// no approval has been recorded for that exact identity — never
+    /// falls back to a different version or category. An unrecognized
+    /// persisted `risk_category` (a corrupted or hand-edited row) fails
+    /// closed as a typed persistence error rather than exposing the raw
+    /// stored value or silently defaulting to `None`.
+    fn get_high_risk_approval(
+        &mut self,
+        _task_id: TaskId,
+        _approved_task_version: u64,
+        _risk_category: HighRiskCategory,
+    ) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically creates-or-reuses one immutable [`HighRiskApprovalRecord`]
+    /// for the exact `(task_id, expected_version, risk_category)` identity,
+    /// inside a single `IMMEDIATE` transaction: re-verify the task exists and
+    /// its current version equals `expected_version`, look up the exact
+    /// existing approval, and either return it unchanged or insert a new one
+    /// and return that — never both, and never a duplicate row. Unlike
+    /// [`Self::save_high_risk_approval`] (a bare immutable insert that
+    /// surfaces a duplicate identity as an error), this method treats an
+    /// already-existing exact match as success, not a conflict — the
+    /// `IMMEDIATE` lock this transaction acquires up front is what makes
+    /// that reuse race-free against a concurrent caller doing the same
+    /// thing, exactly like [`Self::save_review_consent`]'s create-or-reuse
+    /// shape. Does not whitelist or validate the task's current *state* —
+    /// which state(s) require which category is a future Policy Engine's
+    /// responsibility, not this storage boundary's. Never validates or
+    /// changes `Task` state, transition history, the `ActiveTaskLease`, or
+    /// any provider consent/manifest/validation-approval row.
+    fn ensure_high_risk_approval(
+        &mut self,
+        _task_id: TaskId,
+        _expected_version: u64,
+        _risk_category: HighRiskCategory,
+        _approved_at_ms: i64,
+    ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Immutably inserts one [`DiffApprovalRecord`]. The SQL trigger
+    /// (`0019_task_diff_approvals.sql`) enforces that
+    /// `approved_task_version` equals the task's current version at insert
+    /// time; a duplicate `(task_id, approved_task_version,
+    /// diff_content_hash)` is rejected by the table's primary key. This
+    /// method performs no create-or-reuse logic and no task state check — a
+    /// duplicate or a stale version must surface as a repository error,
+    /// never be silently treated as success. Never validates or changes
+    /// `Task` state, transition history, or the `ActiveTaskLease`.
+    fn save_diff_approval(
+        &mut self,
+        _approval: &DiffApprovalRecord,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Looks up the diff approval for the exact `(task_id,
+    /// approved_task_version, diff_content_hash)` identity. Returns `None`
+    /// when no approval has been recorded for that exact identity — never
+    /// falls back to a different version or hash. A malformed persisted hex
+    /// digest (a corrupted or hand-edited row) fails closed as a typed
+    /// persistence error rather than exposing the raw stored value or
+    /// silently defaulting to `None`.
+    fn get_diff_approval(
+        &mut self,
+        _task_id: TaskId,
+        _approved_task_version: u64,
+        _diff_content_hash: DiffContentHash,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically creates-or-reuses one immutable [`DiffApprovalRecord`] for
+    /// the exact `(task_id, expected_version, diff_content_hash)` identity,
+    /// inside a single `IMMEDIATE` transaction: re-verify the task exists
+    /// and its current version equals `expected_version`, look up the exact
+    /// existing approval, and either return it unchanged or insert a new
+    /// one and return that — never both, and never a duplicate row. Mirrors
+    /// [`Self::ensure_high_risk_approval`]'s create-or-reuse shape. Callers
+    /// are responsible for recomputing `diff_content_hash` from the task's
+    /// *current* worktree diff and verifying it exactly matches whatever
+    /// hash the user was shown before calling this — this method itself
+    /// does not read or re-verify any diff. Does not validate the task's
+    /// current *state*: gating which state(s) may call this remains the
+    /// caller's responsibility (see
+    /// `chatoms_application::user_diff_approval`). Never validates or
+    /// changes `Task` state, transition history, the `ActiveTaskLease`, or
+    /// any provider consent/manifest/high-risk-approval row.
+    fn ensure_diff_approval(
+        &mut self,
+        _task_id: TaskId,
+        _expected_version: u64,
+        _diff_content_hash: DiffContentHash,
+        _approved_at_ms: i64,
+    ) -> Result<DiffApprovalRecord, RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
 

@@ -35,8 +35,12 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::planning::start_claude_planning,
             commands::planning::cancel_claude_planning,
             commands::planning::get_planning_result,
+            commands::context_package::get_context_package_planning_readiness,
+            commands::planning::start_claude_planning_context_package,
             commands::implementation::start_claude_implementation,
             commands::implementation::cancel_claude_implementation,
+            commands::context_package::get_context_package_implementation_readiness,
+            commands::implementation::start_claude_implementation_context_package,
             commands::testing::start_validation_testing,
             commands::testing::cancel_validation_testing,
             commands::validation_commands::get_validation_command_candidates,
@@ -45,6 +49,15 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::review::start_claude_review,
             commands::review::cancel_claude_review,
             commands::review::get_review_result,
+            commands::context_package::prepare_planning_context_package,
+            commands::context_package::prepare_implementation_context_package,
+            commands::context_package::prepare_review_context_package,
+            commands::context_package::get_context_package_review_readiness,
+            commands::review::start_claude_review_context_package,
+            commands::high_risk_approval::get_high_risk_approval_status,
+            commands::high_risk_approval::approve_high_risk_operation,
+            commands::user_diff_review::get_user_diff_for_review,
+            commands::user_diff_review::approve_user_diff,
         ])
         .run(tauri::generate_context!())
 }
