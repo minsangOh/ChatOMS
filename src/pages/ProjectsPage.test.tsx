@@ -463,7 +463,7 @@ it("shows a safe recovery notice when Claude Implementation cancel finds no matc
 it("shows safe status text for paused and recovery-required states without exposing internals", async () => {
   for (const [taskState, expectedText] of [
     ["paused", "The task is paused"],
-    ["recoveryRequired", "requires manual recovery"],
+    ["recoveryRequired", "result could not be confirmed"],
   ] as const) {
     const { unmount } = renderActiveTask(taskState);
     expect(await screen.findByText(new RegExp(expectedText))).toBeVisible();
@@ -666,27 +666,31 @@ it("shows a safe error state when the diff cannot be loaded, without exposing th
   expect(document.body.textContent).not.toContain("APP_STORAGE_UNAVAILABLE");
 });
 
-it("does not call approveUserDiff before confirmation, and confirm sends only the digest, never raw diff text", async () => {
+it("does not start merging before confirmation and sends only the digest to the combined command", async () => {
   const diffText = "diff --git a/x b/x\n+added line\n";
   const diffContentHash = "a".repeat(64);
   const getUserDiffForReview = vi.fn().mockResolvedValue({ diffText, diffContentHash });
-  const approveUserDiff = vi.fn().mockResolvedValue({ approvedAtMs: 100 });
+  const approveUserDiffAndStartMerge = vi.fn().mockResolvedValue(restoredTask("merging"));
+  const getProjectRootValidationApprovalStatus = vi.fn().mockResolvedValue({ testApproved: true, buildApproved: true });
   const { isolation } = renderActiveTask("awaitingUserDiffApproval", {
     getReviewResult: async () => null,
     getUserDiffForReview,
-    approveUserDiff,
+    getProjectRootValidationApprovalStatus,
+    approveUserDiffAndStartMerge,
   });
 
+  await screen.findByLabelText("Isolation for Foundation");
   fireEvent.click(await screen.findByRole("button", { name: "Review current diff" }));
   await screen.findByText(/\+added line/);
-  expect(approveUserDiff).not.toHaveBeenCalled();
+  expect(approveUserDiffAndStartMerge).not.toHaveBeenCalled();
 
-  fireEvent.click(screen.getByRole("button", { name: "Approve this diff" }));
+  fireEvent.click(screen.getByRole("button", { name: "Approve and start merge" }));
 
-  expect(await screen.findByText("Diff approval recorded for the current task version.")).toBeVisible();
-  expect(approveUserDiff).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion, diffContentHash);
-  expect(approveUserDiff).toHaveBeenCalledTimes(1);
-  expect(approveUserDiff.mock.calls[0]).not.toContain(diffText);
+  expect(await screen.findByText(/approved change is being committed and merged/)).toBeVisible();
+  expect(approveUserDiffAndStartMerge).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion, diffContentHash);
+  expect(getProjectRootValidationApprovalStatus).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion);
+  expect(approveUserDiffAndStartMerge).toHaveBeenCalledTimes(1);
+  expect(approveUserDiffAndStartMerge.mock.calls[0]).not.toContain(diffText);
 });
 
 it("closing the review modal discards the diff so reopening fetches it again", async () => {
@@ -1333,4 +1337,24 @@ it("never renders Testing validation controls outside the testing state", async 
     expect(screen.queryByLabelText("Testing validation")).toBeNull();
     unmount();
   }
+});
+
+it("shows merge progress and safe terminal merge guidance without a cancel action", async () => {
+  const { unmount } = renderActiveTask("merging");
+  expect(await screen.findByText(/approved change is being committed and merged/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: /cancel merge/i })).toBeNull();
+  unmount();
+
+  renderActiveTask("postMergeTesting");
+  expect(await screen.findByText("The merge completed. Post-merge validation is pending.")).toBeVisible();
+});
+
+it("shows conflict and recovery messages without exposing Git command output", async () => {
+  const { unmount } = renderActiveTask("mergeConflict");
+  expect(await screen.findByText(/Git reported a merge conflict/)).toBeVisible();
+  expect(document.body.textContent).not.toContain("fatal:");
+  unmount();
+
+  renderActiveTask("recoveryRequired");
+  expect(await screen.findByText("The task result could not be confirmed. Review the repository safely before proceeding.")).toBeVisible();
 });

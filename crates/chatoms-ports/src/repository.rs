@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use chatoms_domain::{
     ContextDataScope, GitOperationId, HighRiskCategory, ProjectId, Task, TaskId,
-    TaskStateTransition, ValidationCommandKind, WorkKind,
+    TaskStateTransition, ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 
 use crate::diff::DiffContentHash;
@@ -347,6 +347,7 @@ pub struct TaskReviewResultRecord {
 pub struct ValidationCommandApprovalRecord {
     pub task_id: TaskId,
     pub approved_task_version: u64,
+    pub execution_scope: ValidationExecutionScope,
     pub kind: ValidationCommandKind,
     pub executable: String,
     pub arguments: Vec<String>,
@@ -362,6 +363,10 @@ pub struct ValidationCommandApprovalRecord {
     pub approved_rustup_home_path: Option<String>,
     pub rustup_home_volume_serial_hex: Option<String>,
     pub rustup_home_file_id_hex: Option<String>,
+    pub target_project_id: Option<ProjectId>,
+    pub target_project_identity_revision: Option<u64>,
+    pub target_root_volume_serial_hex: Option<String>,
+    pub target_root_file_id_hex: Option<String>,
     pub approved_at_ms: i64,
 }
 
@@ -399,6 +404,7 @@ pub enum ValidationCommandResultOutcome {
 pub struct ValidationCommandResultAttempt {
     pub task_id: TaskId,
     pub approved_task_version: u64,
+    pub execution_scope: ValidationExecutionScope,
     pub kind: ValidationCommandKind,
     pub outcome: ValidationCommandResultOutcome,
     pub exit_code: Option<i32>,
@@ -425,9 +431,50 @@ pub struct ValidationCommandResultAttempt {
 pub struct ValidationCommandResultRecord {
     pub task_id: TaskId,
     pub approved_task_version: u64,
+    pub execution_scope: ValidationExecutionScope,
     pub kind: ValidationCommandKind,
     pub attempt_sequence: u32,
     pub outcome: ValidationCommandResultOutcome,
+    pub exit_code: Option<i32>,
+    pub safe_summary: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostMergeValidationResultOutcome {
+    Success,
+    ExitFailure,
+    TimedOut,
+    StdoutBoundExceeded,
+    BindingRejected,
+    Cancelled,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostMergeValidationResultAttempt {
+    pub task_id: TaskId,
+    pub approval_task_version: u64,
+    pub post_merge_task_version: u64,
+    pub execution_scope: ValidationExecutionScope,
+    pub kind: ValidationCommandKind,
+    pub outcome: PostMergeValidationResultOutcome,
+    pub exit_code: Option<i32>,
+    pub safe_summary: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostMergeValidationResultRecord {
+    pub task_id: TaskId,
+    pub approval_task_version: u64,
+    pub post_merge_task_version: u64,
+    pub execution_scope: ValidationExecutionScope,
+    pub kind: ValidationCommandKind,
+    pub attempt_sequence: u32,
+    pub outcome: PostMergeValidationResultOutcome,
     pub exit_code: Option<i32>,
     pub safe_summary: String,
     pub started_at_ms: i64,
@@ -1205,6 +1252,15 @@ pub trait FoundationRepository {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
 
+    fn list_validation_command_approvals_for_scope(
+        &mut self,
+        _task_id: TaskId,
+        _approved_task_version: u64,
+        _execution_scope: ValidationExecutionScope,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
     /// Atomically appends one immutable validation command result attempt
     /// for an already-approved `(task_id, approved_task_version, kind)`.
     /// Implementations must, inside a single `IMMEDIATE` transaction: verify
@@ -1254,6 +1310,33 @@ pub trait FoundationRepository {
         _task: &Task,
         _transition: &TaskStateTransition,
         _attempt: &ValidationCommandResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn append_post_merge_validation_result(
+        &mut self,
+        _attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<PostMergeValidationResultRecord, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn list_post_merge_validation_results(
+        &mut self,
+        _task_id: TaskId,
+        _approval_task_version: u64,
+        _post_merge_task_version: u64,
+        _kind: ValidationCommandKind,
+    ) -> Result<Vec<PostMergeValidationResultRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn finalize_post_merge_validation_batch(
+        &mut self,
+        _expected_version: u64,
+        _task: &Task,
+        _transition: &TaskStateTransition,
+        _attempt: &PostMergeValidationResultAttempt,
     ) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }

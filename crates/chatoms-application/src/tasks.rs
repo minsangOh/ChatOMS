@@ -3,17 +3,19 @@ use std::str::FromStr;
 use chatoms_domain::{
     ActorKind, ContextDataScope, DomainError, HighRiskCategory, ProjectId, ReasonCode, Task,
     TaskBranchIdentity, TaskId, TaskState, TaskStateTransition, TaskStateTransitionId,
-    TaskStateTransitionSnapshot, ValidationCommandKind, WorkKind,
+    TaskStateTransitionSnapshot, ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_ports::{
     TimeProvider,
     diff::DiffContentHash,
     error::FailureCategory,
+    merge_execution::MergeExecutionOutcome,
     provider::ProviderKind,
     repository::{
         ActiveLease, ContextPackagePreparation, DiffApprovalRecord, FoundationRepository,
         GitIsolationStatus, HighRiskApprovalRecord, ImplementationResultOutcome,
-        PlanningResultOutcome, ProviderConsent, ReviewResultOutcome, TaskBriefRecord,
+        PlanningResultOutcome, PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
+        PostMergeValidationResultRecord, ProviderConsent, ReviewResultOutcome, TaskBriefRecord,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
         ValidationCommandResultAttempt, ValidationCommandResultOutcome,
     },
@@ -151,6 +153,30 @@ impl StartImplementationRequest {
 pub struct StartReviewRequest {
     task_id: TaskId,
     expected_version: u64,
+}
+
+pub struct StartMergeRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl StartMergeRequest {
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            actor_kind,
+            reason_code,
+        }
+    }
 }
 
 impl StartReviewRequest {
@@ -563,6 +589,33 @@ pub struct RecordReviewResultRequest {
     reason_code: String,
 }
 
+pub struct RecordMergeResultRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: MergeExecutionOutcome,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl RecordMergeResultRequest {
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        outcome: MergeExecutionOutcome,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            outcome,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
 impl RecordReviewResultRequest {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -631,6 +684,86 @@ impl FinalizeValidationCommandBatchRequest {
     ) -> Self {
         Self {
             task_id,
+            expected_version,
+            kind,
+            outcome,
+            exit_code,
+            safe_summary,
+            started_at_ms,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+pub struct AppendPostMergeValidationResultRequest {
+    task_id: TaskId,
+    approval_task_version: u64,
+    post_merge_task_version: u64,
+    kind: ValidationCommandKind,
+    exit_code: Option<i32>,
+    safe_summary: String,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+}
+
+impl AppendPostMergeValidationResultRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        task_id: TaskId,
+        approval_task_version: u64,
+        post_merge_task_version: u64,
+        kind: ValidationCommandKind,
+        exit_code: Option<i32>,
+        safe_summary: String,
+        started_at_ms: i64,
+        completed_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            approval_task_version,
+            post_merge_task_version,
+            kind,
+            exit_code,
+            safe_summary,
+            started_at_ms,
+            completed_at_ms,
+        }
+    }
+}
+
+pub struct FinalizePostMergeValidationBatchRequest {
+    task_id: TaskId,
+    approval_task_version: u64,
+    expected_version: u64,
+    kind: ValidationCommandKind,
+    outcome: PostMergeValidationResultOutcome,
+    exit_code: Option<i32>,
+    safe_summary: String,
+    started_at_ms: i64,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl FinalizePostMergeValidationBatchRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        task_id: TaskId,
+        approval_task_version: u64,
+        expected_version: u64,
+        kind: ValidationCommandKind,
+        outcome: PostMergeValidationResultOutcome,
+        exit_code: Option<i32>,
+        safe_summary: String,
+        started_at_ms: i64,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            approval_task_version,
             expected_version,
             kind,
             outcome,
@@ -1267,6 +1400,26 @@ where
         Ok(TaskView::from(&task))
     }
 
+    pub fn start_merge(
+        &mut self,
+        request: StartMergeRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::AwaitingUserDiffApproval {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        task.transition_to(TaskState::Merging, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_transition(request.expected_version, &task, &transition)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
     /// Read-only: reports whether an exact `(task_id, Claude, Review,
     /// expected_version, ContextPackageV1)` consent and its FK-bound
     /// manifest already exist, without creating, reusing, or mutating
@@ -1765,6 +1918,82 @@ where
         }
     }
 
+    pub fn record_merge_result(
+        &mut self,
+        request: RecordMergeResultRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::Merging {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let target = match request.outcome {
+            MergeExecutionOutcome::Merged => TaskState::PostMergeTesting,
+            MergeExecutionOutcome::ConfirmedMergeConflict => TaskState::MergeConflict,
+            MergeExecutionOutcome::PreWriteRejected(_)
+            | MergeExecutionOutcome::StageWriteUncertain
+            | MergeExecutionOutcome::CommitNotCreated
+            | MergeExecutionOutcome::CommitSucceededMergeFailed
+            | MergeExecutionOutcome::MergeConflictResidue
+            | MergeExecutionOutcome::PostWriteUncertain => TaskState::RecoveryRequired,
+        };
+        task.transition_to(target, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition =
+            self.next_transition(&task, from_state, actor_kind.clone(), reason_code.clone())?;
+        match self
+            .repository
+            .save_transition(request.expected_version, &task, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&task)),
+            Err(error) => self.recover_after_merge_persistence_failure(
+                request.task_id,
+                error,
+                actor_kind,
+                reason_code,
+            ),
+        }
+    }
+
+    fn recover_after_merge_persistence_failure(
+        &mut self,
+        task_id: TaskId,
+        original: chatoms_ports::repository::RepositoryError,
+        actor_kind: ActorKind,
+        reason_code: ReasonCode,
+    ) -> Result<TaskView, ApplicationError> {
+        let Ok(Some(mut persisted)) = self.repository.get_task(task_id) else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted.state() != TaskState::Merging {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let expected_version = persisted.version();
+        let from_state = persisted.state();
+        let Ok(now) = self.now_ms() else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted
+            .transition_to(TaskState::RecoveryRequired, now)
+            .is_err()
+        {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let Ok(transition) = self.next_transition(&persisted, from_state, actor_kind, reason_code)
+        else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        match self
+            .repository
+            .save_transition(expected_version, &persisted, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&persisted)),
+            Err(_) => Err(ApplicationError::from_categorized(&original)),
+        }
+    }
+
     /// Finalizes one Testing batch attempt: appends the batch's final
     /// validation command result and, in the same repository transaction,
     /// drives the resulting state transition (`Success -> Reviewing`,
@@ -1791,6 +2020,7 @@ where
         let attempt = ValidationCommandResultAttempt {
             task_id: request.task_id,
             approved_task_version: request.expected_version,
+            execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
             kind: request.kind,
             outcome: request.outcome,
             exit_code: request.exit_code,
@@ -1830,6 +2060,116 @@ where
             return Err(ApplicationError::from_categorized(&original));
         };
         if persisted.state() != TaskState::Testing {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let expected_version = persisted.version();
+        let from_state = persisted.state();
+        let Ok(now) = self.now_ms() else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted
+            .transition_to(TaskState::RecoveryRequired, now)
+            .is_err()
+        {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let Ok(transition) = self.next_transition(&persisted, from_state, actor_kind, reason_code)
+        else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        match self
+            .repository
+            .save_transition(expected_version, &persisted, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&persisted)),
+            Err(_) => Err(ApplicationError::from_categorized(&original)),
+        }
+    }
+
+    pub fn append_post_merge_validation_result(
+        &mut self,
+        request: AppendPostMergeValidationResultRequest,
+    ) -> Result<PostMergeValidationResultRecord, ApplicationError> {
+        let task = self.load_expected_task(request.task_id, request.post_merge_task_version)?;
+        if task.state() != TaskState::PostMergeTesting {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        self.repository
+            .append_post_merge_validation_result(&PostMergeValidationResultAttempt {
+                task_id: request.task_id,
+                approval_task_version: request.approval_task_version,
+                post_merge_task_version: request.post_merge_task_version,
+                execution_scope: ValidationExecutionScope::ProjectRoot,
+                kind: request.kind,
+                outcome: PostMergeValidationResultOutcome::Success,
+                exit_code: request.exit_code,
+                safe_summary: request.safe_summary,
+                started_at_ms: request.started_at_ms,
+                completed_at_ms: request.completed_at_ms,
+            })
+            .map_err(|error| ApplicationError::from_categorized(&error))
+    }
+
+    pub fn finalize_post_merge_validation_batch(
+        &mut self,
+        request: FinalizePostMergeValidationBatchRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::PostMergeTesting {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let target = if request.outcome == PostMergeValidationResultOutcome::Success {
+            TaskState::Completed
+        } else {
+            TaskState::RecoveryRequired
+        };
+        let occurred_at_ms = self.now_ms()?;
+        task.transition_to(target, occurred_at_ms)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition =
+            self.next_transition(&task, from_state, actor_kind.clone(), reason_code.clone())?;
+        let attempt = PostMergeValidationResultAttempt {
+            task_id: request.task_id,
+            approval_task_version: request.approval_task_version,
+            post_merge_task_version: request.expected_version,
+            execution_scope: ValidationExecutionScope::ProjectRoot,
+            kind: request.kind,
+            outcome: request.outcome,
+            exit_code: request.exit_code,
+            safe_summary: request.safe_summary,
+            started_at_ms: request.started_at_ms,
+            completed_at_ms: occurred_at_ms,
+        };
+        match self.repository.finalize_post_merge_validation_batch(
+            request.expected_version,
+            &task,
+            &transition,
+            &attempt,
+        ) {
+            Ok(()) => Ok(TaskView::from(&task)),
+            Err(error) => self.recover_after_post_merge_validation_persistence_failure(
+                request.task_id,
+                error,
+                actor_kind,
+                reason_code,
+            ),
+        }
+    }
+
+    fn recover_after_post_merge_validation_persistence_failure(
+        &mut self,
+        task_id: TaskId,
+        original: chatoms_ports::repository::RepositoryError,
+        actor_kind: ActorKind,
+        reason_code: ReasonCode,
+    ) -> Result<TaskView, ApplicationError> {
+        let Ok(Some(mut persisted)) = self.repository.get_task(task_id) else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted.state() != TaskState::PostMergeTesting {
             return Err(ApplicationError::from_categorized(&original));
         }
         let expected_version = persisted.version();

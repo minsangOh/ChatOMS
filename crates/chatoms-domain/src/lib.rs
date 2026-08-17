@@ -25,5 +25,5 @@ pub use transition::{
     ACTOR_KIND_MAX_LENGTH, ActorKind, REASON_CODE_MAX_LENGTH, ReasonCode, TaskStateTransition,
     TaskStateTransitionSnapshot,
 };
-pub use validation_command::ValidationCommandKind;
+pub use validation_command::{ValidationCommandKind, ValidationExecutionScope};
 pub use work_kind::WorkKind;

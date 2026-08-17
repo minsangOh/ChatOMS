@@ -8,7 +8,7 @@ use std::{
 use chatoms_domain::{
     ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, Task, TaskBranchIdentity,
     TaskId, TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
-    ValidationCommandKind, WorkKind,
+    ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_ports::{
     TimeProvider,
@@ -19,8 +19,9 @@ use chatoms_ports::{
         ActiveLease, ContextPackageManifestRecord, ContextPackagePreparation, DiffApprovalRecord,
         FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationAttempt,
         GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
-        HighRiskApprovalRecord, ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary,
-        ProviderConsent, RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
+        HighRiskApprovalRecord, PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
+        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderConsent,
+        RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
         ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
         ValidationCommandResultRecord,
@@ -46,7 +47,10 @@ pub struct FakeRepository {
     pub review_results: HashMap<TaskId, TaskReviewResultRecord>,
     pub validation_command_approvals:
         HashMap<(TaskId, u64, ValidationCommandKind), ValidationCommandApprovalRecord>,
+    pub project_root_validation_approvals:
+        HashMap<(TaskId, u64, ValidationCommandKind), ValidationCommandApprovalRecord>,
     pub validation_command_results: Vec<ValidationCommandResultRecord>,
+    pub post_merge_validation_results: Vec<PostMergeValidationResultRecord>,
     pub high_risk_approvals: HashMap<(TaskId, u64, HighRiskCategory), HighRiskApprovalRecord>,
     pub diff_approvals: HashMap<(TaskId, u64, DiffContentHash), DiffApprovalRecord>,
     pub approvals: Vec<GitInitApproval>,
@@ -920,11 +924,14 @@ impl FoundationRepository for FakeRepository {
             approval.approved_task_version,
             approval.kind,
         );
-        if self.validation_command_approvals.contains_key(&key) {
+        let approvals = match approval.execution_scope {
+            ValidationExecutionScope::TaskWorktree => &mut self.validation_command_approvals,
+            ValidationExecutionScope::ProjectRoot => &mut self.project_root_validation_approvals,
+        };
+        if approvals.contains_key(&key) {
             return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
         }
-        self.validation_command_approvals
-            .insert(key, approval.clone());
+        approvals.insert(key, approval.clone());
         Ok(())
     }
 
@@ -948,6 +955,25 @@ impl FoundationRepository for FakeRepository {
                 .unwrap_or(usize::MAX)
         });
         Ok(approvals)
+    }
+
+    fn list_validation_command_approvals_for_scope(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        execution_scope: ValidationExecutionScope,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        self.record("list_validation_command_approvals_for_scope");
+        self.maybe_fail("list_validation_command_approvals_for_scope")?;
+        let approvals = match execution_scope {
+            ValidationExecutionScope::TaskWorktree => &self.validation_command_approvals,
+            ValidationExecutionScope::ProjectRoot => &self.project_root_validation_approvals,
+        };
+        Ok(approvals
+            .iter()
+            .filter(|((id, version, _), _)| *id == task_id && *version == approved_task_version)
+            .map(|(_, approval)| approval.clone())
+            .collect())
     }
 
     fn append_validation_command_result(
@@ -975,6 +1001,7 @@ impl FoundationRepository for FakeRepository {
         let record = ValidationCommandResultRecord {
             task_id: attempt.task_id,
             approved_task_version: attempt.approved_task_version,
+            execution_scope: attempt.execution_scope,
             kind: attempt.kind,
             attempt_sequence,
             outcome: attempt.outcome,
@@ -1038,6 +1065,7 @@ impl FoundationRepository for FakeRepository {
             .push(ValidationCommandResultRecord {
                 task_id: attempt.task_id,
                 approved_task_version: attempt.approved_task_version,
+                execution_scope: attempt.execution_scope,
                 kind: attempt.kind,
                 attempt_sequence,
                 outcome: attempt.outcome,
@@ -1052,6 +1080,82 @@ impl FoundationRepository for FakeRepository {
             .entry(task.id())
             .or_default()
             .push(transition.clone());
+        Ok(())
+    }
+
+    fn append_post_merge_validation_result(
+        &mut self,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<PostMergeValidationResultRecord, RepositoryError> {
+        self.record("append_post_merge_validation_result");
+        self.maybe_fail("append_post_merge_validation_result")?;
+        let sequence = self
+            .post_merge_validation_results
+            .iter()
+            .filter(|record| {
+                record.task_id == attempt.task_id
+                    && record.approval_task_version == attempt.approval_task_version
+                    && record.post_merge_task_version == attempt.post_merge_task_version
+                    && record.kind == attempt.kind
+            })
+            .count() as u32
+            + 1;
+        let record = PostMergeValidationResultRecord {
+            task_id: attempt.task_id,
+            approval_task_version: attempt.approval_task_version,
+            post_merge_task_version: attempt.post_merge_task_version,
+            execution_scope: attempt.execution_scope,
+            kind: attempt.kind,
+            attempt_sequence: sequence,
+            outcome: attempt.outcome,
+            exit_code: attempt.exit_code,
+            safe_summary: attempt.safe_summary.clone(),
+            started_at_ms: attempt.started_at_ms,
+            completed_at_ms: attempt.completed_at_ms,
+        };
+        self.post_merge_validation_results.push(record.clone());
+        Ok(record)
+    }
+
+    fn list_post_merge_validation_results(
+        &mut self,
+        task_id: TaskId,
+        approval_task_version: u64,
+        post_merge_task_version: u64,
+        kind: ValidationCommandKind,
+    ) -> Result<Vec<PostMergeValidationResultRecord>, RepositoryError> {
+        Ok(self
+            .post_merge_validation_results
+            .iter()
+            .filter(|record| {
+                record.task_id == task_id
+                    && record.approval_task_version == approval_task_version
+                    && record.post_merge_task_version == post_merge_task_version
+                    && record.kind == kind
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn finalize_post_merge_validation_batch(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        self.record("finalize_post_merge_validation_batch");
+        self.maybe_fail("finalize_post_merge_validation_batch")?;
+        self.append_post_merge_validation_result(attempt)?;
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        if task.state().is_terminal() {
+            self.active_lease = None;
+        }
         Ok(())
     }
 

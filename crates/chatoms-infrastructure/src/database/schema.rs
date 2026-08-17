@@ -33,6 +33,8 @@ pub(crate) const TASK_HIGH_RISK_APPROVALS_SQL: &str =
     include_str!("../../migrations/0018_task_high_risk_approvals.sql");
 pub(crate) const TASK_DIFF_APPROVALS_SQL: &str =
     include_str!("../../migrations/0019_task_diff_approvals.sql");
+pub(crate) const SCOPED_POST_MERGE_VALIDATION_SQL: &str =
+    include_str!("../../migrations/0020_scoped_post_merge_validation.sql");
 
 pub(crate) const METADATA_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (

@@ -10,6 +10,7 @@ pub mod database;
 pub mod error;
 pub mod git;
 pub mod logging;
+pub mod merge_execution;
 pub mod process;
 pub mod provider;
 pub mod redaction;

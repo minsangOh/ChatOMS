@@ -64,7 +64,8 @@ pub fn handle_start_validation_testing(
     };
 
     let mut repository = ready.repository.clone();
-    let inputs = TestingBatchStarter::new(&mut repository)
+    let mut filesystem_for_start = ready.filesystem.clone();
+    let inputs = TestingBatchStarter::new(&mut repository, &mut filesystem_for_start)
         .begin(BeginTestingBatchRequest::new(id, expected_version))
         .map_err(IpcErrorDto::from)?;
 
@@ -79,7 +80,7 @@ pub fn handle_start_validation_testing(
         return Err(registry_conflict_error());
     };
     let testing_runs = ready.testing_runs.clone();
-    let worktree_path = inputs.worktree_path;
+    let worktree_identity = inputs.worktree_identity;
     let approvals = inputs.approvals;
     let filesystem = ready.filesystem.clone();
     let mut repository_for_thread = ready.repository.clone();
@@ -96,7 +97,7 @@ pub fn handle_start_validation_testing(
             .run_and_record_with_panic_containment(
                 id,
                 expected_version,
-                &worktree_path,
+                &worktree_identity,
                 &approvals,
                 &mut adapter,
                 &cancellation,

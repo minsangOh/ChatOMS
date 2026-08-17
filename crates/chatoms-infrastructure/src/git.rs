@@ -90,6 +90,26 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(20);
 /// Poll interval while waiting for the diff process to exit or the deadline
 /// to pass.
 const DIFF_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const GIT_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitWriteCommand {
+    Stage,
+    Commit,
+    Merge,
+}
+
+pub trait GitWriteCommandObserver: Send + Sync {
+    fn before_command(&self, command: GitWriteCommand);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitWriteCommandOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Uncertain,
+}
 
 #[derive(Clone, Debug)]
 struct GitControlPaths {
@@ -100,12 +120,13 @@ struct GitControlPaths {
     global_attributes: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitCliAdapter {
     runtime: TrustedGitRuntime,
     control: GitControlPaths,
     control_identity: Option<Vec<(PathBuf, String)>>,
     control_directory_identity: Option<Vec<DirectoryIdentity>>,
+    write_observer: Option<Arc<dyn GitWriteCommandObserver>>,
 }
 
 impl GitCliAdapter {
@@ -130,6 +151,7 @@ impl GitCliAdapter {
             control,
             control_identity: None,
             control_directory_identity: None,
+            write_observer: None,
         };
         if prepare_now {
             adapter.ensure_control_paths()?;
@@ -288,6 +310,81 @@ impl GitCliAdapter {
         let mut args = vec![OsString::from("-C"), root.as_os_str().to_owned()];
         args.extend(arguments);
         self.output_with_input(args, Some(input))
+    }
+
+    pub(crate) fn run_command<const N: usize>(
+        &mut self,
+        root: &Path,
+        arguments: [&str; N],
+    ) -> Result<Output, PortFailure> {
+        self.at_str(root, arguments)
+    }
+
+    pub fn set_write_command_observer(
+        &mut self,
+        observer: Option<Arc<dyn GitWriteCommandObserver>>,
+    ) {
+        self.write_observer = observer;
+    }
+
+    pub(crate) fn run_write_command<const N: usize>(
+        &mut self,
+        root: &Path,
+        command_kind: GitWriteCommand,
+        arguments: [&str; N],
+    ) -> GitWriteCommandOutcome {
+        let mut args = vec![OsString::from("-C"), root.as_os_str().to_owned()];
+        args.extend(arguments.into_iter().map(OsString::from));
+        let deadline = Instant::now() + GIT_WRITE_TIMEOUT;
+        let result = self.bounded_write_output(args, command_kind, deadline);
+        match result {
+            Ok(BoundedCaptureOutcome::Success(_)) => GitWriteCommandOutcome::Succeeded,
+            Ok(BoundedCaptureOutcome::ExitFailure) => GitWriteCommandOutcome::Failed,
+            Ok(BoundedCaptureOutcome::TimedOut) => GitWriteCommandOutcome::TimedOut,
+            Ok(BoundedCaptureOutcome::TooLarge | BoundedCaptureOutcome::Uncertain) | Err(_) => {
+                GitWriteCommandOutcome::Uncertain
+            }
+        }
+    }
+
+    fn bounded_write_output(
+        &mut self,
+        arguments: Vec<OsString>,
+        command_kind: GitWriteCommand,
+        deadline: Instant,
+    ) -> Result<BoundedCaptureOutcome, PortFailure> {
+        self.ensure_control_paths()?;
+        self.validate_runtime()?;
+        self.validate_control_paths()?;
+        if let Some(observer) = &self.write_observer {
+            observer.before_command(command_kind);
+        }
+        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(BoundedCaptureOutcome::TimedOut);
+        };
+        let mut command = Command::new(self.runtime.executable());
+        command
+            .env_clear()
+            .current_dir(&self.control.home)
+            .args(self.common_arguments())
+            .args(arguments);
+        configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        capture_bounded_stdout(command, DIFF_MAX_BYTES, timeout)
+    }
+
+    pub(crate) fn output_text(output: &Output) -> Result<&str, PortFailure> {
+        trimmed_utf8(&output.stdout)
+    }
+
+    pub(crate) fn validate_write_configuration(
+        &mut self,
+        root: &Path,
+        worktree: &Path,
+        base_commit: &str,
+    ) -> Result<(), PortFailure> {
+        self.validate_repository_source(root, base_commit)?;
+        reject_active_info_attributes(root)?;
+        self.check_worktree_filter_attributes(worktree)
     }
 
     fn validate_control_paths(&self) -> Result<(), PortFailure> {
@@ -714,7 +811,7 @@ impl GitService for GitCliAdapter {
 }
 
 impl GitCliAdapter {
-    fn verify_task_worktree_with_changes(
+    pub(crate) fn verify_task_worktree_with_changes(
         &mut self,
         root: &Path,
         branch: &str,
@@ -820,7 +917,7 @@ impl CommitCandidatePort for GitCliAdapter {
         base_commit: &str,
         worktree: &Path,
     ) -> Result<CommitCandidateOutcome, PortFailure> {
-        validate_branch(base_branch)?;
+        validate_base_branch(base_branch)?;
         validate_branch(task_branch)?;
         validate_object_id(base_commit)?;
         if !root.is_absolute() || !worktree.is_absolute() {
@@ -1441,6 +1538,25 @@ fn validate_branch(branch: &str) -> Result<(), PortFailure> {
         Ok(())
     } else {
         Err(PortFailure::new(FailureCategory::InvalidInput))
+    }
+}
+
+fn validate_base_branch(branch: &str) -> Result<(), PortFailure> {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+    {
+        Err(PortFailure::new(FailureCategory::InvalidInput))
+    } else {
+        Ok(())
     }
 }
 

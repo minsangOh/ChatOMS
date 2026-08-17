@@ -23,7 +23,9 @@
 
 use std::path::{Path, PathBuf};
 
-use chatoms_domain::{TaskId, TaskState, ValidationCommandKind};
+use chatoms_domain::{
+    ProjectId, TaskId, TaskState, ValidationCommandKind, ValidationExecutionScope,
+};
 use chatoms_ports::{
     TimeProvider,
     error::FailureCategory,
@@ -61,6 +63,46 @@ impl ApproveValidationCommandRequest {
         Self {
             task_id,
             expected_version,
+            kind,
+            executable,
+            arguments,
+            approved_executable_path,
+            approved_cargo_home_path,
+            approved_rustup_home_path,
+        }
+    }
+}
+
+pub struct ApproveProjectRootValidationCommandRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    project_id: ProjectId,
+    kind: ValidationCommandKind,
+    executable: String,
+    arguments: Vec<String>,
+    approved_executable_path: PathBuf,
+    approved_cargo_home_path: Option<PathBuf>,
+    approved_rustup_home_path: Option<PathBuf>,
+}
+
+impl ApproveProjectRootValidationCommandRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        project_id: ProjectId,
+        kind: ValidationCommandKind,
+        executable: String,
+        arguments: Vec<String>,
+        approved_executable_path: PathBuf,
+        approved_cargo_home_path: Option<PathBuf>,
+        approved_rustup_home_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            project_id,
             kind,
             executable,
             arguments,
@@ -171,6 +213,7 @@ where
         let approval = ValidationCommandApprovalRecord {
             task_id: request.task_id,
             approved_task_version: request.expected_version,
+            execution_scope: ValidationExecutionScope::TaskWorktree,
             kind: request.kind,
             executable: request.executable,
             arguments: request.arguments,
@@ -190,6 +233,131 @@ where
                 .as_ref()
                 .map(|home| home.volume_serial_hex.clone()),
             rustup_home_file_id_hex: rustup_home.as_ref().map(|home| home.file_id_hex.clone()),
+            target_project_id: None,
+            target_project_identity_revision: None,
+            target_root_volume_serial_hex: None,
+            target_root_file_id_hex: None,
+            approved_at_ms,
+        };
+        self.repository
+            .save_validation_command_approval(&approval)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(approval)
+    }
+
+    pub fn approve_project_root_command(
+        &mut self,
+        request: ApproveProjectRootValidationCommandRequest,
+    ) -> Result<ValidationCommandApprovalRecord, ApplicationError> {
+        let task = self
+            .repository
+            .get_task(request.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        if task.version() != request.expected_version {
+            return Err(category_error(FailureCategory::VersionConflict));
+        }
+        if task.state() != TaskState::AwaitingUserDiffApproval {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        if task.project_id() != request.project_id {
+            return Err(category_error(FailureCategory::InvariantViolation));
+        }
+        let project = self
+            .repository
+            .get_project(request.project_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        let project_identity = self
+            .repository
+            .get_project_identity(request.project_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .filter(|identity| identity.confirmed)
+            .ok_or_else(|| category_error(FailureCategory::InvariantViolation))?;
+        let live_root = self
+            .filesystem
+            .inspect_supported_directory(Path::new(&project.root_path))
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        if live_root.volume_serial_hex != project_identity.root_volume_serial_hex
+            || live_root.file_id_hex != project_identity.root_file_id_hex
+            || live_root.canonical_path.to_string_lossy() != project.root_path
+        {
+            return Err(category_error(FailureCategory::InvariantViolation));
+        }
+        let isolation = self
+            .repository
+            .get_task_isolation(request.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        if isolation.project_id != task.project_id()
+            || isolation.expected_task_version != request.expected_version
+        {
+            return Err(category_error(FailureCategory::InvariantViolation));
+        }
+        let worktree_path = isolation
+            .worktree_path
+            .filter(|_| isolation.status == GitIsolationStatus::WorktreeReady)
+            .ok_or_else(|| category_error(FailureCategory::InvariantViolation))?;
+        let candidates = self
+            .discovery
+            .discover_candidates(Path::new(&worktree_path))
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        let fixed_cargo = request.executable == "cargo"
+            && expected_cargo_arguments(request.kind).is_some_and(|arguments| {
+                request.arguments.iter().map(String::as_str).eq(arguments)
+            });
+        if !fixed_cargo
+            || !candidates.iter().any(|candidate| {
+                candidate.kind == request.kind
+                    && candidate.executable == request.executable
+                    && candidate.arguments == request.arguments
+            })
+        {
+            return Err(category_error(FailureCategory::InvalidInput));
+        }
+        let binding =
+            self.bind_executable(&project.root_path, &request.approved_executable_path)?;
+        let cargo_home = request
+            .approved_cargo_home_path
+            .as_deref()
+            .map(|path| self.bind_environment_directory(&project.root_path, path))
+            .transpose()?;
+        let rustup_home = request
+            .approved_rustup_home_path
+            .as_deref()
+            .map(|path| self.bind_environment_directory(&project.root_path, path))
+            .transpose()?;
+        let approved_at_ms = self
+            .time
+            .now_ms()
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        let approval = ValidationCommandApprovalRecord {
+            task_id: request.task_id,
+            approved_task_version: request.expected_version,
+            execution_scope: ValidationExecutionScope::ProjectRoot,
+            kind: request.kind,
+            executable: request.executable,
+            arguments: request.arguments,
+            approved_executable_path: binding.executable_path,
+            executable_volume_serial_hex: binding.executable_volume_serial_hex,
+            executable_file_id_hex: binding.executable_file_id_hex,
+            tool_directory_path: binding.tool_directory_path,
+            tool_directory_volume_serial_hex: binding.tool_directory_volume_serial_hex,
+            tool_directory_file_id_hex: binding.tool_directory_file_id_hex,
+            approved_cargo_home_path: cargo_home.as_ref().map(|home| home.path.clone()),
+            cargo_home_volume_serial_hex: cargo_home
+                .as_ref()
+                .map(|home| home.volume_serial_hex.clone()),
+            cargo_home_file_id_hex: cargo_home.as_ref().map(|home| home.file_id_hex.clone()),
+            approved_rustup_home_path: rustup_home.as_ref().map(|home| home.path.clone()),
+            rustup_home_volume_serial_hex: rustup_home
+                .as_ref()
+                .map(|home| home.volume_serial_hex.clone()),
+            rustup_home_file_id_hex: rustup_home.as_ref().map(|home| home.file_id_hex.clone()),
+            target_project_id: Some(request.project_id),
+            target_project_identity_revision: Some(project_identity.revision),
+            target_root_volume_serial_hex: Some(project_identity.root_volume_serial_hex),
+            target_root_file_id_hex: Some(project_identity.root_file_id_hex),
             approved_at_ms,
         };
         self.repository
@@ -430,4 +598,19 @@ fn category_error(category: FailureCategory) -> ApplicationError {
         category.default_severity(),
         category.default_retry(),
     )
+}
+
+fn expected_cargo_arguments(
+    kind: ValidationCommandKind,
+) -> Option<impl Iterator<Item = &'static str>> {
+    let arguments: &'static [&'static str] = match kind {
+        ValidationCommandKind::Format => &["fmt", "--all", "--", "--check"],
+        ValidationCommandKind::Lint => {
+            &["clippy", "--workspace", "--all-targets", "--all-features"]
+        }
+        ValidationCommandKind::Typecheck => return None,
+        ValidationCommandKind::Test => &["test", "--workspace"],
+        ValidationCommandKind::Build => &["build", "--workspace"],
+    };
+    Some(arguments.iter().copied())
 }

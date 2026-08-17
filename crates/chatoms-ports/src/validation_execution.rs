@@ -13,11 +13,49 @@
 //! `crate::implementation::ClaudeImplementationExecutor` arrived before
 //! `TaskService::record_implementation_result` existed.
 
-use std::path::Path;
-
 use crate::{
-    error::PortFailure, process::CancellationSignal, repository::ValidationCommandApprovalRecord,
+    error::PortFailure, filesystem::DirectoryIdentity, process::CancellationSignal,
+    repository::ValidationCommandApprovalRecord,
 };
+use chatoms_domain::{ProjectId, ValidationExecutionScope};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidationExecutionTarget {
+    TaskWorktree {
+        directory_identity: DirectoryIdentity,
+    },
+    ProjectRoot {
+        project_id: ProjectId,
+        project_identity_revision: u64,
+        directory_identity: DirectoryIdentity,
+    },
+}
+
+impl ValidationExecutionTarget {
+    #[must_use]
+    pub const fn scope(&self) -> ValidationExecutionScope {
+        match self {
+            Self::TaskWorktree { .. } => ValidationExecutionScope::TaskWorktree,
+            Self::ProjectRoot { .. } => ValidationExecutionScope::ProjectRoot,
+        }
+    }
+
+    #[must_use]
+    pub const fn directory_identity(&self) -> &DirectoryIdentity {
+        match self {
+            Self::TaskWorktree { directory_identity }
+            | Self::ProjectRoot {
+                directory_identity, ..
+            } => directory_identity,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ValidationExecutionRequest<'a> {
+    pub target: &'a ValidationExecutionTarget,
+    pub approval: &'a ValidationCommandApprovalRecord,
+}
 
 /// Reason a validation command attempt was rejected before any subprocess
 /// was spawned. Every variant means "no process started."
@@ -31,12 +69,13 @@ pub enum ValidationBindingRejection {
     /// already rejects) identically to a mismatch.
     IdentityMismatch,
     /// The approved executable's current canonical path resolves inside the
-    /// task worktree passed to this attempt.
-    ExecutableInsideWorktree,
+    /// explicit execution target passed to this attempt.
+    ExecutableInsideExecutionTarget,
     /// `approval`'s `(executable, arguments)` does not exactly match this
     /// implementation's own fixed vocabulary for `approval.kind` — a
     /// defense-in-depth re-check that never trusts a stored row blindly.
     UnapprovedCommandKind,
+    UnsupportedExecutionScope,
 }
 
 /// Terminal, fail-closed classification of one validation command attempt
@@ -61,19 +100,14 @@ pub enum ValidationExecutionStartOutcome {
 }
 
 /// Provider/tool-neutral execution contract for one already-approved
-/// validation command. `worktree_path` is both the identity check's "not
-/// inside here" boundary and the child's working directory — unlike Claude
-/// Planning/Implementation's app-owned preflight CWD, a validation command
-/// must run with the task worktree as its current directory to operate on
-/// that worktree's own manifest. Implementations own every identity
+/// validation command. The request couples one approval to one explicit,
+/// scope-matched target identity. Implementations own every identity
 /// re-check, controlled-environment construction, and timeout decision;
-/// `crate::validation`'s discovery/approval port never executes anything
-/// itself.
+/// `crate::validation`'s discovery/approval port never executes anything.
 pub trait ValidationCommandExecutor {
     fn start_validation_command(
         &mut self,
-        worktree_path: &Path,
-        approval: &ValidationCommandApprovalRecord,
+        request: ValidationExecutionRequest<'_>,
         cancellation: &dyn CancellationSignal,
     ) -> Result<ValidationExecutionStartOutcome, PortFailure>;
 }

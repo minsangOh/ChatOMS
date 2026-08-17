@@ -51,7 +51,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chatoms_domain::ValidationCommandKind;
+use chatoms_domain::{ValidationCommandKind, ValidationExecutionScope};
 use chatoms_ports::{
     error::PortFailure,
     filesystem::FilesystemIdentityPort,
@@ -62,7 +62,7 @@ use chatoms_ports::{
     repository::ValidationCommandApprovalRecord,
     validation_execution::{
         ValidationBindingRejection, ValidationCommandExecutor, ValidationExecutionOutcome,
-        ValidationExecutionStartOutcome,
+        ValidationExecutionRequest, ValidationExecutionStartOutcome, ValidationExecutionTarget,
     },
 };
 
@@ -119,11 +119,22 @@ where
     /// a PATH search and never accepts a shell string.
     pub fn start_validation_command(
         &mut self,
-        worktree_path: &Path,
-        approval: &ValidationCommandApprovalRecord,
+        request: ValidationExecutionRequest<'_>,
         cancellation: &dyn CancellationSignal,
     ) -> Result<ValidationExecutionStartOutcome, PortFailure> {
-        if let Err(rejection) = self.verify_bindings(worktree_path, approval) {
+        let ValidationExecutionTarget::TaskWorktree { directory_identity } = request.target else {
+            return Ok(ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::UnsupportedExecutionScope,
+            ));
+        };
+        let approval = request.approval;
+        if approval.execution_scope != ValidationExecutionScope::TaskWorktree {
+            return Ok(ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::UnsupportedExecutionScope,
+            ));
+        }
+        let worktree_path = directory_identity.canonical_path.as_path();
+        if let Err(rejection) = self.verify_bindings(directory_identity, approval) {
             return Ok(ValidationExecutionStartOutcome::BindingRejected(rejection));
         }
 
@@ -167,7 +178,7 @@ where
     /// mismatch) is treated identically: reject, never spawn.
     fn verify_bindings(
         &mut self,
-        worktree_path: &Path,
+        worktree_identity: &chatoms_ports::filesystem::DirectoryIdentity,
         approval: &ValidationCommandApprovalRecord,
     ) -> Result<(), ValidationBindingRejection> {
         let Some(expected_arguments) = expected_cargo_arguments(approval.kind) else {
@@ -204,15 +215,18 @@ where
             return Err(ValidationBindingRejection::IdentityMismatch);
         }
 
-        let worktree_identity = self
+        let current_worktree_identity = self
             .filesystem
-            .inspect_supported_directory(worktree_path)
+            .inspect_supported_directory(&worktree_identity.canonical_path)
             .map_err(|_error| ValidationBindingRejection::IdentityMismatch)?;
+        if current_worktree_identity != *worktree_identity {
+            return Err(ValidationBindingRejection::IdentityMismatch);
+        }
         if executable_identity
             .canonical_path
             .starts_with(&worktree_identity.canonical_path)
         {
-            return Err(ValidationBindingRejection::ExecutableInsideWorktree);
+            return Err(ValidationBindingRejection::ExecutableInsideExecutionTarget);
         }
 
         self.verify_environment_binding(
@@ -274,16 +288,10 @@ where
 {
     fn start_validation_command(
         &mut self,
-        worktree_path: &Path,
-        approval: &ValidationCommandApprovalRecord,
+        request: ValidationExecutionRequest<'_>,
         cancellation: &dyn CancellationSignal,
     ) -> Result<ValidationExecutionStartOutcome, PortFailure> {
-        CargoValidationAdapter::start_validation_command(
-            self,
-            worktree_path,
-            approval,
-            cancellation,
-        )
+        CargoValidationAdapter::start_validation_command(self, request, cancellation)
     }
 }
 
@@ -418,7 +426,7 @@ fn interpret_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chatoms_domain::TaskId;
+    use chatoms_domain::{TaskId, ValidationExecutionScope};
     use chatoms_ports::{
         error::FailureCategory, filesystem::DirectoryIdentity, process::AtomicCancellationSignal,
     };
@@ -431,6 +439,7 @@ mod tests {
         ValidationCommandApprovalRecord {
             task_id: TaskId::new(),
             approved_task_version: 3,
+            execution_scope: ValidationExecutionScope::TaskWorktree,
             kind,
             executable: CARGO_EXECUTABLE_NAME.to_owned(),
             arguments: arguments
@@ -449,6 +458,10 @@ mod tests {
             approved_rustup_home_path: None,
             rustup_home_volume_serial_hex: None,
             rustup_home_file_id_hex: None,
+            target_project_id: None,
+            target_project_identity_revision: None,
+            target_root_volume_serial_hex: None,
+            target_root_file_id_hex: None,
             approved_at_ms: 30,
         }
     }
@@ -478,6 +491,14 @@ mod tests {
 
     fn worktree_path() -> PathBuf {
         PathBuf::from("C:/managed/task")
+    }
+
+    fn worktree_identity() -> DirectoryIdentity {
+        DirectoryIdentity {
+            canonical_path: worktree_path(),
+            volume_serial_hex: "0000000000000009".to_owned(),
+            file_id_hex: "00000000000000000000000000000009".to_owned(),
+        }
     }
 
     fn cargo_home_binding() -> DirectoryIdentity {
@@ -640,7 +661,15 @@ mod tests {
         approval: &ValidationCommandApprovalRecord,
     ) -> ValidationExecutionStartOutcome {
         adapter
-            .start_validation_command(&worktree_path(), approval, &never_cancelled())
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &ValidationExecutionTarget::TaskWorktree {
+                        directory_identity: worktree_identity(),
+                    },
+                    approval,
+                },
+                &never_cancelled(),
+            )
             .expect("start_validation_command returns a typed outcome")
     }
 
@@ -676,6 +705,40 @@ mod tests {
         );
         assert_eq!(spec.working_directory, worktree_path());
         assert_eq!(*max_bytes, MAX_STDOUT_BYTES);
+    }
+
+    #[test]
+    fn project_root_target_is_rejected_before_spawn_until_the_adapter_is_explicitly_extended() {
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(FakeFilesystemIdentity::with_valid_bindings(), streaming);
+        let approval = test_approval();
+        let target = ValidationExecutionTarget::ProjectRoot {
+            project_id: chatoms_domain::ProjectId::new(),
+            project_identity_revision: 1,
+            directory_identity: worktree_identity(),
+        };
+
+        let outcome = adapter
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &target,
+                    approval: &approval,
+                },
+                &never_cancelled(),
+            )
+            .expect("unsupported scope is a typed pre-spawn outcome");
+
+        assert_eq!(
+            outcome,
+            ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::UnsupportedExecutionScope
+            )
+        );
+        assert!(observed.lock().expect("observed lock").is_empty());
     }
 
     #[test]
@@ -867,7 +930,7 @@ mod tests {
         assert_eq!(
             outcome,
             ValidationExecutionStartOutcome::BindingRejected(
-                ValidationBindingRejection::ExecutableInsideWorktree
+                ValidationBindingRejection::ExecutableInsideExecutionTarget
             )
         );
         assert!(observed.lock().expect("observed lock").is_empty());
@@ -1031,7 +1094,15 @@ mod tests {
         cancellation.cancel();
 
         let outcome = adapter
-            .start_validation_command(&worktree_path(), &test_approval(), &cancellation)
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &ValidationExecutionTarget::TaskWorktree {
+                        directory_identity: worktree_identity(),
+                    },
+                    approval: &test_approval(),
+                },
+                &cancellation,
+            )
             .expect("typed outcome");
 
         assert_eq!(
@@ -1095,7 +1166,15 @@ mod tests {
         );
 
         adapter
-            .start_validation_command(&worktree_path(), &test_approval(), &never_cancelled())
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &ValidationExecutionTarget::TaskWorktree {
+                        directory_identity: worktree_identity(),
+                    },
+                    approval: &test_approval(),
+                },
+                &never_cancelled(),
+            )
             .expect_err("a genuine spawn failure must not be silently swallowed");
     }
 

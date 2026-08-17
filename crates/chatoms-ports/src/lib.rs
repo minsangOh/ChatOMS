@@ -9,6 +9,7 @@ pub mod error;
 pub mod filesystem;
 pub mod git;
 pub mod implementation;
+pub mod merge_execution;
 pub mod path;
 pub mod permissions;
 pub mod planning;

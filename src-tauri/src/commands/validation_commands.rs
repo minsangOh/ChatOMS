@@ -14,8 +14,12 @@ use std::path::PathBuf;
 
 use chatoms_application::{
     error::ApplicationError,
+    merge_execution::MergeExecutionStarter,
     tasks::TaskService,
-    validation_commands::{ApproveValidationCommandRequest, ValidationCommandService},
+    validation_commands::{
+        ApproveProjectRootValidationCommandRequest, ApproveValidationCommandRequest,
+        ValidationCommandService,
+    },
 };
 use chatoms_domain::{TaskId, ValidationCommandKind};
 use chatoms_infrastructure::validation_discovery::ManifestValidationCommandDiscovery;
@@ -23,7 +27,8 @@ use chatoms_ports::{error::FailureCategory, repository::FoundationRepository};
 
 use crate::{
     dto::{
-        ApproveValidationCommandInputDto, ApproveValidationCommandResultDto,
+        ApproveProjectRootValidationInputDto, ApproveValidationCommandInputDto,
+        ApproveValidationCommandResultDto, ProjectRootValidationApprovalStatusDto,
         ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto,
     },
     error::IpcErrorDto,
@@ -160,6 +165,101 @@ pub fn handle_approve_validation_command(
     })
 }
 
+pub fn handle_get_project_root_validation_approval_status(
+    runtime: &ManagedRuntime,
+    task_id: &str,
+    expected_version: u64,
+) -> Result<ProjectRootValidationApprovalStatusDto, IpcErrorDto> {
+    let id = parse_task_id(task_id)?;
+    let ready = runtime.ready_snapshot()?;
+    let mut repository = ready.repository.clone();
+    let mut time = ready.time.clone();
+    let mut filesystem = ready.filesystem.clone();
+    MergeExecutionStarter::new(&mut repository, &mut time, &mut filesystem)
+        .project_root_validation_approval_status(id, expected_version)
+        .map(|status| ProjectRootValidationApprovalStatusDto {
+            test_approved: status.test_approved,
+            build_approved: status.build_approved,
+        })
+        .map_err(IpcErrorDto::from)
+}
+
+pub fn handle_approve_project_root_validation(
+    runtime: &ManagedRuntime,
+    task_id: &str,
+    expected_version: u64,
+    input: ApproveProjectRootValidationInputDto,
+) -> Result<ProjectRootValidationApprovalStatusDto, IpcErrorDto> {
+    let id = parse_task_id(task_id)?;
+    validate_project_root_approve_input(&input)?;
+
+    let ready = runtime.ready_snapshot()?;
+    let mut repository = ready.repository.clone();
+    let mut time = ready.time.clone();
+    let mut discovery = ManifestValidationCommandDiscovery::new();
+    let mut filesystem = ready.filesystem.clone();
+    let initial_status = MergeExecutionStarter::new(&mut repository, &mut time, &mut filesystem)
+        .project_root_validation_approval_status(id, expected_version)
+        .map_err(IpcErrorDto::from)?;
+    if initial_status.ready() {
+        return Ok(ProjectRootValidationApprovalStatusDto {
+            test_approved: true,
+            build_approved: true,
+        });
+    }
+
+    let task = TaskService::new(&mut repository, &mut time)
+        .get_task(id)
+        .map_err(IpcErrorDto::from)?
+        .ok_or_else(IpcErrorDto::not_found)?;
+    let candidates =
+        ValidationCommandService::new(&mut repository, &mut time, &mut discovery, &mut filesystem)
+            .list_candidates(id, expected_version)
+            .map_err(IpcErrorDto::from)?;
+    let mut resolved = Vec::new();
+    for (kind, already_approved) in [
+        (ValidationCommandKind::Test, initial_status.test_approved),
+        (ValidationCommandKind::Build, initial_status.build_approved),
+    ] {
+        if already_approved {
+            continue;
+        }
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.executable == "cargo" && candidate.kind == kind)
+            .ok_or_else(invalid_input_error)?;
+        resolved.push((
+            kind,
+            candidate.executable.clone(),
+            candidate.arguments.clone(),
+        ));
+    }
+
+    let executable_path = PathBuf::from(input.executable_path.trim());
+    let cargo_home_path = normalize_optional_path(input.cargo_home_path.as_deref());
+    let rustup_home_path = normalize_optional_path(input.rustup_home_path.as_deref());
+    for (kind, executable, arguments) in resolved {
+        ValidationCommandService::new(&mut repository, &mut time, &mut discovery, &mut filesystem)
+            .approve_project_root_command(ApproveProjectRootValidationCommandRequest::new(
+                id,
+                expected_version,
+                task.project_id,
+                kind,
+                executable,
+                arguments,
+                executable_path.clone(),
+                cargo_home_path.clone(),
+                rustup_home_path.clone(),
+            ))
+            .map_err(IpcErrorDto::from)?;
+    }
+
+    Ok(ProjectRootValidationApprovalStatusDto {
+        test_approved: true,
+        build_approved: true,
+    })
+}
+
 fn current_task_version(
     ready: &crate::state::AppRuntime,
     task_id: TaskId,
@@ -188,6 +288,15 @@ fn validate_approve_input(input: &ApproveValidationCommandInputDto) -> Result<()
             return Err(invalid_input_error());
         }
     }
+    if input.executable_path.trim().is_empty() {
+        return Err(invalid_input_error());
+    }
+    Ok(())
+}
+
+fn validate_project_root_approve_input(
+    input: &ApproveProjectRootValidationInputDto,
+) -> Result<(), IpcErrorDto> {
     if input.executable_path.trim().is_empty() {
         return Err(invalid_input_error());
     }
@@ -227,4 +336,23 @@ pub fn approve_validation_command(
     input: ApproveValidationCommandInputDto,
 ) -> Result<ApproveValidationCommandResultDto, IpcErrorDto> {
     handle_approve_validation_command(&state, &task_id, expected_version, input)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_project_root_validation_approval_status(
+    state: tauri::State<'_, ManagedRuntime>,
+    task_id: String,
+    expected_version: u64,
+) -> Result<ProjectRootValidationApprovalStatusDto, IpcErrorDto> {
+    handle_get_project_root_validation_approval_status(&state, &task_id, expected_version)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn approve_project_root_validation(
+    state: tauri::State<'_, ManagedRuntime>,
+    task_id: String,
+    expected_version: u64,
+    input: ApproveProjectRootValidationInputDto,
+) -> Result<ProjectRootValidationApprovalStatusDto, IpcErrorDto> {
+    handle_approve_project_root_validation(&state, &task_id, expected_version, input)
 }

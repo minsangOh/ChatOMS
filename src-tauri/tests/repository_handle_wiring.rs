@@ -20,7 +20,7 @@ use chatoms_app_lib::state::RepositoryHandle;
 use chatoms_domain::{
     ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, Task, TaskId, TaskState,
     TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind,
-    WorkKind,
+    ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::bootstrap::{DatabaseBootstrapAdapter, SharedDatabase};
 use chatoms_ports::{
@@ -32,10 +32,11 @@ use chatoms_ports::{
     repository::{
         AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
         DiffApprovalRecord, FoundationRepository, GitIsolationStatus, HighRiskApprovalRecord,
-        ImplementationResultOutcome, PlanningResultOutcome, ProjectFilesystemIdentityRecord,
-        ProjectRecord, ProviderBindingRecord, ProviderConsent, ReviewResultOutcome,
-        TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
-        TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+        ImplementationResultOutcome, PlanningResultOutcome, PostMergeValidationResultAttempt,
+        PostMergeValidationResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord,
+        ProviderBindingRecord, ProviderConsent, ReviewResultOutcome, TaskGitIsolation,
+        TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
+        ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
         ValidationCommandResultOutcome,
     },
 };
@@ -951,6 +952,11 @@ fn validation_command_approval_delegation_reaches_real_sqlite_through_both_wrapp
     );
 
     let approval = ValidationCommandApprovalRecord {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        target_project_id: None,
+        target_project_identity_revision: None,
+        target_root_volume_serial_hex: None,
+        target_root_file_id_hex: None,
         task_id: task.id(),
         approved_task_version: task.version(),
         kind: ValidationCommandKind::Test,
@@ -980,7 +986,15 @@ fn validation_command_approval_delegation_reaches_real_sqlite_through_both_wrapp
     let stored = repository
         .list_validation_command_approvals(task.id(), task.version())
         .expect("list_validation_command_approvals after save must reach the real repository");
-    assert_eq!(stored, vec![approval]);
+    assert_eq!(stored, vec![approval.clone()]);
+    let scoped = repository
+        .list_validation_command_approvals_for_scope(
+            task.id(),
+            task.version(),
+            chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        )
+        .expect("scoped approval lookup must reach the real repository");
+    assert_eq!(scoped, vec![approval]);
 }
 
 #[test]
@@ -1021,6 +1035,11 @@ fn validation_command_result_delegation_reaches_real_sqlite_through_both_wrapper
     );
 
     let approval = ValidationCommandApprovalRecord {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        target_project_id: None,
+        target_project_identity_revision: None,
+        target_root_volume_serial_hex: None,
+        target_root_file_id_hex: None,
         task_id: task.id(),
         approved_task_version: task.version(),
         kind: ValidationCommandKind::Test,
@@ -1045,6 +1064,7 @@ fn validation_command_result_delegation_reaches_real_sqlite_through_both_wrapper
         .expect("seed the approval this result attempt is bound to");
 
     let attempt = ValidationCommandResultAttempt {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
         task_id: task.id(),
         approved_task_version: task.version(),
         kind: ValidationCommandKind::Test,
@@ -1096,6 +1116,11 @@ fn finalize_validation_command_batch_delegation_reaches_real_sqlite_through_both
     let expected_version = task.version();
 
     let approval = ValidationCommandApprovalRecord {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        target_project_id: None,
+        target_project_identity_revision: None,
+        target_root_volume_serial_hex: None,
+        target_root_file_id_hex: None,
         task_id: task.id(),
         approved_task_version: expected_version,
         kind: ValidationCommandKind::Test,
@@ -1120,6 +1145,7 @@ fn finalize_validation_command_batch_delegation_reaches_real_sqlite_through_both
         .expect("seed the approval this final result attempt is bound to");
 
     let attempt = ValidationCommandResultAttempt {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
         task_id: task.id(),
         approved_task_version: expected_version,
         kind: ValidationCommandKind::Test,
@@ -1459,5 +1485,133 @@ fn review_context_package_preparation_delegation_reaches_real_sqlite_through_bot
     assert_eq!(
         second, first,
         "reusing an existing pair must return it unchanged"
+    );
+}
+
+#[test]
+fn post_merge_validation_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("post-merge-validation");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+    advance(&mut repository, &mut task, TaskState::Reviewing, 180);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingUserDiffApproval,
+        190,
+    );
+
+    let approval_task_version = task.version();
+    repository
+        .save_validation_command_approval(&ValidationCommandApprovalRecord {
+            task_id: task.id(),
+            approved_task_version: approval_task_version,
+            execution_scope: ValidationExecutionScope::ProjectRoot,
+            kind: ValidationCommandKind::Test,
+            executable: "cargo".to_owned(),
+            arguments: vec!["test".to_owned(), "--workspace".to_owned()],
+            approved_executable_path: "C:/tools/cargo/bin/cargo.exe".to_owned(),
+            executable_volume_serial_hex: "0000000000000002".to_owned(),
+            executable_file_id_hex: "00000000000000000000000000000002".to_owned(),
+            tool_directory_path: "C:/tools/cargo/bin".to_owned(),
+            tool_directory_volume_serial_hex: "0000000000000001".to_owned(),
+            tool_directory_file_id_hex: "00000000000000000000000000000001".to_owned(),
+            approved_cargo_home_path: None,
+            cargo_home_volume_serial_hex: None,
+            cargo_home_file_id_hex: None,
+            approved_rustup_home_path: None,
+            rustup_home_volume_serial_hex: None,
+            rustup_home_file_id_hex: None,
+            target_project_id: Some(project_id),
+            target_project_identity_revision: Some(1),
+            target_root_volume_serial_hex: Some("0000000000000001".to_owned()),
+            target_root_file_id_hex: Some("00000000000000000000000000000001".to_owned()),
+            approved_at_ms: 195,
+        })
+        .expect("save ProjectRoot approval through both wrapper layers");
+
+    advance(&mut repository, &mut task, TaskState::Merging, 200);
+    advance(&mut repository, &mut task, TaskState::PostMergeTesting, 210);
+    let post_merge_task_version = task.version();
+    let attempt = PostMergeValidationResultAttempt {
+        task_id: task.id(),
+        approval_task_version,
+        post_merge_task_version,
+        execution_scope: ValidationExecutionScope::ProjectRoot,
+        kind: ValidationCommandKind::Test,
+        outcome: PostMergeValidationResultOutcome::Success,
+        exit_code: Some(0),
+        safe_summary: "approved post-merge test passed".to_owned(),
+        started_at_ms: 220,
+        completed_at_ms: 230,
+    };
+    let appended = repository
+        .append_post_merge_validation_result(&attempt)
+        .expect("append_post_merge_validation_result must reach the real repository");
+    assert_eq!(appended.attempt_sequence, 1);
+    assert_eq!(
+        repository
+            .list_post_merge_validation_results(
+                task.id(),
+                approval_task_version,
+                post_merge_task_version,
+                ValidationCommandKind::Test,
+            )
+            .expect("list_post_merge_validation_results must reach the real repository"),
+        vec![appended],
+    );
+
+    let expected_version = task.version();
+    let previous_state = task.state();
+    task.transition_to(TaskState::Completed, 240)
+        .expect("PostMergeTesting -> Completed");
+    let transition = transition_record(&task, previous_state, 240);
+    repository
+        .finalize_post_merge_validation_batch(expected_version, &task, &transition, &attempt)
+        .expect("finalize_post_merge_validation_batch must reach the real repository");
+
+    let reloaded = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task exists");
+    assert_eq!(reloaded.state(), TaskState::Completed);
+    assert_eq!(
+        repository
+            .list_post_merge_validation_results(
+                task.id(),
+                approval_task_version,
+                post_merge_task_version,
+                ValidationCommandKind::Test,
+            )
+            .expect("final post-merge result must be readable through both wrappers")
+            .len(),
+        2,
+    );
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active_lease through both wrapper layers"),
+        None,
+        "Completed must release the active lease"
     );
 }

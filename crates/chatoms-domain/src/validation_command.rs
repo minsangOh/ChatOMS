@@ -1,5 +1,18 @@
 use serde::{Deserialize, Serialize};
 
+/// The closed set of filesystem targets a validation approval may authorize.
+/// Scope is part of approval identity: an approval for one target can never
+/// authorize execution against the other.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum ValidationExecutionScope {
+    TaskWorktree,
+    ProjectRoot,
+}
+
+impl ValidationExecutionScope {
+    pub const ALL: [Self; 2] = [Self::TaskWorktree, Self::ProjectRoot];
+}
+
 /// The fixed vocabulary of Testing validation categories from
 /// `PRODUCT_REQUIREMENTS.md` section 15 (포맷 검사/린트/타입 검사/단위+통합
 /// 테스트/빌드). Provider-neutral and execution-neutral: this type carries no

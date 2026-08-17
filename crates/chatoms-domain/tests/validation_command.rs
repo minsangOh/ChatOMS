@@ -1,4 +1,4 @@
-use chatoms_domain::ValidationCommandKind;
+use chatoms_domain::{ValidationCommandKind, ValidationExecutionScope};
 
 #[test]
 fn all_lists_exactly_the_five_product_requirements_categories() {
@@ -10,6 +10,17 @@ fn all_lists_exactly_the_five_product_requirements_categories() {
             ValidationCommandKind::Typecheck,
             ValidationCommandKind::Test,
             ValidationCommandKind::Build,
+        ]
+    );
+}
+
+#[test]
+fn validation_execution_scope_is_closed_to_worktree_and_project_root() {
+    assert_eq!(
+        ValidationExecutionScope::ALL,
+        [
+            ValidationExecutionScope::TaskWorktree,
+            ValidationExecutionScope::ProjectRoot,
         ]
     );
 }

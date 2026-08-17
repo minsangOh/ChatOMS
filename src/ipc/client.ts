@@ -8,6 +8,7 @@ import { isRawUserDiffForReviewDto, isUserDiffApprovalDto } from "./user_diff_re
 import {
   isApproveValidationCommandResultDto,
   isCancelTestingDto,
+  isProjectRootValidationApprovalStatusDto,
   isValidationCommandApprovalStatusDto,
   isValidationCommandCandidateDtoArray,
 } from "./validation_command";
@@ -22,6 +23,7 @@ import type {
   ActiveTaskStatusDto,
   ApproveValidationCommandInput,
   ApproveValidationCommandResultDto,
+  ApproveProjectRootValidationInput,
   BootstrapStatusDto,
   CancelImplementationDto,
   CancelPlanningDto,
@@ -42,6 +44,7 @@ import type {
   LegacyMigrationDiagnosticDto,
   PlanningResultDto,
   ProjectDto,
+  ProjectRootValidationApprovalStatusDto,
   ProviderEligibilityDto,
   ProjectCandidateDto,
   ProjectStatusDto,
@@ -98,6 +101,8 @@ export const IPC_COMMANDS = {
   getValidationCommandCandidates: "get_validation_command_candidates",
   getValidationCommandApprovalStatus: "get_validation_command_approval_status",
   approveValidationCommand: "approve_validation_command",
+  getProjectRootValidationApprovalStatus: "get_project_root_validation_approval_status",
+  approveProjectRootValidation: "approve_project_root_validation",
   startClaudeReview: "start_claude_review",
   cancelClaudeReview: "cancel_claude_review",
   getReviewResult: "get_review_result",
@@ -110,6 +115,7 @@ export const IPC_COMMANDS = {
   approveHighRiskOperation: "approve_high_risk_operation",
   getUserDiffForReview: "get_user_diff_for_review",
   approveUserDiff: "approve_user_diff",
+  approveUserDiffAndStartMerge: "approve_user_diff_and_start_merge",
 } as const;
 
 export type InvokeTransport = (
@@ -159,6 +165,15 @@ export interface IpcClient {
     expectedVersion: number,
     input: ApproveValidationCommandInput,
   ): Promise<ApproveValidationCommandResultDto>;
+  getProjectRootValidationApprovalStatus(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ProjectRootValidationApprovalStatusDto>;
+  approveProjectRootValidation(
+    taskId: string,
+    expectedVersion: number,
+    input: ApproveProjectRootValidationInput,
+  ): Promise<ProjectRootValidationApprovalStatusDto>;
   startValidationTesting(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelValidationTesting(taskId: string): Promise<CancelTestingDto>;
   startClaudeReview(taskId: string, expectedVersion: number): Promise<TaskDto>;
@@ -197,6 +212,11 @@ export interface IpcClient {
     expectedVersion: number,
     expectedDiffContentHash: string,
   ): Promise<UserDiffApprovalDto>;
+  approveUserDiffAndStartMerge(
+    taskId: string,
+    expectedVersion: number,
+    expectedDiffContentHash: string,
+  ): Promise<TaskDto>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -301,6 +321,18 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
         expectedVersion,
         input,
       }),
+    getProjectRootValidationApprovalStatus: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.getProjectRootValidationApprovalStatus,
+        isProjectRootValidationApprovalStatusDto,
+        { taskId, expectedVersion },
+      ),
+    approveProjectRootValidation: (taskId, expectedVersion, input) =>
+      request(
+        IPC_COMMANDS.approveProjectRootValidation,
+        isProjectRootValidationApprovalStatusDto,
+        { taskId, expectedVersion, input },
+      ),
     startValidationTesting: (taskId, expectedVersion) =>
       request(IPC_COMMANDS.startValidationTesting, isTaskDto, { taskId, expectedVersion }),
     cancelValidationTesting: (taskId) =>
@@ -356,6 +388,12 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
       }),
     approveUserDiff: (taskId, expectedVersion, expectedDiffContentHash) =>
       request(IPC_COMMANDS.approveUserDiff, isUserDiffApprovalDto, {
+        taskId,
+        expectedVersion,
+        expectedDiffContentHash,
+      }),
+    approveUserDiffAndStartMerge: (taskId, expectedVersion, expectedDiffContentHash) =>
+      request(IPC_COMMANDS.approveUserDiffAndStartMerge, isTaskDto, {
         taskId,
         expectedVersion,
         expectedDiffContentHash,

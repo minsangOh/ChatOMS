@@ -36,7 +36,7 @@ fn run_registry(
 
 #[test]
 fn production_registry_and_checksum_policy_are_valid() {
-    assert_eq!(FOUNDATION_MIGRATION.len(), 19);
+    assert_eq!(FOUNDATION_MIGRATION.len(), 20);
     assert_eq!(FOUNDATION_MIGRATION[0].version, 1);
     assert_eq!(FOUNDATION_MIGRATION[0].name, "foundation");
     assert_eq!(FOUNDATION_MIGRATION[1].version, 2);
@@ -87,6 +87,11 @@ fn production_registry_and_checksum_policy_are_valid() {
     assert_eq!(FOUNDATION_MIGRATION[17].name, "task_high_risk_approvals");
     assert_eq!(FOUNDATION_MIGRATION[18].version, 19);
     assert_eq!(FOUNDATION_MIGRATION[18].name, "task_diff_approvals");
+    assert_eq!(FOUNDATION_MIGRATION[19].version, 20);
+    assert_eq!(
+        FOUNDATION_MIGRATION[19].name,
+        "scoped_post_merge_validation"
+    );
     validate_registry(&FOUNDATION_MIGRATION).expect("production registry must be valid");
 
     for migration in FOUNDATION_MIGRATION {
@@ -590,8 +595,8 @@ fn registry_rejects_zero_non_one_start_duplicates_order_and_empty_fields() {
 fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     let database = TestDatabase::empty();
     let first = run_registry(&database, &FOUNDATION_MIGRATION).expect("first migration run");
-    assert_eq!(first.schema_version, 19);
-    assert_eq!(first.applied_count, 19);
+    assert_eq!(first.schema_version, 20);
+    assert_eq!(first.applied_count, 20);
 
     let connection = database.open_raw();
     let metadata: (i64, String, String, i64) = connection
@@ -617,7 +622,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     drop(connection);
 
     let second = run_registry(&database, &FOUNDATION_MIGRATION).expect("second migration run");
-    assert_eq!(second.schema_version, 19);
+    assert_eq!(second.schema_version, 20);
     assert_eq!(second.applied_count, 0);
     let connection = database.open_raw();
     let schema_after: String = connection
@@ -629,7 +634,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
         )
         .expect("read schema snapshot after reopen");
     assert_eq!(schema_after, schema_before);
-    assert_eq!(count_rows(&connection, "schema_migrations"), 19);
+    assert_eq!(count_rows(&connection, "schema_migrations"), 20);
     let metadata_after: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
@@ -1428,8 +1433,8 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let outcome = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("apply provider-neutral state migration");
-            assert_eq!(outcome.schema_version, 19);
-            assert_eq!(outcome.applied_count, 16);
+            assert_eq!(outcome.schema_version, 20);
+            assert_eq!(outcome.applied_count, 17);
 
             let connection = database.open_raw();
             assert_provider_state_fixture_migrated(
@@ -1444,7 +1449,7 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let rerun = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("re-run provider-neutral state migration");
-            assert_eq!(rerun.schema_version, 19);
+            assert_eq!(rerun.schema_version, 20);
             assert_eq!(rerun.applied_count, 0);
         }
     }
@@ -1488,13 +1493,13 @@ fn v5_adds_task_briefs_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(&database.open_raw(), "task_briefs"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1552,13 +1557,13 @@ fn v6_adds_provider_consents_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(&database.open_raw(), "task_provider_consents"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1662,13 +1667,13 @@ fn v7_adds_task_planning_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(&database.open_raw(), "task_planning_results"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2110,8 +2115,8 @@ fn v17_adds_context_package_manifests_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(
         &database.open_raw(),
         "context_package_manifests"
@@ -2119,7 +2124,7 @@ fn v17_adds_context_package_manifests_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2266,13 +2271,13 @@ fn v15_adds_task_review_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(&database.open_raw(), "task_review_results"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2383,8 +2388,8 @@ fn v9_adds_task_implementation_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(
         &database.open_raw(),
         "task_implementation_results"
@@ -2392,7 +2397,7 @@ fn v9_adds_task_implementation_results_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2489,8 +2494,8 @@ fn v10_adds_task_validation_command_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(
         &database.open_raw(),
         "task_validation_command_approvals"
@@ -2498,7 +2503,7 @@ fn v10_adds_task_validation_command_approvals_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2663,8 +2668,8 @@ fn v13_adds_task_validation_command_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(
         &database.open_raw(),
         "task_validation_command_results"
@@ -2672,7 +2677,7 @@ fn v13_adds_task_validation_command_results_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2681,8 +2686,8 @@ fn v18_adds_task_high_risk_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(
         &database.open_raw(),
         "task_high_risk_approvals"
@@ -2690,7 +2695,7 @@ fn v18_adds_task_high_risk_approvals_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2813,14 +2818,123 @@ fn v19_adds_task_diff_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 19);
-    assert_eq!(outcome.applied_count, 19);
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 20);
     assert!(table_exists(&database.open_raw(), "task_diff_approvals"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 19);
+    assert_eq!(rerun.schema_version, 20);
     assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn v20_backfills_existing_validation_evidence_as_task_worktree_without_loss() {
+    let database = TestDatabase::empty();
+    run_registry(&database, &FOUNDATION_MIGRATION[..19]).expect("apply through v19");
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "validation-task", "project");
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'Testing' WHERE id = 'validation-task'",
+            [],
+        )
+        .expect("move fixture to Testing");
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, command_kind, executable,
+                arguments_json, worktree_scope, approved_executable_path,
+                executable_volume_serial_hex, executable_file_id_hex,
+                tool_directory_path, tool_directory_volume_serial_hex,
+                tool_directory_file_id_hex, approved_at_ms
+             ) VALUES (
+                'validation-task', 0, 'Test', 'cargo', '[\"test\",\"--workspace\"]',
+                'TaskWorktree', ?1, ?2, ?3, ?4, ?5, ?6, 100
+             )",
+            params![
+                VALID_EXECUTABLE_PATH,
+                VALID_EXECUTABLE_VOLUME_HEX,
+                VALID_EXECUTABLE_FILE_ID_HEX,
+                VALID_TOOL_DIRECTORY_PATH,
+                VALID_TOOL_DIRECTORY_VOLUME_HEX,
+                VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+            ],
+        )
+        .expect("seed v19 approval");
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_results (
+                task_id, approved_task_version, command_kind, attempt_sequence,
+                outcome, exit_code, safe_summary, started_at_ms, completed_at_ms
+             ) VALUES (
+                'validation-task', 0, 'Test', 1, 'Success', 0,
+                'validation succeeded', 100, 200
+             )",
+            [],
+        )
+        .expect("seed v19 result");
+    drop(connection);
+
+    let outcome = run_registry(&database, &FOUNDATION_MIGRATION).expect("apply v20");
+    assert_eq!(outcome.schema_version, 20);
+    assert_eq!(outcome.applied_count, 1);
+
+    let connection = database.open_raw();
+    let approval: (String, Option<String>, Option<i64>) = connection
+        .query_row(
+            "SELECT execution_scope, target_project_id, target_project_identity_revision
+             FROM task_validation_command_approvals
+             WHERE task_id = 'validation-task' AND command_kind = 'Test'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read migrated approval");
+    assert_eq!(approval, ("TaskWorktree".to_owned(), None, None));
+    let result: (String, String, i64) = connection
+        .query_row(
+            "SELECT execution_scope, safe_summary, attempt_sequence
+             FROM task_validation_command_results
+             WHERE task_id = 'validation-task' AND command_kind = 'Test'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read migrated result");
+    assert_eq!(
+        result,
+        (
+            "TaskWorktree".to_owned(),
+            "validation succeeded".to_owned(),
+            1
+        )
+    );
+    for forbidden in [
+        "stdout",
+        "stderr",
+        "raw_diff",
+        "diff_text",
+        "executable_path",
+        "environment_path",
+        "authentication",
+        "session_id",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('task_post_merge_validation_results')
+                    WHERE name = ?1
+                 )",
+                [forbidden],
+                |row| row.get(0),
+            )
+            .expect("inspect post-merge result columns");
+        assert!(
+            !exists,
+            "forbidden result column must not exist: {forbidden}"
+        );
+    }
+    assert_eq!(foreign_key_violation_count(&connection), 0);
 }
 
 #[test]
@@ -2946,7 +3060,7 @@ fn insert_validation_command_approval_sql(
     command_kind: &str,
     executable: &str,
     arguments_json: &str,
-    worktree_scope: &str,
+    execution_scope: &str,
     approved_executable_path: &str,
     executable_volume_serial_hex: &str,
     executable_file_id_hex: &str,
@@ -2957,8 +3071,8 @@ fn insert_validation_command_approval_sql(
 ) -> rusqlite::Result<usize> {
     connection.execute(
         "INSERT INTO task_validation_command_approvals (
-            task_id, approved_task_version, command_kind, executable,
-            arguments_json, worktree_scope, approved_executable_path,
+            task_id, approved_task_version, execution_scope, command_kind, executable,
+            arguments_json, approved_executable_path,
             executable_volume_serial_hex, executable_file_id_hex,
             tool_directory_path, tool_directory_volume_serial_hex,
             tool_directory_file_id_hex, approved_at_ms
@@ -2966,10 +3080,10 @@ fn insert_validation_command_approval_sql(
         params![
             task_id,
             approved_task_version,
+            execution_scope,
             command_kind,
             executable,
             arguments_json,
-            worktree_scope,
             approved_executable_path,
             executable_volume_serial_hex,
             executable_file_id_hex,
@@ -3214,6 +3328,83 @@ fn task_validation_command_approvals_enforce_shape_binding_duplicates_and_immuta
 }
 
 #[test]
+fn validation_approval_scopes_coexist_and_project_root_binding_is_all_or_nothing() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "validation-task", "project");
+    insert_validation_command_approval_sql(
+        &connection,
+        "validation-task",
+        0,
+        "Test",
+        "cargo",
+        "[\"test\",\"--workspace\"]",
+        "TaskWorktree",
+        VALID_EXECUTABLE_PATH,
+        VALID_EXECUTABLE_VOLUME_HEX,
+        VALID_EXECUTABLE_FILE_ID_HEX,
+        VALID_TOOL_DIRECTORY_PATH,
+        VALID_TOOL_DIRECTORY_VOLUME_HEX,
+        VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        100,
+    )
+    .expect("seed TaskWorktree approval");
+    connection
+        .execute(
+            "INSERT INTO task_validation_command_approvals (
+                task_id, approved_task_version, execution_scope, command_kind,
+                executable, arguments_json, approved_executable_path,
+                executable_volume_serial_hex, executable_file_id_hex,
+                tool_directory_path, tool_directory_volume_serial_hex,
+                tool_directory_file_id_hex, target_project_id,
+                target_project_identity_revision, target_root_volume_serial_hex,
+                target_root_file_id_hex, approved_at_ms
+             ) VALUES (
+                'validation-task', 0, 'ProjectRoot', 'Test', 'cargo',
+                '[\"test\",\"--workspace\"]', ?1, ?2, ?3, ?4, ?5, ?6,
+                'project', 1, '0000000000000001', ?7, 100
+             )",
+            params![
+                VALID_EXECUTABLE_PATH,
+                VALID_EXECUTABLE_VOLUME_HEX,
+                VALID_EXECUTABLE_FILE_ID_HEX,
+                VALID_TOOL_DIRECTORY_PATH,
+                VALID_TOOL_DIRECTORY_VOLUME_HEX,
+                VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+                "0".repeat(32),
+            ],
+        )
+        .expect("same version and kind may coexist in ProjectRoot scope");
+    assert_eq!(
+        count_rows(&connection, "task_validation_command_approvals"),
+        2
+    );
+
+    let partial = connection.execute(
+        "INSERT INTO task_validation_command_approvals (
+            task_id, approved_task_version, execution_scope, command_kind,
+            executable, arguments_json, approved_executable_path,
+            executable_volume_serial_hex, executable_file_id_hex,
+            tool_directory_path, tool_directory_volume_serial_hex,
+            tool_directory_file_id_hex, target_project_id, approved_at_ms
+         ) VALUES (
+            'validation-task', 0, 'ProjectRoot', 'Build', 'cargo', '[\"build\"]',
+            ?1, ?2, ?3, ?4, ?5, ?6, 'project', 100
+         )",
+        params![
+            VALID_EXECUTABLE_PATH,
+            VALID_EXECUTABLE_VOLUME_HEX,
+            VALID_EXECUTABLE_FILE_ID_HEX,
+            VALID_TOOL_DIRECTORY_PATH,
+            VALID_TOOL_DIRECTORY_VOLUME_HEX,
+            VALID_TOOL_DIRECTORY_FILE_ID_HEX,
+        ],
+    );
+    assert!(partial.as_ref().is_err_and(is_constraint_error));
+}
+
+#[test]
 fn migration_0011_validation_command_executable_binding_aborts_when_existing_approvals_present() {
     let database = TestDatabase::empty();
     let mut connection = DatabaseConnection::open(database.path()).expect("open database");
@@ -3425,9 +3616,9 @@ fn insert_validation_command_result_sql(
 ) -> rusqlite::Result<usize> {
     connection.execute(
         "INSERT INTO task_validation_command_results (
-            task_id, approved_task_version, command_kind, attempt_sequence,
+            task_id, approved_task_version, execution_scope, command_kind, attempt_sequence,
             outcome, exit_code, safe_summary, started_at_ms, completed_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, 'TaskWorktree', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             task_id,
             approved_task_version,

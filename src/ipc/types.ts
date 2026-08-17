@@ -325,6 +325,11 @@ export interface ValidationCommandApprovalStatusDto {
   approvedKinds: readonly ValidationCommandKind[];
 }
 
+export interface ProjectRootValidationApprovalStatusDto {
+  testApproved: boolean;
+  buildApproved: boolean;
+}
+
 export interface ApproveValidationCommandInput {
   kinds: readonly ValidationCommandKind[];
   executablePath: string;
@@ -334,6 +339,12 @@ export interface ApproveValidationCommandInput {
 
 export interface ApproveValidationCommandResultDto {
   approvedKinds: readonly ValidationCommandKind[];
+}
+
+export interface ApproveProjectRootValidationInput {
+  executablePath: string;
+  cargoHomePath: string | null;
+  rustupHomePath: string | null;
 }
 
 /// Exhaustive one-to-one mirror of the backend's 13 fixed

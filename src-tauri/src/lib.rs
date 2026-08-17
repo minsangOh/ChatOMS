@@ -46,6 +46,8 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::validation_commands::get_validation_command_candidates,
             commands::validation_commands::get_validation_command_approval_status,
             commands::validation_commands::approve_validation_command,
+            commands::validation_commands::get_project_root_validation_approval_status,
+            commands::validation_commands::approve_project_root_validation,
             commands::review::start_claude_review,
             commands::review::cancel_claude_review,
             commands::review::get_review_result,
@@ -58,6 +60,7 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::high_risk_approval::approve_high_risk_operation,
             commands::user_diff_review::get_user_diff_for_review,
             commands::user_diff_review::approve_user_diff,
+            commands::merge_execution::approve_user_diff_and_start_merge,
         ])
         .run(tauri::generate_context!())
 }

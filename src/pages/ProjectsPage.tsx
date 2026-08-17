@@ -363,7 +363,7 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
 
   useEffect(() => {
     const activeExecutionEntries = Object.entries(isolations).filter(
-      ([, isolation]) => isolation.taskState === "planning" || isolation.taskState === "implementing" || isolation.taskState === "testing" || isolation.taskState === "reviewing",
+      ([, isolation]) => isolation.taskState === "planning" || isolation.taskState === "implementing" || isolation.taskState === "testing" || isolation.taskState === "reviewing" || isolation.taskState === "merging",
     );
     if (activeExecutionEntries.length === 0) return;
     const interval = setInterval(() => {
@@ -676,6 +676,14 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       taskId={dialog.taskId}
       taskVersion={dialog.taskVersion}
       onClose={() => setUserDiffReviewDialog(null)}
+      onMergeStarted={(task) => {
+        setUserDiffReviewDialog(null);
+        setIsolations((current) => {
+          const existing = current[dialog.projectId];
+          if (!existing) return current;
+          return { ...current, [dialog.projectId]: { ...existing, taskState: task.state, taskVersion: task.version } };
+        });
+      }}
     />;
   }
 
@@ -846,8 +854,11 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               {renderReviewResult(reviewResults[isolation.taskId])}
               <button className="button button--secondary" disabled={busy} onClick={() => setUserDiffReviewDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion })}>Review current diff</button>
             </div>}
+            {isolation.taskState === "merging" && <p className="muted">The approved change is being committed and merged. This status updates automatically; merge cancellation is not available.</p>}
+            {isolation.taskState === "postMergeTesting" && <p className="muted">The merge completed. Post-merge validation is pending.</p>}
+            {isolation.taskState === "mergeConflict" && <p className="inline-notice">Git reported a merge conflict. ChatOMS did not resolve it automatically; user action is required.</p>}
             {isolation.taskState === "completed" && <p className="muted">This task is completed. Its active task lease has been released.</p>}
-            {isolation.taskState === "recoveryRequired" && <p className="muted">This task requires manual recovery before continuing. Review the task before proceeding.</p>}
+            {isolation.taskState === "recoveryRequired" && <p className="muted">The task result could not be confirmed. Review the repository safely before proceeding.</p>}
             {isolation.taskState === "failed" && <p className="inline-notice">Claude Planning failed. Review the task before retrying.</p>}
             {isolation.taskState === "cancelled" && <p className="muted">Claude Planning was cancelled.</p>}
             <button className="button button--secondary" disabled={busy} onClick={() => void run(async () => { const next = await client.getTaskIsolation(isolation.taskId); setIsolations((current) => ({ ...current, [project.id]: next })); })}>Refresh isolation</button>

@@ -2,6 +2,7 @@ pub mod context_package;
 pub mod git_isolation;
 pub mod high_risk_approval;
 pub mod implementation;
+pub mod merge_execution;
 pub mod planning;
 pub mod projects;
 pub mod provider;
@@ -13,7 +14,7 @@ pub mod testing;
 pub mod user_diff_review;
 pub mod validation_commands;
 
-pub const REGISTERED_HANDLERS: [&str; 45] = [
+pub const REGISTERED_HANDLERS: [&str; 48] = [
     "get_version",
     "get_health",
     "get_system_status",
@@ -47,6 +48,8 @@ pub const REGISTERED_HANDLERS: [&str; 45] = [
     "get_validation_command_candidates",
     "get_validation_command_approval_status",
     "approve_validation_command",
+    "get_project_root_validation_approval_status",
+    "approve_project_root_validation",
     "start_claude_review",
     "cancel_claude_review",
     "get_review_result",
@@ -59,6 +62,7 @@ pub const REGISTERED_HANDLERS: [&str; 45] = [
     "approve_high_risk_operation",
     "get_user_diff_for_review",
     "approve_user_diff",
+    "approve_user_diff_and_start_merge",
 ];
 
 #[cfg(test)]

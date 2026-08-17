@@ -22,7 +22,8 @@ pub use provider_eligibility::{
 pub use review_result::{ReviewOutcomeDto, ReviewResultDto};
 pub use user_diff_review::{RawUserDiffForReviewDto, UserDiffApprovalDto};
 pub use validation_command::{
-    ApproveValidationCommandInputDto, ApproveValidationCommandResultDto,
+    ApproveProjectRootValidationInputDto, ApproveValidationCommandInputDto,
+    ApproveValidationCommandResultDto, ProjectRootValidationApprovalStatusDto,
     ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKindDto,
 };
 

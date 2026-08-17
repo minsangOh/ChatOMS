@@ -8,7 +8,7 @@ use std::time::Duration;
 use chatoms_domain::{
     ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, RecoveryValidation,
     ResumeValidation, Task, TaskId, TaskState, TaskStateTransition, TaskStateTransitionId,
-    TaskStateTransitionSnapshot, ValidationCommandKind, WorkKind,
+    TaskStateTransitionSnapshot, ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::database::{DatabaseConnection, SqliteFoundationRepository};
 use chatoms_ports::diff::DiffContentHash;
@@ -16,10 +16,11 @@ use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
     ContextPackageManifestRecord, DiffApprovalRecord, FoundationRepository, GitIsolationStatus,
     GitOperationReceiptKind, HighRiskApprovalRecord, ImplementationResultOutcome,
-    PlanningResultOutcome, ProviderConsent, RepositoryError, RepositoryErrorCode,
-    ReviewResultOutcome, TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
-    TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
-    ValidationCommandResultAttempt, ValidationCommandResultOutcome,
+    PlanningResultOutcome, PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
+    ProviderConsent, RepositoryError, RepositoryErrorCode, ReviewResultOutcome, TaskBriefRecord,
+    TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
+    TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+    ValidationCommandResultOutcome,
 };
 use rusqlite::params;
 
@@ -155,6 +156,42 @@ fn advance_to_testing(repository: &mut impl FoundationRepository, task: &mut Tas
 fn advance_to_reviewing(repository: &mut impl FoundationRepository, task: &mut Task) {
     advance_to_testing(repository, task);
     advance(repository, task, TaskState::Reviewing, 180);
+}
+
+fn advance_to_awaiting_user_diff_approval(
+    repository: &mut impl FoundationRepository,
+    task: &mut Task,
+) {
+    advance_to_reviewing(repository, task);
+    advance(repository, task, TaskState::AwaitingUserDiffApproval, 190);
+}
+
+fn project_root_validation_approval(
+    repository: &mut impl FoundationRepository,
+    task: &Task,
+    kind: ValidationCommandKind,
+) -> ValidationCommandApprovalRecord {
+    let identity = repository
+        .get_project_identity(task.project_id())
+        .expect("read project identity")
+        .expect("project identity exists");
+    let mut approval = validation_command_approval(
+        task.id(),
+        task.version(),
+        kind,
+        "cargo",
+        match kind {
+            ValidationCommandKind::Test => &["test", "--workspace"],
+            ValidationCommandKind::Build => &["build", "--workspace"],
+            _ => &[],
+        },
+    );
+    approval.execution_scope = ValidationExecutionScope::ProjectRoot;
+    approval.target_project_id = Some(task.project_id());
+    approval.target_project_identity_revision = Some(identity.revision);
+    approval.target_root_volume_serial_hex = Some(identity.root_volume_serial_hex);
+    approval.target_root_file_id_hex = Some(identity.root_file_id_hex);
+    approval
 }
 
 fn completed_planning_result(task_id: TaskId, plan_text: &str) -> TaskPlanningResultRecord {
@@ -3085,6 +3122,7 @@ fn validation_command_approval(
     ValidationCommandApprovalRecord {
         task_id,
         approved_task_version,
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
         kind,
         executable: executable.to_owned(),
         arguments: arguments
@@ -3103,6 +3141,10 @@ fn validation_command_approval(
         approved_rustup_home_path: None,
         rustup_home_volume_serial_hex: None,
         rustup_home_file_id_hex: None,
+        target_project_id: None,
+        target_project_identity_revision: None,
+        target_root_volume_serial_hex: None,
+        target_root_file_id_hex: None,
         approved_at_ms: 175,
     }
 }
@@ -3130,6 +3172,204 @@ fn save_validation_command_approval_persists_and_lists_back_atomically() {
         .list_validation_command_approvals(task.id(), task.version())
         .expect("read back validation command approvals");
     assert_eq!(stored, vec![approval]);
+}
+
+#[test]
+fn project_root_approvals_are_scope_separated_and_require_awaiting_user_diff_approval() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_awaiting_user_diff_approval(&mut repository, &mut task);
+
+    let test_approval =
+        project_root_validation_approval(&mut repository, &task, ValidationCommandKind::Test);
+    repository
+        .save_validation_command_approval(&test_approval)
+        .expect("save ProjectRoot approval");
+
+    assert!(
+        repository
+            .list_validation_command_approvals(task.id(), task.version())
+            .expect("list TaskWorktree approvals")
+            .is_empty()
+    );
+    let project_root = repository
+        .list_validation_command_approvals_for_scope(
+            task.id(),
+            task.version(),
+            ValidationExecutionScope::ProjectRoot,
+        )
+        .expect("list ProjectRoot approvals");
+    assert_eq!(project_root, vec![test_approval.clone()]);
+
+    let mut mismatched =
+        project_root_validation_approval(&mut repository, &task, ValidationCommandKind::Build);
+    mismatched.target_project_identity_revision = Some(99);
+    assert_code(
+        repository
+            .save_validation_command_approval(&mismatched)
+            .expect_err("mismatched project identity snapshot must be rejected"),
+        RepositoryErrorCode::InvalidAggregate,
+    );
+
+    advance(&mut repository, &mut task, TaskState::Merging, 200);
+    let wrong_state =
+        project_root_validation_approval(&mut repository, &task, ValidationCommandKind::Build);
+    assert_code(
+        repository
+            .save_validation_command_approval(&wrong_state)
+            .expect_err("Merging cannot create a new ProjectRoot approval"),
+        RepositoryErrorCode::InvalidAggregate,
+    );
+}
+
+fn prepare_post_merge_task(
+    repository: &mut impl FoundationRepository,
+    project_id: ProjectId,
+) -> (Task, u64) {
+    let (mut task, _) = create_task(repository, project_id);
+    advance_to_awaiting_user_diff_approval(repository, &mut task);
+    let approval_version = task.version();
+    for kind in [ValidationCommandKind::Test, ValidationCommandKind::Build] {
+        let approval = project_root_validation_approval(repository, &task, kind);
+        repository
+            .save_validation_command_approval(&approval)
+            .expect("save required ProjectRoot approval");
+    }
+    advance(repository, &mut task, TaskState::Merging, 200);
+    advance(repository, &mut task, TaskState::PostMergeTesting, 210);
+    (task, approval_version)
+}
+
+fn post_merge_attempt(
+    task: &Task,
+    approval_task_version: u64,
+    outcome: PostMergeValidationResultOutcome,
+) -> PostMergeValidationResultAttempt {
+    PostMergeValidationResultAttempt {
+        task_id: task.id(),
+        approval_task_version,
+        post_merge_task_version: task.version(),
+        execution_scope: ValidationExecutionScope::ProjectRoot,
+        kind: ValidationCommandKind::Build,
+        outcome,
+        exit_code: match outcome {
+            PostMergeValidationResultOutcome::Success => Some(0),
+            PostMergeValidationResultOutcome::ExitFailure => Some(1),
+            _ => None,
+        },
+        safe_summary: "post-merge validation result".to_owned(),
+        started_at_ms: 220,
+        completed_at_ms: 230,
+    }
+}
+
+#[test]
+fn post_merge_final_success_is_atomic_with_completed_history_and_lease_release() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, approval_version) = prepare_post_merge_task(&mut repository, fixture.project_id);
+    let expected_version = task.version();
+    let mut intermediate = post_merge_attempt(
+        &task,
+        approval_version,
+        PostMergeValidationResultOutcome::Success,
+    );
+    intermediate.kind = ValidationCommandKind::Test;
+    repository
+        .append_post_merge_validation_result(&intermediate)
+        .expect("append intermediate success without a state transition");
+    assert_eq!(
+        repository
+            .get_task(task.id())
+            .expect("read task")
+            .expect("task")
+            .state(),
+        TaskState::PostMergeTesting
+    );
+    let source_task = task.clone();
+    let from_state = task.state();
+    task.transition_to(TaskState::Completed, 240)
+        .expect("PostMergeTesting -> Completed");
+    let record = transition(TaskStateTransitionId::new(), &task, from_state, 240);
+    let attempt = post_merge_attempt(
+        &source_task,
+        approval_version,
+        PostMergeValidationResultOutcome::Success,
+    );
+
+    repository
+        .finalize_post_merge_validation_batch(expected_version, &task, &record, &attempt)
+        .expect("atomic post-merge success finalize");
+
+    assert_eq!(
+        repository
+            .get_task(task.id())
+            .expect("read task")
+            .expect("task")
+            .state(),
+        TaskState::Completed
+    );
+    assert!(repository.active_lease().expect("read lease").is_none());
+    assert_eq!(
+        repository
+            .list_post_merge_validation_results(
+                task.id(),
+                approval_version,
+                expected_version,
+                ValidationCommandKind::Build,
+            )
+            .expect("list result")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn post_merge_non_success_results_atomically_require_recovery_and_keep_the_lease() {
+    for outcome in [
+        PostMergeValidationResultOutcome::ExitFailure,
+        PostMergeValidationResultOutcome::TimedOut,
+        PostMergeValidationResultOutcome::StdoutBoundExceeded,
+        PostMergeValidationResultOutcome::BindingRejected,
+        PostMergeValidationResultOutcome::Cancelled,
+        PostMergeValidationResultOutcome::Uncertain,
+    ] {
+        let fixture = Fixture::new();
+        let mut connection = fixture.open();
+        let mut repository = SqliteFoundationRepository::new(&mut connection);
+        let (mut task, approval_version) =
+            prepare_post_merge_task(&mut repository, fixture.project_id);
+        let source_task = task.clone();
+        let expected_version = task.version();
+        let from_state = task.state();
+        task.transition_to(TaskState::RecoveryRequired, 240)
+            .expect("PostMergeTesting -> RecoveryRequired");
+        let record = transition(TaskStateTransitionId::new(), &task, from_state, 240);
+        let attempt = post_merge_attempt(&source_task, approval_version, outcome);
+
+        repository
+            .finalize_post_merge_validation_batch(expected_version, &task, &record, &attempt)
+            .expect("atomic fail-closed finalize");
+
+        assert_eq!(
+            repository
+                .get_task(task.id())
+                .expect("read task")
+                .expect("task")
+                .state(),
+            TaskState::RecoveryRequired
+        );
+        assert_eq!(
+            repository
+                .active_lease()
+                .expect("read lease")
+                .map(|lease| lease.task_id),
+            Some(task.id())
+        );
+    }
 }
 
 #[test]
@@ -3485,6 +3725,7 @@ fn validation_command_result_attempt(
     ValidationCommandResultAttempt {
         task_id,
         approved_task_version,
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
         kind,
         outcome,
         exit_code,

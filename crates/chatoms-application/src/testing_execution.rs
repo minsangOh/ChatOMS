@@ -44,13 +44,15 @@ use chatoms_domain::{TaskId, TaskState, ValidationCommandKind};
 use chatoms_ports::{
     TimeProvider,
     error::{FailureCategory, PortFailure},
+    filesystem::{DirectoryIdentity, FilesystemIdentityPort},
     process::CancellationSignal,
     repository::{
         FoundationRepository, GitIsolationStatus, ValidationCommandApprovalRecord,
         ValidationCommandResultAttempt, ValidationCommandResultOutcome,
     },
     validation_execution::{
-        ValidationCommandExecutor, ValidationExecutionOutcome, ValidationExecutionStartOutcome,
+        ValidationCommandExecutor, ValidationExecutionOutcome, ValidationExecutionRequest,
+        ValidationExecutionStartOutcome, ValidationExecutionTarget,
     },
 };
 
@@ -84,21 +86,26 @@ impl BeginTestingBatchRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestingBatchInputs {
     pub task: TaskView,
-    pub worktree_path: String,
+    pub worktree_identity: DirectoryIdentity,
     pub approvals: Vec<ValidationCommandApprovalRecord>,
 }
 
-pub struct TestingBatchStarter<'a, R> {
+pub struct TestingBatchStarter<'a, R, F> {
     repository: &'a mut R,
+    filesystem: &'a mut F,
 }
 
-impl<'a, R> TestingBatchStarter<'a, R>
+impl<'a, R, F> TestingBatchStarter<'a, R, F>
 where
     R: FoundationRepository,
+    F: FilesystemIdentityPort,
 {
     #[must_use]
-    pub const fn new(repository: &'a mut R) -> Self {
-        Self { repository }
+    pub const fn new(repository: &'a mut R, filesystem: &'a mut F) -> Self {
+        Self {
+            repository,
+            filesystem,
+        }
     }
 
     /// Read-only: verifies the task is `Testing` at `expected_version`,
@@ -133,6 +140,10 @@ where
             .worktree_path
             .filter(|_| isolation.status == GitIsolationStatus::WorktreeReady)
             .ok_or_else(|| category_error(FailureCategory::InvariantViolation))?;
+        let worktree_identity = self
+            .filesystem
+            .inspect_supported_directory(Path::new(&worktree_path))
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
 
         let mut approvals = self
             .repository
@@ -150,7 +161,7 @@ where
 
         Ok(TestingBatchInputs {
             task: TaskView::from(&task),
-            worktree_path,
+            worktree_identity,
             approvals,
         })
     }
@@ -192,7 +203,7 @@ where
         &mut self,
         task_id: TaskId,
         expected_version: u64,
-        worktree_path: &str,
+        worktree_identity: &DirectoryIdentity,
         approvals: &[ValidationCommandApprovalRecord],
         executor: &mut X,
         cancellation: &dyn CancellationSignal,
@@ -204,10 +215,18 @@ where
             return Err(category_error(FailureCategory::NotFound));
         }
         let last_index = approvals.len() - 1;
+        let target = ValidationExecutionTarget::TaskWorktree {
+            directory_identity: worktree_identity.clone(),
+        };
         for (index, approval) in approvals.iter().enumerate() {
             let started_at_ms = self.now_ms()?;
-            let outcome =
-                executor.start_validation_command(Path::new(worktree_path), approval, cancellation);
+            let outcome = executor.start_validation_command(
+                ValidationExecutionRequest {
+                    target: &target,
+                    approval,
+                },
+                cancellation,
+            );
             if let Some(view) = self.process_attempt(
                 task_id,
                 expected_version,
@@ -242,7 +261,7 @@ where
         &mut self,
         task_id: TaskId,
         expected_version: u64,
-        worktree_path: &str,
+        worktree_identity: &DirectoryIdentity,
         approvals: &[ValidationCommandApprovalRecord],
         executor: &mut X,
         cancellation: &dyn CancellationSignal,
@@ -254,10 +273,19 @@ where
             return Err(category_error(FailureCategory::NotFound));
         }
         let last_index = approvals.len() - 1;
+        let target = ValidationExecutionTarget::TaskWorktree {
+            directory_identity: worktree_identity.clone(),
+        };
         for (index, approval) in approvals.iter().enumerate() {
             let started_at_ms = self.now_ms()?;
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                executor.start_validation_command(Path::new(worktree_path), approval, cancellation)
+                executor.start_validation_command(
+                    ValidationExecutionRequest {
+                        target: &target,
+                        approval,
+                    },
+                    cancellation,
+                )
             }));
             let attempt = match panic_result {
                 Ok(outcome) => CommandAttemptOutcome::Executed(outcome),
@@ -313,6 +341,7 @@ where
                 .append_validation_command_result(&ValidationCommandResultAttempt {
                     task_id,
                     approved_task_version: expected_version,
+                    execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
                     kind,
                     outcome: result_outcome,
                     exit_code,

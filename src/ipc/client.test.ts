@@ -30,7 +30,7 @@ describe("typed IPC client", () => {
       ["get_task", { taskId: "task-id" }],
       ["list_task_history", { taskId: "task-id" }],
     ]);
-    expect(Object.values(IPC_COMMANDS)).toHaveLength(45);
+    expect(Object.values(IPC_COMMANDS)).toHaveLength(48);
   });
 
   it("returns a validated result and rejects malformed success data safely", async () => {
@@ -149,6 +149,12 @@ describe("typed IPC client", () => {
       cargoHomePath: null,
       rustupHomePath: null,
     });
+    await client.getProjectRootValidationApprovalStatus("task-id", 6);
+    await client.approveProjectRootValidation("task-id", 6, {
+      executablePath: "C:\\tools\\cargo\\bin\\cargo.exe",
+      cargoHomePath: null,
+      rustupHomePath: null,
+    });
     expect(transport.mock.calls).toEqual([
       ["start_validation_testing", { taskId: "task-id", expectedVersion: 6 }],
       ["cancel_validation_testing", { taskId: "task-id" }],
@@ -161,6 +167,19 @@ describe("typed IPC client", () => {
           expectedVersion: 6,
           input: {
             kinds: ["test"],
+            executablePath: "C:\\tools\\cargo\\bin\\cargo.exe",
+            cargoHomePath: null,
+            rustupHomePath: null,
+          },
+        },
+      ],
+      ["get_project_root_validation_approval_status", { taskId: "task-id", expectedVersion: 6 }],
+      [
+        "approve_project_root_validation",
+        {
+          taskId: "task-id",
+          expectedVersion: 6,
+          input: {
             executablePath: "C:\\tools\\cargo\\bin\\cargo.exe",
             cargoHomePath: null,
             rustupHomePath: null,
@@ -258,6 +277,20 @@ describe("typed IPC client", () => {
     await expect(
       extraFieldApprove.approveValidationCommand("task-id", 6, {
         kinds: ["test"],
+        executablePath: "x",
+        cargoHomePath: null,
+        rustupHomePath: null,
+      }),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const malformedProjectRootStatus = createIpcClient(async () => ({ testApproved: true, buildApproved: "yes" }));
+    await expect(
+      malformedProjectRootStatus.getProjectRootValidationApprovalStatus("task-id", 6),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const leakedProjectRootStatus = createIpcClient(async () => ({ testApproved: true, buildApproved: true, executablePath: "leaked" }));
+    await expect(
+      leakedProjectRootStatus.approveProjectRootValidation("task-id", 6, {
         executablePath: "x",
         cargoHomePath: null,
         rustupHomePath: null,
@@ -409,15 +442,20 @@ describe("typed IPC client", () => {
     ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
   });
 
-  it("uses versioned task-scoped payloads for user diff review and approve", async () => {
+  it("uses versioned task-scoped payloads for user diff review approval and merge start", async () => {
     const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
     const client = createIpcClient(transport);
     await client.getUserDiffForReview("task-id", 3);
     await client.approveUserDiff("task-id", 3, "a".repeat(64));
+    await client.approveUserDiffAndStartMerge("task-id", 3, "a".repeat(64));
     expect(transport.mock.calls).toEqual([
       ["get_user_diff_for_review", { taskId: "task-id", expectedVersion: 3 }],
       [
         "approve_user_diff",
+        { taskId: "task-id", expectedVersion: 3, expectedDiffContentHash: "a".repeat(64) },
+      ],
+      [
+        "approve_user_diff_and_start_merge",
         { taskId: "task-id", expectedVersion: 3, expectedDiffContentHash: "a".repeat(64) },
       ],
     ]);
@@ -433,6 +471,11 @@ describe("typed IPC client", () => {
     await expect(
       validApproval.approveUserDiff("task-id", 3, "a".repeat(64)),
     ).resolves.toEqual({ approvedAtMs: 100 });
+
+    const validMerge = createIpcClient(async () => responses.approve_user_diff_and_start_merge);
+    await expect(
+      validMerge.approveUserDiffAndStartMerge("task-id", 3, "a".repeat(64)),
+    ).resolves.toEqual(responses.approve_user_diff_and_start_merge);
 
     const malformedHash = createIpcClient(async () => ({
       diffText: "x",
@@ -578,6 +621,8 @@ const responses: Record<string, unknown> = {
   get_validation_command_candidates: [{ kind: "test", label: "Test (cargo test)" }],
   get_validation_command_approval_status: { approvedKinds: ["test"] },
   approve_validation_command: { approvedKinds: ["test"] },
+  get_project_root_validation_approval_status: { testApproved: true, buildApproved: true },
+  approve_project_root_validation: { testApproved: true, buildApproved: true },
   start_claude_review: {
     id: "task-id",
     projectId: "project-id",
@@ -606,4 +651,16 @@ const responses: Record<string, unknown> = {
     diffContentHash: "a".repeat(64),
   },
   approve_user_diff: { approvedAtMs: 100 },
+  approve_user_diff_and_start_merge: {
+    id: "task-id",
+    projectId: "project-id",
+    state: "merging",
+    version: 4,
+    branchIdentity: "ai-task/task-id",
+    resumeTargetState: null,
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    terminalAtMs: null,
+    brief: null,
+  },
 };

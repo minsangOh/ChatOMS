@@ -11,7 +11,9 @@ use chatoms_application::{
     bootstrap::{ActiveTaskStatus, BootstrapStatus, DatabaseStatus, LoggingStatus, StorageStatus},
     error::ApplicationError,
 };
-use chatoms_domain::{HighRiskCategory, Task, TaskId, TaskStateTransition};
+use chatoms_domain::{
+    HighRiskCategory, Task, TaskId, TaskStateTransition, ValidationExecutionScope,
+};
 use chatoms_ports::{
     PlatformCapabilities, PlatformCapabilityPort, PlatformCapabilityStatus, TimeProvider,
     error::{FailureCategory, PortFailure},
@@ -28,8 +30,9 @@ use chatoms_ports::{
 };
 
 use super::{
-    REGISTERED_HANDLERS, context_package, high_risk_approval, implementation, planning, projects,
-    provider_eligibility, review, system, tasks, testing, user_diff_review, validation_commands,
+    REGISTERED_HANDLERS, context_package, high_risk_approval, implementation, merge_execution,
+    planning, projects, provider_eligibility, review, system, tasks, testing, user_diff_review,
+    validation_commands,
 };
 use crate::{
     dto::HealthStateDto,
@@ -148,6 +151,7 @@ impl FoundationRepository for RepositoryFake {
         let duplicate = self.approvals.iter().any(|existing| {
             existing.task_id == approval.task_id
                 && existing.approved_task_version == approval.approved_task_version
+                && existing.execution_scope == approval.execution_scope
                 && existing.kind == approval.kind
         });
         if duplicate {
@@ -167,6 +171,23 @@ impl FoundationRepository for RepositoryFake {
             .filter(|approval| {
                 approval.task_id == task_id
                     && approval.approved_task_version == approved_task_version
+            })
+            .cloned()
+            .collect())
+    }
+    fn list_validation_command_approvals_for_scope(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        execution_scope: ValidationExecutionScope,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        Ok(self
+            .approvals
+            .iter()
+            .filter(|approval| {
+                approval.task_id == task_id
+                    && approval.approved_task_version == approved_task_version
+                    && approval.execution_scope == execution_scope
             })
             .cloned()
             .collect())
@@ -974,7 +995,7 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 
 #[test]
 fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 45);
+    assert_eq!(REGISTERED_HANDLERS.len(), 48);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -1011,6 +1032,8 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "get_validation_command_candidates",
             "get_validation_command_approval_status",
             "approve_validation_command",
+            "get_project_root_validation_approval_status",
+            "approve_project_root_validation",
             "start_claude_review",
             "cancel_claude_review",
             "get_review_result",
@@ -1023,6 +1046,7 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "approve_high_risk_operation",
             "get_user_diff_for_review",
             "approve_user_diff",
+            "approve_user_diff_and_start_merge",
         ]
     );
     for forbidden in [
@@ -1687,6 +1711,23 @@ fn get_validation_command_approval_status_reports_only_approved_kinds() {
     )
     .expect("approval status loads even with nothing approved yet");
     assert!(status.approved_kinds.is_empty());
+}
+
+#[test]
+fn project_root_validation_status_is_content_free_and_requires_the_awaiting_diff_version() {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingUserDiffApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let status = validation_commands::handle_get_project_root_validation_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("content-free ProjectRoot approval status loads");
+
+    assert!(!status.test_approved);
+    assert!(!status.build_approved);
 }
 
 #[test]
@@ -2732,6 +2773,56 @@ fn approve_user_diff_rejects_an_unparseable_task_id_before_touching_git_or_repos
         user_diff_review::handle_approve_user_diff(&runtime, "not-a-task-id", 1, &"a".repeat(64))
             .expect_err("malformed task id must be rejected");
     assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn approve_user_diff_and_start_merge_rejects_an_unparseable_task_id_before_approval_or_merge() {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error = merge_execution::handle_approve_user_diff_and_start_merge(
+        &runtime,
+        "not-a-task-id",
+        1,
+        &"a".repeat(64),
+    )
+    .expect_err("malformed task id must be rejected");
+    assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn approve_user_diff_and_start_merge_rejects_a_malformed_hash_before_approval_or_merge() {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error = merge_execution::handle_approve_user_diff_and_start_merge(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+        "not-hex",
+    )
+    .expect_err("malformed hash must be rejected");
+    assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn approve_user_diff_and_start_merge_rejects_missing_project_root_approvals_before_diff_approval_or_merge()
+ {
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingUserDiffApproval);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let error = merge_execution::handle_approve_user_diff_and_start_merge(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        &"a".repeat(64),
+    )
+    .expect_err("missing ProjectRoot Test and Build approvals reject the combined action");
+
+    assert_eq!(error.code, "APP_NOT_FOUND");
+    assert_eq!(
+        tasks::handle_get_task(&runtime, &task.id().to_string())
+            .expect("task remains readable")
+            .state,
+        crate::dto::TaskStateDto::AwaitingUserDiffApproval,
+    );
 }
 
 #[test]

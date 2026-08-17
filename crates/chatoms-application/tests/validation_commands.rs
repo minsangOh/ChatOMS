@@ -5,14 +5,17 @@ use std::path::{Path, PathBuf};
 use chatoms_application::{
     error::ApplicationErrorCode,
     validation_commands::{
-        ApproveValidationCommandRequest, ValidationCommandBindingStatus, ValidationCommandService,
+        ApproveProjectRootValidationCommandRequest, ApproveValidationCommandRequest,
+        ValidationCommandBindingStatus, ValidationCommandService,
     },
 };
 use chatoms_domain::{GitOperationId, ProjectId, TaskId, TaskState, ValidationCommandKind};
 use chatoms_ports::{
     error::{FailureCategory, PortFailure},
     filesystem::{DirectoryIdentity, DirectoryIdentityGuard, FilesystemIdentityPort},
-    repository::{GitIsolationStatus, TaskGitIsolation},
+    repository::{
+        GitIsolationStatus, ProjectFilesystemIdentityRecord, ProjectRecord, TaskGitIsolation,
+    },
     validation::{ValidationCommandCandidate, ValidationCommandDiscovery},
 };
 
@@ -177,6 +180,48 @@ fn setup_task(state: TaskState, version: u64) -> (FakeRepository, TaskId) {
     (repository, task_id)
 }
 
+fn setup_project_root_task(
+    state: TaskState,
+    version: u64,
+    confirmed: bool,
+) -> (FakeRepository, TaskId) {
+    let (task, history) = restored_task(state, version, 20, None);
+    let task_id = task.id();
+    let project_id = task.project_id();
+    let mut repository = FakeRepository::default();
+    let mut isolation = worktree_ready_isolation(task_id, version);
+    isolation.project_id = project_id;
+    repository.isolations.insert(task_id, isolation);
+    repository.project_records.insert(
+        project_id,
+        ProjectRecord {
+            id: project_id,
+            name: "project".to_owned(),
+            root_path: "C:/projects/root".to_owned(),
+            canonical_path_key: "c:/projects/root".to_owned(),
+            display_path: "C:/projects/root".to_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+    );
+    repository.project_identities.insert(
+        project_id,
+        ProjectFilesystemIdentityRecord {
+            project_id,
+            root_volume_serial_hex: "0000000000000001".to_owned(),
+            root_file_id_hex: "00000000000000000000000000000001".to_owned(),
+            repository_kind: chatoms_ports::git::RepositoryKind::Git,
+            git_common_volume_serial_hex: None,
+            git_common_file_id_hex: None,
+            confirmed,
+            revision: 7,
+            verified_at_ms: 1,
+        },
+    );
+    repository.seed_task(task, history);
+    (repository, task_id)
+}
+
 fn approve_test_candidate_request(
     task_id: TaskId,
     version: u64,
@@ -192,6 +237,126 @@ fn approve_test_candidate_request(
         None,
         None,
     )
+}
+
+fn approve_project_root_test_request(
+    task_id: TaskId,
+    project_id: ProjectId,
+    version: u64,
+) -> ApproveProjectRootValidationCommandRequest {
+    ApproveProjectRootValidationCommandRequest::new(
+        task_id,
+        version,
+        project_id,
+        ValidationCommandKind::Test,
+        "cargo".to_owned(),
+        vec!["test".to_owned(), "--workspace".to_owned()],
+        outside_worktree_executable_path(),
+        None,
+        None,
+    )
+}
+
+#[test]
+fn project_root_approval_is_separate_and_only_allowed_while_awaiting_user_diff_approval() {
+    let (mut repository, task_id) =
+        setup_project_root_task(TaskState::AwaitingUserDiffApproval, 3, true);
+    let project_id = repository.tasks[&task_id].project_id();
+    let mut time = FakeTime::at(30);
+    let mut discovery = FakeDiscovery::with_candidates(vec![test_candidate()]);
+    let mut filesystem = FakeFilesystemIdentity::default();
+
+    let approval =
+        ValidationCommandService::new(&mut repository, &mut time, &mut discovery, &mut filesystem)
+            .approve_project_root_command(approve_project_root_test_request(task_id, project_id, 3))
+            .expect("ProjectRoot approval succeeds at the exact pre-merge state");
+
+    assert_eq!(
+        approval.execution_scope,
+        chatoms_domain::ValidationExecutionScope::ProjectRoot
+    );
+    assert_eq!(approval.target_project_id, Some(project_id));
+    assert!(repository.validation_command_approvals.is_empty());
+    assert_eq!(repository.project_root_validation_approvals.len(), 1);
+
+    let (mut wrong_state_repository, wrong_task_id) =
+        setup_project_root_task(TaskState::Testing, 3, true);
+    let wrong_project_id = wrong_state_repository.tasks[&wrong_task_id].project_id();
+    let error = ValidationCommandService::new(
+        &mut wrong_state_repository,
+        &mut time,
+        &mut discovery,
+        &mut filesystem,
+    )
+    .approve_project_root_command(approve_project_root_test_request(
+        wrong_task_id,
+        wrong_project_id,
+        3,
+    ))
+    .expect_err("Testing cannot create a ProjectRoot approval");
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+}
+
+#[test]
+fn project_root_approval_rejects_stale_unconfirmed_or_mismatched_identity() {
+    let (mut stale_repository, stale_task_id) =
+        setup_project_root_task(TaskState::AwaitingUserDiffApproval, 3, true);
+    let stale_project_id = stale_repository.tasks[&stale_task_id].project_id();
+    let mut time = FakeTime::at(30);
+    let mut discovery = FakeDiscovery::with_candidates(vec![test_candidate()]);
+    let mut filesystem = FakeFilesystemIdentity::default();
+    let stale = ValidationCommandService::new(
+        &mut stale_repository,
+        &mut time,
+        &mut discovery,
+        &mut filesystem,
+    )
+    .approve_project_root_command(approve_project_root_test_request(
+        stale_task_id,
+        stale_project_id,
+        2,
+    ))
+    .expect_err("stale task version is rejected");
+    assert_eq!(stale.code(), ApplicationErrorCode::VersionConflict);
+
+    let (mut unconfirmed_repository, unconfirmed_task_id) =
+        setup_project_root_task(TaskState::AwaitingUserDiffApproval, 3, false);
+    let unconfirmed_project_id = unconfirmed_repository.tasks[&unconfirmed_task_id].project_id();
+    let unconfirmed = ValidationCommandService::new(
+        &mut unconfirmed_repository,
+        &mut time,
+        &mut discovery,
+        &mut filesystem,
+    )
+    .approve_project_root_command(approve_project_root_test_request(
+        unconfirmed_task_id,
+        unconfirmed_project_id,
+        3,
+    ))
+    .expect_err("unconfirmed project identity is rejected");
+    assert_eq!(unconfirmed.code(), ApplicationErrorCode::Internal);
+
+    let (mut mismatch_repository, mismatch_task_id) =
+        setup_project_root_task(TaskState::AwaitingUserDiffApproval, 3, true);
+    let mismatch_project_id = mismatch_repository.tasks[&mismatch_task_id].project_id();
+    mismatch_repository
+        .project_identities
+        .get_mut(&mismatch_project_id)
+        .expect("identity")
+        .root_file_id_hex = "ffffffffffffffffffffffffffffffff".to_owned();
+    let mismatch = ValidationCommandService::new(
+        &mut mismatch_repository,
+        &mut time,
+        &mut discovery,
+        &mut filesystem,
+    )
+    .approve_project_root_command(approve_project_root_test_request(
+        mismatch_task_id,
+        mismatch_project_id,
+        3,
+    ))
+    .expect_err("live root identity mismatch is rejected");
+    assert_eq!(mismatch.code(), ApplicationErrorCode::Internal);
 }
 
 /// Outside the `C:/managed/task` worktree, distinct from

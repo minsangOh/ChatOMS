@@ -8,7 +8,7 @@ use chatoms_application::system::CapabilityStatus as AppCapabilityStatus;
 use chatoms_application::{bootstrap::BootstrapStatus, error::ApplicationError};
 use chatoms_domain::{
     ContextDataScope, HighRiskCategory, ProjectId, Task, TaskId, TaskStateTransition,
-    ValidationCommandKind, WorkKind,
+    ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::bootstrap::{
     LegacyMigrationDiagnostic, SharedDatabase, SharedFoundationRepository, SharedLoggingGuard,
@@ -48,6 +48,7 @@ use chatoms_ports::{
         ActiveLease, AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
         DiffApprovalRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
         GitOperationReceipt, GitOperationReceiptKind, HighRiskApprovalRecord,
+        PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
         ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
         ProviderConsent, RepositoryError, TaskBriefRecord, TaskGitIsolation,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
@@ -478,6 +479,21 @@ impl FoundationRepository for RepositoryHandle {
         })
     }
 
+    fn list_validation_command_approvals_for_scope(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        execution_scope: ValidationExecutionScope,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.list_validation_command_approvals_for_scope(
+                task_id,
+                approved_task_version,
+                execution_scope,
+            )
+        })
+    }
+
     fn append_validation_command_result(
         &mut self,
         attempt: &ValidationCommandResultAttempt,
@@ -505,6 +521,42 @@ impl FoundationRepository for RepositoryHandle {
     ) -> Result<(), RepositoryError> {
         self.with_inner(|inner| {
             inner.finalize_validation_command_batch(expected_version, task, transition, attempt)
+        })
+    }
+
+    fn append_post_merge_validation_result(
+        &mut self,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<PostMergeValidationResultRecord, RepositoryError> {
+        self.with_inner(|inner| inner.append_post_merge_validation_result(attempt))
+    }
+
+    fn list_post_merge_validation_results(
+        &mut self,
+        task_id: TaskId,
+        approval_task_version: u64,
+        post_merge_task_version: u64,
+        kind: ValidationCommandKind,
+    ) -> Result<Vec<PostMergeValidationResultRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.list_post_merge_validation_results(
+                task_id,
+                approval_task_version,
+                post_merge_task_version,
+                kind,
+            )
+        })
+    }
+
+    fn finalize_post_merge_validation_batch(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.finalize_post_merge_validation_batch(expected_version, task, transition, attempt)
         })
     }
 
