@@ -39,9 +39,9 @@ ChatOMS는 공식 Claude Code CLI와 공식 Codex CLI를 로컬에서 조율하�
 
 ## 현재 개발 상태
 
-Phase 1~4가 완료되었다. Phase 2는 로컬 프로젝트 등록과 작업별 branch/worktree 격리를, Phase 3은 Claude 실행파일 trust와 capability preflight를, Phase 4는 Claude Planning·Implementation·Review와 승인된 Cargo-only validation의 사용자 시작·취소·복구 경로를 구현했다. Phase 4의 정상 종료 지점은 `AwaitingUserDiffApproval`이며, 이 상태에서는 마스킹된 review 결과만 읽기 전용으로 표시한다.
+Phase 1~4가 완료되었고 Phase 5d-1~4c 구현이 현재 checkpoint다. Phase 2는 로컬 프로젝트 등록과 작업별 branch/worktree 격리를, Phase 3은 Claude 실행파일 trust와 capability preflight를, Phase 4는 Claude Planning·Implementation·Review와 승인된 Cargo-only validation의 사용자 시작·취소·복구 경로를 구현했다. Phase 5d-1~3은 bounded Git commit/`--no-ff` merge, conflict·uncertainty fail-closed 처리, `Merging` orchestration과 Tauri/IPC/UI 배선을 추가했다. Phase 5d-4b~4c는 `TaskWorktree`와 `ProjectRoot` validation approval을 분리하고 merge 전에 ProjectRoot Cargo `Test`·`Build` 승인을 별도로 요구한다. 실제 ProjectRoot Cargo 실행은 후속 Unit이다.
 
-Git worktree는 `%LOCALAPPDATA%\ChatOMS\worktrees\<project-id>\<task-id>`에만 생성한다. Claude 실행은 사용자 동의와 capability gate를 통과한 뒤에만 시작한다. Codex는 executable trust와 실행 계약이 미승인이라 모든 작업 종류에서 `Unsupported`/`NotApproved`로 차단된다. 원격 Git 쓰기, 기본 브랜치 병합, `AutoFixing`/`ReviewFixing`, Context Package, 고위험 승인, 모델 추천·override·프로젝트별 모델 고정과 보존 정책 기반 정리는 Phase 5 이후 범위다. Windows build gate는 installer를 생성하지 않는 `node_modules\.bin\tauri.cmd build --debug --no-bundle -- --offline --locked -j 1`이다.
+Git worktree는 `%LOCALAPPDATA%\ChatOMS\worktrees\<project-id>\<task-id>`에만 생성한다. Claude 실행과 Git write는 사용자 승인·capability·identity gate를 통과한 뒤에만 시작한다. Codex는 executable trust와 실행 계약이 미승인이라 모든 작업 종류에서 `Unsupported`/`NotApproved`로 차단된다. ProjectRoot validation status는 Test/Build readiness만 반환하며 raw diff·stdout/stderr·실행 경로를 일반 결과 표면에 노출하지 않는다. 실제 ProjectRoot Cargo 실행, post-merge validation background orchestration, AutoFixing/ReviewFixing, 원격 Git 쓰기는 후속 범위다. Windows build gate는 installer를 생성하지 않는 `node_modules\.bin\tauri.cmd build --debug --no-bundle -- --offline --locked -j 1`이다.
 
 ## 문서
 

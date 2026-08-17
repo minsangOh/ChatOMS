@@ -128,6 +128,13 @@ Phase 1 기반
 
 **완료 조건:** 승인 없는 고위험 동작과 병합이 차단되고, 기준 브랜치 변경·미커밋 상태·위험 충돌에서 실패 폐쇄하며 병합 결과와 검증이 기록된다.
 
+**현재 구현 상태 (Phase 5d-1~4c):**
+
+- `GitCliAdapter`가 승인 hash·worktree/project identity·repository state를 재검증한 뒤 승인 candidate만 단일 task commit으로 만들고 원본 branch에 `--no-ff` merge한다. command timeout·spawn uncertainty는 success로 축소하지 않으며, 확인된 conflict는 typed outcome으로 반환한다.
+- `MergeExecutionStarter`/`Recorder`가 `AwaitingUserDiffApproval → Merging → PostMergeTesting | MergeConflict | RecoveryRequired` 결과를 기록한다. Tauri command는 `Merging` 전이를 확정한 뒤 detached execution을 시작하고 UI는 polling/read-only 상태만 표시한다.
+- `ValidationExecutionScope::{TaskWorktree, ProjectRoot}`와 forward migration, ProjectRoot post-merge result contract를 구현했다. ProjectRoot Cargo `Test`와 `Build` approval은 merge 전 현재 task version에 별도로 기록되며 TaskWorktree approval을 재사용하지 않는다.
+- diff approval-and-start-merge는 두 ProjectRoot approval이 모두 존재할 때만 통과한다. 승인 상태 API는 두 readiness flag만 반환하고, 실제 ProjectRoot Cargo 실행은 후속 Unit이다.
+
 ## Phase 6 — 기록·복구·보존
 
 **선행조건:** Phase 2~5 완료.

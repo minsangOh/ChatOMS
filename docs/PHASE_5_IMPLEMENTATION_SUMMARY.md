@@ -1,6 +1,6 @@
 # Phase 5 Implementation Summary
 
-This checkpoint records the Phase 5 work completed through user-diff approval and canonical commit-candidate calculation. It deliberately does not implement Git commit or merge execution.
+This checkpoint records the Phase 5 work completed through Phase 5d-4c. Git write, merge orchestration, scoped validation approval, and the pre-merge ProjectRoot approval gate are implemented. Actual ProjectRoot Cargo execution remains intentionally deferred to the next Unit.
 
 ## Context Package v1
 
@@ -19,9 +19,22 @@ This checkpoint records the Phase 5 work completed through user-diff approval an
 - The current diff can be shown only in the scoped local-user modal and is never persisted, logged, cached, or sent to a provider.
 - Approval records bind the task version to a content-free SHA-256 hash.
 - The canonical candidate includes tracked changes and eligible untracked UTF-8 files exactly as a later `git add -A -- .` would include them.
-- Approval does not transition the task to `Completed` or start a merge.
+- The combined approval-and-start-merge flow requires separate ProjectRoot `Test` and `Build` approvals for the same task version before it records diff approval or transitions to `Merging`.
+
+## Git write and merge execution
+
+- `GitCliAdapter` rechecks canonical candidate hash, task worktree/root/common-dir identity, isolation metadata, repository state, and approved author/filter constraints immediately before Git writes.
+- Approved changes are staged with the canonical `git add -A -- .` candidate definition, committed once on the task branch, and merged into the original branch with `--no-ff`.
+- Each write command has a bounded wall-clock timeout. Confirmed merge conflicts are returned as typed conflict outcomes without automatic resolution or follow-up writes; timeout, spawn, and other uncertain results remain fail-closed.
+
+## Scoped validation and post-merge contract
+
+- `ValidationExecutionScope` is the closed `TaskWorktree | ProjectRoot` vocabulary. Existing approval/result evidence is preserved as `TaskWorktree`; it cannot authorize ProjectRoot execution.
+- ProjectRoot approval is an independent immutable record bound to the current `AwaitingUserDiffApproval` task version, confirmed project identity revision, root stable identity, and fixed Cargo `Test`/`Build` candidates.
+- Post-merge results use a separate immutable table and transition only complete validation batches to `Completed`; every failure, cancellation, uncertainty, panic, or persistence uncertainty maps to `RecoveryRequired`.
+- The approval status IPC surface exposes only Test/Build readiness flags. The UI keeps the raw diff ephemeral and starts merge only after both approvals are ready. Native executable selection is one-shot and its path is not returned in status DTOs.
 
 ## Explicitly deferred
 
-- The narrow Git-write adapter, `Merging` orchestration, merge-conflict handling, post-merge testing, and all remote Git mutation remain unimplemented.
+- Actual ProjectRoot Cargo process execution, post-merge background validation orchestration, and result display remain unimplemented.
 - No provider/model selection, `AutoFixing`, `ReviewFixing`, or Codex activation is included in this checkpoint.
