@@ -3,6 +3,7 @@ import { FrontendError, isRecord, toFrontendError } from "./errors";
 import { isHighRiskApprovalDto, isHighRiskApprovalStatusDto } from "./high_risk_approval";
 import { isMergeAbortStartDto } from "./merge_abort";
 import { isMergeConflictWriteStatusDto } from "./merge_conflict_write_status";
+import { isOperationRiskAssessmentStatusDto } from "./operation_risk_assessment";
 import { isNullablePlanningResultDto } from "./planning_result";
 import { isPostMergeValidationResultDtoArray } from "./post_merge_validation_result";
 import { isNullableMergeConflictInspectionDto } from "./merge_conflict_inspection";
@@ -51,6 +52,7 @@ import type {
   PlanningResultDto,
   PostMergeValidationResultDto,
   MergeConflictInspectionDto,
+  OperationRiskAssessmentStatusDto,
   ProjectDto,
   ProjectRootValidationApprovalStatusDto,
   ProviderEligibilityDto,
@@ -123,6 +125,8 @@ export const IPC_COMMANDS = {
   startClaudeReviewContextPackage: "start_claude_review_context_package",
   getHighRiskApprovalStatus: "get_high_risk_approval_status",
   approveHighRiskOperation: "approve_high_risk_operation",
+  getProviderImplementationRiskAssessmentStatus: "get_provider_implementation_risk_assessment_status",
+  declareProviderImplementationRisk: "declare_provider_implementation_risk",
   getUserDiffForReview: "get_user_diff_for_review",
   approveUserDiff: "approve_user_diff",
   approveUserDiffAndStartMerge: "approve_user_diff_and_start_merge",
@@ -221,6 +225,16 @@ export interface IpcClient {
     expectedVersion: number,
     riskCategory: HighRiskCategory,
   ): Promise<HighRiskApprovalDto>;
+  getProviderImplementationRiskAssessmentStatus(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<OperationRiskAssessmentStatusDto>;
+  declareProviderImplementationRisk(
+    taskId: string,
+    expectedVersion: number,
+    riskCategories: readonly HighRiskCategory[],
+    explicitEmpty: boolean,
+  ): Promise<OperationRiskAssessmentStatusDto>;
   getUserDiffForReview(taskId: string, expectedVersion: number): Promise<RawUserDiffForReviewDto>;
   approveUserDiff(
     taskId: string,
@@ -403,6 +417,23 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
         expectedVersion,
         riskCategory,
       }),
+    getProviderImplementationRiskAssessmentStatus: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.getProviderImplementationRiskAssessmentStatus,
+        isOperationRiskAssessmentStatusDto,
+        { taskId, expectedVersion },
+      ),
+    declareProviderImplementationRisk: (
+      taskId,
+      expectedVersion,
+      riskCategories,
+      explicitEmpty,
+    ) =>
+      request(
+        IPC_COMMANDS.declareProviderImplementationRisk,
+        isOperationRiskAssessmentStatusDto,
+        { taskId, expectedVersion, riskCategories, explicitEmpty },
+      ),
     getUserDiffForReview: (taskId, expectedVersion) =>
       request(IPC_COMMANDS.getUserDiffForReview, isRawUserDiffForReviewDto, {
         taskId,

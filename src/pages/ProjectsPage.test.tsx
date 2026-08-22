@@ -3,7 +3,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 import type { IpcClient } from "../ipc/client";
 import { FrontendError } from "../ipc/errors";
-import type { ProjectDto, ProviderEligibilityDto, TaskDto, TaskIsolationDto } from "../ipc/types";
+import { HIGH_RISK_CATEGORIES } from "../ipc/high_risk_approval";
+import type { OperationRiskAssessmentStatusDto, ProjectDto, ProviderEligibilityDto, TaskDto, TaskIsolationDto } from "../ipc/types";
 import { createFakeClient } from "../test/fixtures";
 import { ProjectsPage } from "./ProjectsPage";
 
@@ -315,6 +316,22 @@ const HIGH_RISK_CATEGORY_LABELS = [
   "Difficult-to-recover change",
 ];
 
+function operationRiskStatus(
+  selectedCategories: OperationRiskAssessmentStatusDto["selectedCategories"] = [],
+  declarationExists = false,
+): OperationRiskAssessmentStatusDto {
+  return {
+    assessmentRequired: !declarationExists,
+    declarationExists,
+    selectedCategories,
+    approvalReadiness: HIGH_RISK_CATEGORIES.map((riskCategory) => ({
+      riskCategory,
+      approved: selectedCategories.includes(riskCategory),
+    })),
+    failureCategory: null,
+  };
+}
+
 it("shows all 13 fixed high-risk categories with per-category status in awaitingDesignApproval", async () => {
   const getHighRiskApprovalStatus = vi.fn().mockResolvedValue({ approved: false });
   renderActiveTask("awaitingDesignApproval", {
@@ -334,6 +351,52 @@ it("does not show the high-risk approval panel outside awaitingDesignApproval", 
   renderActiveTask("worktreeReady");
   await screen.findByRole("button", { name: "Start Claude Planning" });
   expect(screen.queryByRole("heading", { name: "High-risk approval" })).toBeNull();
+});
+
+it("loads Provider Implementation risk assessment only in awaitingDesignApproval", async () => {
+  const getProviderImplementationRiskAssessmentStatus = vi
+    .fn()
+    .mockResolvedValue(operationRiskStatus());
+  const { isolation } = renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => null,
+    getProviderImplementationRiskAssessmentStatus,
+  });
+  expect(await screen.findByRole("heading", { name: "Provider Implementation risk assessment" })).toBeVisible();
+  expect(getProviderImplementationRiskAssessmentStatus).toHaveBeenCalledWith(
+    isolation.taskId,
+    isolation.taskVersion,
+  );
+
+  const outside = vi.fn().mockResolvedValue(operationRiskStatus());
+  renderActiveTask("worktreeReady", { getProviderImplementationRiskAssessmentStatus: outside });
+  await screen.findAllByRole("button", { name: "Start Claude Planning" });
+  expect(outside).not.toHaveBeenCalled();
+});
+
+it("shows an immutable saved assessment without replacement controls", async () => {
+  renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => null,
+    getProviderImplementationRiskAssessmentStatus: async () =>
+      operationRiskStatus(["dataMigration"], true),
+  });
+  expect(await screen.findByText("Assessment recorded for the current task version. This immutable declaration cannot be changed.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Review and confirm assessment" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Record immutable assessment" })).toBeNull();
+});
+
+it("keeps assessment finalization unavailable after a safe backend failure", async () => {
+  renderActiveTask("awaitingDesignApproval", {
+    getPlanningResult: async () => null,
+    getProviderImplementationRiskAssessmentStatus: async () => ({
+      assessmentRequired: null,
+      declarationExists: null,
+      selectedCategories: [],
+      approvalReadiness: [],
+      failureCategory: "identityMismatch",
+    }),
+  });
+  expect(await screen.findByText(/Risk assessment status could not be loaded safely/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Review and confirm assessment" })).toBeNull();
 });
 
 it("does not call approveHighRiskOperation until the confirmation dialog is confirmed", async () => {

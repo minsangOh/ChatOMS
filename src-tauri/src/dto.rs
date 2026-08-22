@@ -6,6 +6,7 @@ mod high_risk_approval;
 mod merge_abort;
 mod merge_conflict_inspection;
 mod merge_conflict_write_status;
+mod operation_risk_assessment;
 mod planning_result;
 mod post_merge_validation_result;
 mod provider_eligibility;
@@ -23,6 +24,10 @@ pub use merge_conflict_inspection::{
     MergeConflictCountsDto, MergeConflictInspectionDto, MergeConflictInspectionOutcomeDto,
 };
 pub use merge_conflict_write_status::MergeConflictWriteStatusDto;
+pub use operation_risk_assessment::{
+    OperationRiskApprovalReadinessDto, OperationRiskAssessmentFailureCategoryDto,
+    OperationRiskAssessmentStatusDto,
+};
 pub use planning_result::{PlanningOutcomeDto, PlanningResultDto};
 pub use post_merge_validation_result::{
     PostMergeValidationOutcomeDto, PostMergeValidationResultDto,

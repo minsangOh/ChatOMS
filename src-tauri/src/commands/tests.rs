@@ -35,6 +35,9 @@ use super::{
     projects, provider_eligibility, review, system, tasks, testing, user_diff_review,
     validation_commands,
 };
+
+mod operation_risk_assessment;
+mod operation_risk_support;
 use crate::{
     dto::HealthStateDto,
     state::{
@@ -1125,7 +1128,7 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 
 #[test]
 fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 53);
+    assert_eq!(REGISTERED_HANDLERS.len(), 55);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -1176,6 +1179,8 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "start_claude_review_context_package",
             "get_high_risk_approval_status",
             "approve_high_risk_operation",
+            "get_provider_implementation_risk_assessment_status",
+            "declare_provider_implementation_risk",
             "get_user_diff_for_review",
             "approve_user_diff",
             "approve_user_diff_and_start_merge",

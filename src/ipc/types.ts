@@ -416,6 +416,29 @@ export interface HighRiskApprovalDto {
   approvedAtMs: number;
 }
 
+export type OperationRiskAssessmentFailureCategory =
+  | "invalidInput"
+  | "notFound"
+  | "versionConflict"
+  | "invalidState"
+  | "activeLeaseConflict"
+  | "identityMismatch"
+  | "persistenceUnavailable"
+  | "internal";
+
+export interface OperationRiskApprovalReadinessDto {
+  riskCategory: HighRiskCategory;
+  approved: boolean;
+}
+
+export interface OperationRiskAssessmentStatusDto {
+  assessmentRequired: boolean | null;
+  declarationExists: boolean | null;
+  selectedCategories: readonly HighRiskCategory[];
+  approvalReadiness: readonly OperationRiskApprovalReadinessDto[];
+  failureCategory: OperationRiskAssessmentFailureCategory | null;
+}
+
 /// The ONLY DTO in this codebase that carries raw repository diff content.
 /// It exists solely for `getUserDiffForReview` to hand the diff, once,
 /// directly to the requesting local user's own review modal -- never to a
