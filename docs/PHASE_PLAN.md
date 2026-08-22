@@ -141,7 +141,8 @@ Phase 1 기반
 - (Phase 5f-3b) `MergeConflict` UI의 continue/abort action을 backend의 공유 `MergeConflictWriteLock` 상태로 gate하는 content-free read-only IPC를 추가했다. UI는 이 status를 polling과 함께 조회하며, task 상태가 여전히 `MergeConflict`라는 사실만으로는 action을 재활성화하지 않고 authoritative status가 idle을 확인한 뒤에만 재활성화한다. status 조회의 loading/error/malformed 응답은 모두 fail-safe로 action을 노출하지 않는다.
 - (Phase 5g-2a) `ProviderImplementation`에 대한 immutable operation-risk declaration foundation을 추가했다. parent-only empty assessment와 미평가를 구분하고, non-empty category는 동일 task/version의 기존 high-risk approval에 FK로 결합하며, declaration은 content-free stable target identity digest에 결합한다. Policy evaluation/permit과 execution gate는 아직 열지 않았다.
 - (Phase 5g-2c) 중앙 Policy Engine이 `ProviderImplementation` 요청에 한해 authoritative task/state/version/lease, immutable declaration과 exact category approval, task/project/isolation 및 live target identity digest를 재검증한다. declaration 부재는 `AssessmentRequired`, 정상 불일치는 closed denial, persistence·identity inspection·corruption 실패는 application error로 구분하며, 통과한 평가만 task/version/operation/digest-bound in-memory non-serializable `PolicyPermit`을 발급한다. evaluation은 task lifecycle이나 provider 실행을 변경하지 않는다.
-- 자동 conflict resolution, `AutoFixing`, `ReviewFixing`, provider/model 선택과 PolicyPermit의 Implementation starter/adapter spawn gate 연결은 후속 Unit이다.
+- (Phase 5g-2d) LegacyPhase4와 ContextPackageV1 Claude Implementation starter가 기존 evidence 확인 뒤 Policy Engine을 provider capability probe·consent·상태 전이·registry보다 먼저 평가하고, `Authorized(PolicyPermit)`만 기존 시작 경로로 진행한다. permit은 IPC/DTO/registry/persistence를 거치지 않고 detached worker로 이동하며, policy-gated executor가 inner Claude adapter 호출 직전에 worktree stable identity를 다시 검사한다. 이 재검증 실패는 spawn 없이 기존 `RecoveryRequired` 결과 경로로 기록한다.
+- 자동 conflict resolution, `AutoFixing`, `ReviewFixing`, provider/model 선택과 validation/merge Policy Engine 연동은 후속 Unit이다.
 
 ## Phase 6 — 기록·복구·보존
 

@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+#[path = "operation_risk_declaration/support.rs"]
+mod operation_risk_support;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -8,24 +11,34 @@ use chatoms_application::{
         BeginImplementationExecutionRequest, ImplementationExecutionRecorder,
         ImplementationExecutionStarter,
     },
+    operation_risk_declaration::{
+        DeclareProviderImplementationRiskRequest, OperationRiskDeclarationService,
+    },
 };
-use chatoms_domain::{ContextDataScope, GitOperationId, ProjectId, TaskId, TaskState, WorkKind};
+use chatoms_domain::{
+    ContextDataScope, GitOperationId, HighRiskCategory, OperationRiskKind, ProjectId, TaskId,
+    TaskState, WorkKind,
+};
 use chatoms_ports::{
     error::{FailureCategory, PortFailure},
+    git::RepositoryKind,
     implementation::{
-        ClaudeImplementationExecutor, ImplementationExecutionBrief, ImplementationExecutionResult,
-        ImplementationExecutionStartOutcome,
+        ImplementationExecutionBrief, ImplementationExecutionResult,
+        ImplementationExecutionStartOutcome, PolicyGatedClaudeImplementationExecutor,
     },
     process::{AtomicCancellationSignal, CancellationSignal},
     provider::{
         ProviderCapabilities, ProviderCapabilityPort, ProviderCapabilityStatus, ProviderKind,
     },
     repository::{
-        FoundationRepository, GitIsolationStatus, ImplementationResultOutcome,
-        PlanningResultOutcome, TaskBriefRecord, TaskGitIsolation, TaskPlanningResultRecord,
+        FoundationRepository, GitIsolationStatus, HighRiskApprovalRecord,
+        ImplementationResultOutcome, PlanningResultOutcome, ProjectFilesystemIdentityRecord,
+        ProjectRecord, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
+        TaskPlanningResultRecord,
     },
 };
 
+use operation_risk_support::FakeFilesystem;
 use support::{FakeRepository, FakeTime, restored_task};
 
 struct FakeCapability(ProviderCapabilityStatus);
@@ -36,6 +49,14 @@ impl ProviderCapabilityPort for FakeCapability {
             claude: self.0,
             codex: ProviderCapabilityStatus::Unsupported,
         })
+    }
+}
+
+struct UnexpectedCapability;
+
+impl ProviderCapabilityPort for UnexpectedCapability {
+    fn provider_capabilities(&mut self) -> Result<ProviderCapabilities, PortFailure> {
+        panic!("policy rejection must precede every provider capability probe")
     }
 }
 
@@ -95,9 +116,11 @@ impl ScriptedExecutor {
     }
 }
 
-impl ClaudeImplementationExecutor for ScriptedExecutor {
+impl PolicyGatedClaudeImplementationExecutor for ScriptedExecutor {
     fn start_implementation(
         &mut self,
+        _task_id: TaskId,
+        _started_task_version: u64,
         worktree: &Path,
         brief: ImplementationExecutionBrief<'_>,
         _cancellation: &dyn CancellationSignal,
@@ -163,19 +186,82 @@ fn completed_planning_result(task_id: TaskId, plan_text: &str) -> TaskPlanningRe
 /// A task ready to start Implementation: `AwaitingDesignApproval` state
 /// with a matching `WorktreeReady` isolation record, an attached brief, and
 /// a `Completed` Claude Planning result carrying plan text.
-fn setup_awaiting_design_approval(version: u64) -> (FakeRepository, TaskId) {
+fn setup_awaiting_design_approval_without_declaration(
+    version: u64,
+) -> (FakeRepository, FakeFilesystem, TaskId) {
     let (task, history) = restored_task(TaskState::AwaitingDesignApproval, version, 20, None);
     let task_id = task.id();
     let mut repository = FakeRepository::default();
-    repository
-        .isolations
-        .insert(task_id, worktree_ready_isolation(task_id, version));
+    let mut isolation = worktree_ready_isolation(task_id, version);
+    isolation.project_id = task.project_id();
+    repository.isolations.insert(task_id, isolation);
     repository.briefs.insert(task_id, brief_record(task_id));
     repository
         .planning_results
         .insert(task_id, completed_planning_result(task_id, "masked plan"));
+    repository.project_records.insert(
+        task.project_id(),
+        ProjectRecord {
+            id: task.project_id(),
+            name: "Project".to_owned(),
+            root_path: "C:/project".to_owned(),
+            canonical_path_key: "c:/project".to_owned(),
+            display_path: "Project".to_owned(),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        },
+    );
+    repository.project_identities.insert(
+        task.project_id(),
+        ProjectFilesystemIdentityRecord {
+            project_id: task.project_id(),
+            root_volume_serial_hex: "0000000000000001".to_owned(),
+            root_file_id_hex: "11111111111111111111111111111111".to_owned(),
+            repository_kind: RepositoryKind::Git,
+            git_common_volume_serial_hex: None,
+            git_common_file_id_hex: None,
+            confirmed: true,
+            revision: 1,
+            verified_at_ms: 20,
+        },
+    );
     repository.seed_task(task, history);
-    (repository, task_id)
+    let filesystem = FakeFilesystem {
+        identities: std::collections::HashMap::from([
+            (
+                PathBuf::from("C:/project"),
+                chatoms_ports::filesystem::DirectoryIdentity {
+                    canonical_path: PathBuf::from("C:/project"),
+                    volume_serial_hex: "0000000000000001".to_owned(),
+                    file_id_hex: "11111111111111111111111111111111".to_owned(),
+                },
+            ),
+            (
+                PathBuf::from("C:/managed/task"),
+                chatoms_ports::filesystem::DirectoryIdentity {
+                    canonical_path: PathBuf::from("C:/managed/task"),
+                    volume_serial_hex: "0000000000000002".to_owned(),
+                    file_id_hex: "22222222222222222222222222222222".to_owned(),
+                },
+            ),
+        ]),
+        failures: std::collections::HashMap::new(),
+    };
+    (repository, filesystem, task_id)
+}
+
+fn setup_awaiting_design_approval(version: u64) -> (FakeRepository, FakeFilesystem, TaskId) {
+    let (mut repository, mut filesystem, task_id) =
+        setup_awaiting_design_approval_without_declaration(version);
+    OperationRiskDeclarationService::new(&mut repository, &mut filesystem)
+        .declare_provider_implementation_risk(DeclareProviderImplementationRiskRequest {
+            task_id,
+            expected_version: version,
+            risk_categories: Vec::new(),
+            declared_at_ms: 25,
+        })
+        .expect("declare explicit empty provider implementation risk");
+    (repository, filesystem, task_id)
 }
 
 /// A task already in `Implementing`, as `run_and_record` expects to find
@@ -190,13 +276,18 @@ fn setup_implementing(version: u64) -> (FakeRepository, TaskId) {
 
 #[test]
 fn begin_transitions_to_implementing_and_returns_worktree_brief_and_plan_when_supported() {
-    let (mut repository, task_id) = setup_awaiting_design_approval(3);
+    let (mut repository, mut filesystem, task_id) = setup_awaiting_design_approval(3);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
 
-    let inputs = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect("begin succeeds");
+    let inputs = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .expect("begin succeeds");
 
     assert_eq!(inputs.task.state, TaskState::Implementing);
     assert_eq!(inputs.task.version, 4);
@@ -206,14 +297,171 @@ fn begin_transitions_to_implementing_and_returns_worktree_brief_and_plan_when_su
 }
 
 #[test]
+fn begin_rejects_when_provider_implementation_assessment_is_missing() {
+    let (mut repository, mut filesystem, task_id) =
+        setup_awaiting_design_approval_without_declaration(3);
+    let mut time = FakeTime::at(30);
+    let mut capability = UnexpectedCapability;
+
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .err()
+    .expect("a missing operation-risk declaration must fail closed");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::AwaitingDesignApproval
+    );
+    assert_eq!(repository.tasks[&task_id].version(), 3);
+    assert!(repository.last_saved.is_none());
+    assert!(
+        repository
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Implementation,
+                3,
+                ContextDataScope::LegacyPhase4,
+            )
+            .expect("consent lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn begin_accepts_non_empty_assessment_with_exact_approval() {
+    let (mut repository, mut filesystem, task_id) =
+        setup_awaiting_design_approval_without_declaration(3);
+    repository.high_risk_approvals.insert(
+        (task_id, 3, HighRiskCategory::ArchitectureChange),
+        HighRiskApprovalRecord {
+            task_id,
+            approved_task_version: 3,
+            risk_category: HighRiskCategory::ArchitectureChange,
+            approved_at_ms: 24,
+        },
+    );
+    OperationRiskDeclarationService::new(&mut repository, &mut filesystem)
+        .declare_provider_implementation_risk(DeclareProviderImplementationRiskRequest {
+            task_id,
+            expected_version: 3,
+            risk_categories: vec![HighRiskCategory::ArchitectureChange],
+            declared_at_ms: 25,
+        })
+        .expect("declare exact approved category");
+    let mut time = FakeTime::at(30);
+    let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
+
+    let inputs = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .expect("exact approved assessment starts implementation");
+
+    assert_eq!(inputs.task.state, TaskState::Implementing);
+}
+
+#[test]
+fn begin_policy_failures_preserve_state_consent_and_provider_boundary() {
+    for failure in ["lease", "target", "inspection", "repository", "approval"] {
+        let (mut repository, mut filesystem, task_id) = setup_awaiting_design_approval(3);
+        match failure {
+            "lease" => repository.active_lease = None,
+            "target" => {
+                filesystem
+                    .identities
+                    .get_mut(Path::new("C:/managed/task"))
+                    .expect("worktree identity")
+                    .file_id_hex = "33333333333333333333333333333333".to_owned();
+            }
+            "inspection" => {
+                filesystem.failures.insert(
+                    PathBuf::from("C:/managed/task"),
+                    FailureCategory::PermissionDenied,
+                );
+            }
+            "repository" => {
+                repository.fail_on = Some((
+                    "get_operation_risk_declaration",
+                    RepositoryErrorCode::DatabaseUnavailable,
+                ));
+            }
+            "approval" => {
+                repository
+                    .operation_risk_declarations
+                    .get_mut(&(task_id, 3, OperationRiskKind::ProviderImplementation))
+                    .expect("declaration")
+                    .risk_categories = vec![HighRiskCategory::ArchitectureChange];
+            }
+            _ => unreachable!(),
+        }
+        let mut time = FakeTime::at(30);
+        let mut capability = UnexpectedCapability;
+
+        let error = ImplementationExecutionStarter::new(
+            &mut repository,
+            &mut time,
+            &mut capability,
+            &mut filesystem,
+        )
+        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+        .err()
+        .expect("policy failure must reject");
+
+        let expected_code = match failure {
+            "lease" => ApplicationErrorCode::ActiveTaskConflict,
+            "target" => ApplicationErrorCode::Conflict,
+            "inspection" => ApplicationErrorCode::PermissionDenied,
+            "repository" => ApplicationErrorCode::StorageUnavailable,
+            "approval" => ApplicationErrorCode::InvalidState,
+            _ => unreachable!(),
+        };
+        assert_eq!(error.code(), expected_code, "failure case: {failure}");
+        assert_eq!(
+            repository.tasks[&task_id].state(),
+            TaskState::AwaitingDesignApproval
+        );
+        assert_eq!(repository.tasks[&task_id].version(), 3);
+        assert!(repository.last_saved.is_none());
+        assert!(
+            repository
+                .get_provider_consent(
+                    task_id,
+                    ProviderKind::Claude,
+                    WorkKind::Implementation,
+                    3,
+                    ContextDataScope::LegacyPhase4,
+                )
+                .expect("consent lookup")
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn begin_rejects_unsupported_capability_with_no_execution_and_state_preserved() {
-    let (mut repository, task_id) = setup_awaiting_design_approval(3);
+    let (mut repository, mut filesystem, task_id) = setup_awaiting_design_approval(3);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Unsupported);
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect_err("unsupported capability must reject before any state change");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .err()
+    .expect("unsupported capability must reject before any state change");
 
     assert_eq!(error.code(), ApplicationErrorCode::Unsupported);
     assert!(
@@ -243,40 +491,64 @@ fn begin_rejects_when_task_is_not_awaiting_design_approval() {
         .insert(task_id, completed_planning_result(task_id, "masked plan"));
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
+    let mut filesystem = FakeFilesystem::default();
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 4))
-        .expect_err("task is already Implementing");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 4))
+    .err()
+    .expect("task is already Implementing");
 
     assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
 }
 
 #[test]
 fn begin_rejects_a_stale_task_version() {
-    let (mut repository, task_id) = setup_awaiting_design_approval(5);
+    let (mut repository, mut filesystem, task_id) = setup_awaiting_design_approval(5);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 1))
-        .expect_err("stale expected_version must be rejected");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 1))
+    .err()
+    .expect("stale expected_version must be rejected");
 
     assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
 }
 
 #[test]
 fn begin_rejects_a_duplicate_start_replayed_after_the_first_succeeds() {
-    let (mut repository, task_id) = setup_awaiting_design_approval(3);
+    let (mut repository, mut filesystem, task_id) = setup_awaiting_design_approval(3);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
 
-    ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect("first start succeeds");
+    ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .expect("first start succeeds");
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect_err("a duplicate start replaying the same version must fail closed");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .err()
+    .expect("a duplicate start replaying the same version must fail closed");
 
     assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
     assert_eq!(repository.tasks[&task_id].state(), TaskState::Implementing);
@@ -295,10 +567,17 @@ fn begin_rejects_missing_isolation_record_with_no_state_change() {
     repository.seed_task(task, history);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
+    let mut filesystem = FakeFilesystem::default();
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect_err("start requires a WorktreeReady isolation record");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .err()
+    .expect("start requires a WorktreeReady isolation record");
 
     assert_eq!(error.code(), ApplicationErrorCode::NotFound);
     assert_eq!(
@@ -334,10 +613,17 @@ fn begin_rejects_missing_planning_result_with_no_state_change() {
     repository.seed_task(task, history);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
+    let mut filesystem = FakeFilesystem::default();
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect_err("start requires a recorded Claude Planning result");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .err()
+    .expect("start requires a recorded Claude Planning result");
 
     assert_eq!(error.code(), ApplicationErrorCode::NotFound);
     assert_eq!(
@@ -373,10 +659,17 @@ fn begin_rejects_a_non_completed_planning_result_with_no_state_change() {
     repository.seed_task(task, history);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
+    let mut filesystem = FakeFilesystem::default();
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect_err("a non-Completed planning result must not start Implementation");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .err()
+    .expect("a non-Completed planning result must not start Implementation");
 
     assert_eq!(error.code(), ApplicationErrorCode::Internal);
     assert_eq!(
@@ -400,10 +693,17 @@ fn begin_rejects_missing_brief_with_no_state_change() {
     repository.seed_task(task, history);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
+    let mut filesystem = FakeFilesystem::default();
 
-    let error = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect_err("start requires a TaskBrief");
+    let error = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .err()
+    .expect("start requires a TaskBrief");
 
     assert_eq!(error.code(), ApplicationErrorCode::Internal);
     assert_eq!(
@@ -662,13 +962,18 @@ fn panic_containment_does_not_report_success_when_the_recovery_write_is_itself_r
 
 #[test]
 fn begin_then_run_and_record_connects_consent_state_adapter_and_result_end_to_end() {
-    let (mut repository, task_id) = setup_awaiting_design_approval(3);
+    let (mut repository, mut filesystem, task_id) = setup_awaiting_design_approval(3);
     let mut time = FakeTime::at(30);
     let mut capability = FakeCapability(ProviderCapabilityStatus::Supported);
 
-    let inputs = ImplementationExecutionStarter::new(&mut repository, &mut time, &mut capability)
-        .begin(BeginImplementationExecutionRequest::new(task_id, 3))
-        .expect("begin succeeds");
+    let inputs = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut capability,
+        &mut filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(task_id, 3))
+    .expect("begin succeeds");
     assert_eq!(inputs.task.state, TaskState::Implementing);
 
     let consent = repository

@@ -17,6 +17,8 @@
 
 use std::path::Path;
 
+use chatoms_domain::TaskId;
+
 use crate::error::PortFailure;
 use crate::implementation::{ImplementationExecutionBrief, ImplementationExecutionStartOutcome};
 use crate::process::CancellationSignal;
@@ -35,6 +37,17 @@ use crate::process::CancellationSignal;
 pub trait ContextPackageImplementationExecutor {
     fn start_implementation(
         &mut self,
+        worktree: &Path,
+        brief: ImplementationExecutionBrief<'_>,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<ImplementationExecutionStartOutcome, PortFailure>;
+}
+
+pub trait PolicyGatedContextPackageImplementationExecutor {
+    fn start_implementation(
+        &mut self,
+        task_id: TaskId,
+        started_task_version: u64,
         worktree: &Path,
         brief: ImplementationExecutionBrief<'_>,
         cancellation: &dyn CancellationSignal,

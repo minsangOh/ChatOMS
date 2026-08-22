@@ -34,8 +34,9 @@ use std::path::Path;
 use chatoms_domain::TaskId;
 use chatoms_ports::{
     TimeProvider,
-    context_package_implementation::ContextPackageImplementationExecutor,
+    context_package_implementation::PolicyGatedContextPackageImplementationExecutor,
     error::FailureCategory,
+    filesystem::FilesystemIdentityPort,
     implementation::{ImplementationExecutionBrief, ImplementationExecutionStartOutcome},
     process::CancellationSignal,
     provider::{ProviderCapabilityPort, ProviderCapabilityStatus},
@@ -47,6 +48,7 @@ use chatoms_ports::{
 
 use crate::{
     error::ApplicationError,
+    policy_engine::{PolicyPermit, require_provider_implementation_permit},
     tasks::{
         RecordImplementationResultRequest, StartContextPackageImplementationRequest, TaskService,
         TaskView,
@@ -79,41 +81,50 @@ impl BeginContextPackageImplementationExecutionRequest {
 /// the *new* (post-transition) version, which the eventual `run_and_record`
 /// call must pass back as its `expected_version` — identical shape to
 /// `crate::implementation_execution::ImplementationExecutionInputs`.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextPackageImplementationExecutionInputs {
     pub task: TaskView,
     pub worktree_path: String,
     pub brief: TaskBriefRecord,
     pub plan_text: String,
+    pub policy_permit: PolicyPermit,
 }
 
-pub struct ContextPackageImplementationExecutionStarter<'a, R, T, C> {
+pub struct ContextPackageImplementationExecutionStarter<'a, R, T, C, F> {
     repository: &'a mut R,
     time: &'a mut T,
     capability: &'a mut C,
+    filesystem: &'a mut F,
 }
 
-impl<'a, R, T, C> ContextPackageImplementationExecutionStarter<'a, R, T, C>
+impl<'a, R, T, C, F> ContextPackageImplementationExecutionStarter<'a, R, T, C, F>
 where
     R: FoundationRepository,
     T: TimeProvider,
     C: ProviderCapabilityPort,
+    F: FilesystemIdentityPort,
 {
     #[must_use]
-    pub const fn new(repository: &'a mut R, time: &'a mut T, capability: &'a mut C) -> Self {
+    pub const fn new(
+        repository: &'a mut R,
+        time: &'a mut T,
+        capability: &'a mut C,
+        filesystem: &'a mut F,
+    ) -> Self {
         Self {
             repository,
             time,
             capability,
+            filesystem,
         }
     }
 
-    /// Fresh-checks Claude capability, then loads and validates the
-    /// evidence a write-capable run requires — a `WorktreeReady` isolation
+    /// Loads and validates the evidence a write-capable run requires — a
+    /// `WorktreeReady` isolation
     /// record, a `Completed` Claude Planning result with non-empty plan
     /// text, and the `TaskBrief` — exactly like
     /// `ImplementationExecutionStarter::begin`, and only once every one of
-    /// those is confirmed present does it commit the
+    /// those is confirmed present, evaluates the Provider Implementation
+    /// policy, and fresh-checks Claude capability before it commits the
     /// `AwaitingDesignApproval -> Implementing` transition via
     /// `TaskService::start_context_package_implementation` (which
     /// additionally requires, inside its own atomic transaction, the exact
@@ -121,11 +132,20 @@ where
     /// capability, missing/invalid evidence, wrong task state, a stale
     /// version, or a missing/partial Context Package v1 preparation,
     /// nothing is written and the task's state is left exactly as it was:
-    /// "no execution, no consent, state preserved".
+    /// "no execution, no consent, state preserved". Policy rejection occurs
+    /// before the capability probe can start any provider process.
     pub fn begin(
         &mut self,
         request: BeginContextPackageImplementationExecutionRequest,
     ) -> Result<ContextPackageImplementationExecutionInputs, ApplicationError> {
+        let (worktree_path, brief, plan_text) = self.load_execution_evidence(request.task_id)?;
+        let policy_permit = require_provider_implementation_permit(
+            self.repository,
+            self.filesystem,
+            request.task_id,
+            request.expected_version,
+        )?;
+
         let capabilities = self
             .capability
             .provider_capabilities()
@@ -133,8 +153,6 @@ where
         if capabilities.claude != ProviderCapabilityStatus::Supported {
             return Err(category_error(FailureCategory::Unsupported));
         }
-
-        let (worktree_path, brief, plan_text) = self.load_execution_evidence(request.task_id)?;
 
         let task = TaskService::new(self.repository, self.time)
             .start_context_package_implementation(StartContextPackageImplementationRequest::new(
@@ -149,6 +167,7 @@ where
             worktree_path,
             brief,
             plan_text,
+            policy_permit,
         })
     }
 
@@ -240,9 +259,11 @@ where
         cancellation: &dyn CancellationSignal,
     ) -> Result<TaskView, ApplicationError>
     where
-        X: ContextPackageImplementationExecutor,
+        X: PolicyGatedContextPackageImplementationExecutor,
     {
         let outcome = executor.start_implementation(
+            task_id,
+            expected_version,
             Path::new(worktree_path),
             ImplementationExecutionBrief {
                 requirements: &brief.requirements,
@@ -301,7 +322,7 @@ where
         cancellation: &dyn CancellationSignal,
     ) -> Result<TaskView, ApplicationError>
     where
-        X: ContextPackageImplementationExecutor,
+        X: PolicyGatedContextPackageImplementationExecutor,
     {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run_and_record(
