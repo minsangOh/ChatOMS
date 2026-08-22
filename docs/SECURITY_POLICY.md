@@ -156,6 +156,14 @@ Review 결과 저장은 마스킹·크기 제한된 최종 review text와 outcom
 - digest material에는 task/project id, exact version, confirmed project identity revision과 ProjectRoot/worktree stable object identity만 포함한다. raw path, source, diff, plan, prompt, stdout/stderr, executable/environment/auth/session 정보는 declaration schema·record·오류에 포함하지 않는다.
 - 이 Unit은 Policy evaluation/permit, Tauri/IPC/UI, provider consent/Context Package, run registry, adapter와 subprocess spawn을 변경하지 않는다. 실제 provider write gate와 spawn 직전 identity 재검증은 후속 Unit이다.
 
+## Provider Implementation Policy Engine (Phase 5g-2c)
+
+- Policy input은 task id, exact expected version, closed operation kind뿐이다. caller는 risk category, state, approval 결과, path 또는 identity를 주장할 수 없으며 현재 지원 operation은 `ProviderImplementation` 하나다.
+- engine은 task/state/version/active lease, immutable declaration과 그 declaration에 선택된 exact approval, task/project/isolation 관계, app-created `WorktreeReady` target과 live stable identity digest를 repository/filesystem에서 다시 읽는다. declaration 부재만 `AssessmentRequired`이며 explicit empty declaration은 정상 evaluation 대상이다. extra approval은 읽거나 permit 범위를 넓히지 않는다.
+- stale version, wrong state, lease mismatch, missing selected approval, unsupported operation과 live target mismatch는 closed content-free denial이다. malformed aggregate·approval record, missing required relationship와 repository/filesystem inspection 실패는 denial이나 assessment-required로 축소하지 않고 application error로 보존한다.
+- 통과한 평가만 task id, exact version, `ProviderImplementation`, target identity digest에 결합된 in-memory `PolicyPermit`을 발급한다. permit은 public constructor, `Clone`, `Debug`, serde 구현, persistence·DTO·IPC/UI 변환이 없고 raw path/source/diff/plan/prompt/output/executable/environment/auth/session 정보를 담지 않는다.
+- 이 Unit은 read-only evaluation과 permit 발급만 구현한다. task transition, consent/Context Package, registry, adapter construction, subprocess spawn, Tauri/UI, provider/model 선택, `AutoFixing`/`ReviewFixing`, validation/merge gate는 변경하지 않는다. migration과 state-machine edge도 추가하지 않는다.
+
 ## ProjectRoot approval merge gate (Phase 5d-4c)
 
 - `approve_user_diff_and_start_merge`는 동일 `(task_id, approved_task_version, ProjectRoot)` scope의 fixed Cargo `Test`와 `Build` approval이 모두 존재하는지 먼저 확인한다. 누락·stale version·state mismatch·approval lookup failure이면 diff approval, `Merging` 전이, Git adapter 준비와 background execution을 시작하지 않는다.

@@ -1,19 +1,22 @@
 use std::{collections::HashSet, path::Path};
 
-use chatoms_domain::{
-    HighRiskCategory, OperationRiskKind, ProjectId, TargetIdentityDigest, TaskId, TaskState,
-};
+use chatoms_domain::{HighRiskCategory, OperationRiskKind, TaskId, TaskState};
 use chatoms_ports::{
     error::FailureCategory,
-    filesystem::{DirectoryIdentity, FilesystemIdentityPort},
+    filesystem::FilesystemIdentityPort,
     repository::{
         FoundationRepository, GitIsolationStatus, OperationRiskDeclaration,
-        OperationRiskDeclarationRecord, ProjectFilesystemIdentityRecord,
+        OperationRiskDeclarationRecord,
     },
 };
-use sha2::{Digest, Sha256};
 
-use crate::error::ApplicationError;
+use crate::{
+    error::ApplicationError,
+    operation_target_identity::{
+        ProviderImplementationTargetIdentityFacts,
+        derive_provider_implementation_target_identity_digest,
+    },
+};
 
 pub struct DeclareProviderImplementationRiskRequest {
     pub task_id: TaskId,
@@ -131,13 +134,15 @@ where
             task_id: task.id(),
             approved_task_version: request.expected_version,
             operation_kind: OperationRiskKind::ProviderImplementation,
-            target_identity_digest: derive_target_identity_digest(&TargetIdentityFacts {
-                task_id: task.id(),
-                project_id: task.project_id(),
-                approved_task_version: request.expected_version,
-                project_identity: &project_identity,
-                worktree_identity: &live_worktree,
-            }),
+            target_identity_digest: derive_provider_implementation_target_identity_digest(
+                &ProviderImplementationTargetIdentityFacts {
+                    task_id: task.id(),
+                    project_id: task.project_id(),
+                    approved_task_version: request.expected_version,
+                    project_identity: &project_identity,
+                    worktree_identity: &live_worktree,
+                },
+            ),
             declared_at_ms: request.declared_at_ms,
         };
         self.repository
@@ -148,37 +153,6 @@ where
             risk_categories: request.risk_categories,
         })
     }
-}
-
-struct TargetIdentityFacts<'a> {
-    task_id: TaskId,
-    project_id: ProjectId,
-    approved_task_version: u64,
-    project_identity: &'a ProjectFilesystemIdentityRecord,
-    worktree_identity: &'a DirectoryIdentity,
-}
-
-fn derive_target_identity_digest(facts: &TargetIdentityFacts<'_>) -> TargetIdentityDigest {
-    let mut digest = Sha256::new();
-    digest.update(b"chatoms.provider-implementation-risk-target.v1");
-    digest.update([0]);
-    digest.update(facts.task_id.to_string().as_bytes());
-    digest.update([0]);
-    digest.update(facts.project_id.to_string().as_bytes());
-    digest.update([0]);
-    digest.update(facts.approved_task_version.to_be_bytes());
-    digest.update(facts.project_identity.revision.to_be_bytes());
-    digest.update(facts.project_identity.root_volume_serial_hex.as_bytes());
-    digest.update([0]);
-    digest.update(facts.project_identity.root_file_id_hex.as_bytes());
-    digest.update([0]);
-    digest.update(facts.worktree_identity.volume_serial_hex.as_bytes());
-    digest.update([0]);
-    digest.update(facts.worktree_identity.file_id_hex.as_bytes());
-    let digest = digest.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&digest);
-    TargetIdentityDigest::from_digest_bytes(bytes)
 }
 
 fn category_error(category: FailureCategory) -> ApplicationError {
