@@ -7,8 +7,8 @@ use std::sync::{
 use chatoms_application::system::CapabilityStatus as AppCapabilityStatus;
 use chatoms_application::{bootstrap::BootstrapStatus, error::ApplicationError};
 use chatoms_domain::{
-    ContextDataScope, HighRiskCategory, ProjectId, Task, TaskId, TaskStateTransition,
-    ValidationCommandKind, ValidationExecutionScope, WorkKind,
+    ContextDataScope, HighRiskCategory, OperationRiskKind, ProjectId, Task, TaskId,
+    TaskStateTransition, ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::bootstrap::{
     LegacyMigrationDiagnostic, SharedDatabase, SharedFoundationRepository, SharedLoggingGuard,
@@ -50,11 +50,11 @@ use chatoms_ports::{
         DiffApprovalRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
         GitOperationReceipt, GitOperationReceiptKind, HighRiskApprovalRecord,
         ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
-        PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
-        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
-        ProviderConsent, RepositoryError, TaskBriefRecord, TaskGitIsolation,
-        TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
-        ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+        OperationRiskDeclaration, OperationRiskDeclarationRecord, PostMergeValidationResultAttempt,
+        PostMergeValidationResultRecord, ProjectFilesystemIdentityRecord, ProjectRecord,
+        ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError, TaskBriefRecord,
+        TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
+        TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
         ValidationCommandResultRecord,
     },
 };
@@ -396,6 +396,25 @@ impl FoundationRepository for RepositoryHandle {
                 risk_category,
                 approved_at_ms,
             )
+        })
+    }
+
+    fn declare_operation_risk(
+        &mut self,
+        declaration: &OperationRiskDeclarationRecord,
+        risk_categories: &[HighRiskCategory],
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| inner.declare_operation_risk(declaration, risk_categories))
+    }
+
+    fn get_operation_risk_declaration(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        operation_kind: OperationRiskKind,
+    ) -> Result<Option<OperationRiskDeclaration>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_operation_risk_declaration(task_id, approved_task_version, operation_kind)
         })
     }
 

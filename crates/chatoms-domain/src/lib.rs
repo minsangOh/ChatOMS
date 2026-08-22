@@ -5,6 +5,7 @@ mod context_data_scope;
 mod error;
 mod high_risk_category;
 mod id;
+mod operation_risk;
 mod task;
 mod task_brief;
 mod task_state;
@@ -18,6 +19,7 @@ pub use high_risk_category::HighRiskCategory;
 pub use id::{
     AppProfileId, GitOperationId, ProjectId, ProviderBindingId, TaskId, TaskStateTransitionId,
 };
+pub use operation_risk::{OperationRiskKind, TargetIdentityDigest};
 pub use task::{RecoveryValidation, ResumeValidation, Task, TaskBranchIdentity, TaskSnapshot};
 pub use task_brief::TaskBrief;
 pub use task_state::TaskState;

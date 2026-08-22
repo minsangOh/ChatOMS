@@ -50,7 +50,7 @@ impl Migration {
     }
 }
 
-pub static FOUNDATION_MIGRATION: [Migration; 22] = [
+pub static FOUNDATION_MIGRATION: [Migration; 23] = [
     Migration::new(1, "foundation", schema::FOUNDATION_SQL),
     Migration::new(2, "git_isolation", schema::GIT_ISOLATION_SQL),
     Migration::new(3, "provider_binding", schema::PROVIDER_BINDING_SQL),
@@ -128,6 +128,11 @@ pub static FOUNDATION_MIGRATION: [Migration; 22] = [
         22,
         "task_merge_abort_approvals",
         schema::TASK_MERGE_ABORT_APPROVALS_SQL,
+    ),
+    Migration::new(
+        23,
+        "task_operation_risk_declarations",
+        schema::TASK_OPERATION_RISK_DECLARATIONS_SQL,
     ),
 ];
 

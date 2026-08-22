@@ -6,9 +6,9 @@ use std::{
 };
 
 use chatoms_domain::{
-    ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, Task, TaskBranchIdentity,
-    TaskId, TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
-    ValidationCommandKind, ValidationExecutionScope, WorkKind,
+    ActorKind, ContextDataScope, HighRiskCategory, OperationRiskKind, ProjectId, ReasonCode, Task,
+    TaskBranchIdentity, TaskId, TaskSnapshot, TaskState, TaskStateTransition,
+    TaskStateTransitionId, ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_ports::{
     TimeProvider,
@@ -21,11 +21,11 @@ use chatoms_ports::{
         FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationAttempt,
         GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
         HighRiskApprovalRecord, ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
-        PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
-        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderConsent,
-        RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
-        TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
-        ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+        OperationRiskDeclaration, OperationRiskDeclarationRecord, PostMergeValidationResultAttempt,
+        PostMergeValidationResultRecord, ProjectFilesystemIdentityRecord, ProjectRecord,
+        ProjectSummary, ProviderConsent, RepositoryError, RepositoryErrorCode, TaskBriefRecord,
+        TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
+        TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
         ValidationCommandResultRecord,
     },
 };
@@ -54,6 +54,8 @@ pub struct FakeRepository {
     pub validation_command_results: Vec<ValidationCommandResultRecord>,
     pub post_merge_validation_results: Vec<PostMergeValidationResultRecord>,
     pub high_risk_approvals: HashMap<(TaskId, u64, HighRiskCategory), HighRiskApprovalRecord>,
+    pub operation_risk_declarations:
+        HashMap<(TaskId, u64, OperationRiskKind), OperationRiskDeclaration>,
     pub diff_approvals: HashMap<(TaskId, u64, DiffContentHash), DiffApprovalRecord>,
     pub manual_merge_resolution_confirmations:
         HashMap<(TaskId, u64, ManualResolutionDigest), ManualMergeResolutionConfirmationRecord>,
@@ -479,6 +481,57 @@ impl FoundationRepository for FakeRepository {
         };
         self.high_risk_approvals.insert(key, approval);
         Ok(approval)
+    }
+
+    fn declare_operation_risk(
+        &mut self,
+        declaration: &OperationRiskDeclarationRecord,
+        risk_categories: &[HighRiskCategory],
+    ) -> Result<(), RepositoryError> {
+        self.record("declare_operation_risk");
+        self.maybe_fail("declare_operation_risk")?;
+        let key = (
+            declaration.task_id,
+            declaration.approved_task_version,
+            declaration.operation_kind,
+        );
+        if self.operation_risk_declarations.contains_key(&key)
+            || risk_categories
+                .iter()
+                .enumerate()
+                .any(|(index, category)| risk_categories[index + 1..].contains(category))
+            || risk_categories.iter().any(|category| {
+                !self.high_risk_approvals.contains_key(&(
+                    declaration.task_id,
+                    declaration.approved_task_version,
+                    *category,
+                ))
+            })
+        {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.operation_risk_declarations.insert(
+            key,
+            OperationRiskDeclaration {
+                record: *declaration,
+                risk_categories: risk_categories.to_vec(),
+            },
+        );
+        Ok(())
+    }
+
+    fn get_operation_risk_declaration(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        operation_kind: OperationRiskKind,
+    ) -> Result<Option<OperationRiskDeclaration>, RepositoryError> {
+        self.record("get_operation_risk_declaration");
+        self.maybe_fail("get_operation_risk_declaration")?;
+        Ok(self
+            .operation_risk_declarations
+            .get(&(task_id, approved_task_version, operation_kind))
+            .cloned())
     }
 
     fn save_diff_approval(&mut self, approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {

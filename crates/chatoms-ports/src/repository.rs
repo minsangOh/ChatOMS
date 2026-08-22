@@ -1,8 +1,9 @@
 use std::{error::Error, fmt};
 
 use chatoms_domain::{
-    ContextDataScope, GitOperationId, HighRiskCategory, ProjectId, Task, TaskId,
-    TaskStateTransition, ValidationCommandKind, ValidationExecutionScope, WorkKind,
+    ContextDataScope, GitOperationId, HighRiskCategory, OperationRiskKind, ProjectId,
+    TargetIdentityDigest, Task, TaskId, TaskStateTransition, ValidationCommandKind,
+    ValidationExecutionScope, WorkKind,
 };
 
 use crate::diff::DiffContentHash;
@@ -500,6 +501,26 @@ pub struct HighRiskApprovalRecord {
     pub approved_task_version: u64,
     pub risk_category: HighRiskCategory,
     pub approved_at_ms: i64,
+}
+
+/// Immutable, content-free evidence that risk assessment was completed for
+/// one provider-neutral operation and stable target identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationRiskDeclarationRecord {
+    pub task_id: TaskId,
+    pub approved_task_version: u64,
+    pub operation_kind: OperationRiskKind,
+    pub target_identity_digest: TargetIdentityDigest,
+    pub declared_at_ms: i64,
+}
+
+/// A declaration parent and its exact selected category set. An empty set is
+/// an explicit completed assessment; `None` at repository lookup means the
+/// assessment has not been completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationRiskDeclaration {
+    pub record: OperationRiskDeclarationRecord,
+    pub risk_categories: Vec<HighRiskCategory>,
 }
 
 /// An immutable, content-free approval binding a specific task version to
@@ -1156,6 +1177,23 @@ pub trait FoundationRepository {
         _risk_category: HighRiskCategory,
         _approved_at_ms: i64,
     ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn declare_operation_risk(
+        &mut self,
+        _declaration: &OperationRiskDeclarationRecord,
+        _risk_categories: &[HighRiskCategory],
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    fn get_operation_risk_declaration(
+        &mut self,
+        _task_id: TaskId,
+        _approved_task_version: u64,
+        _operation_kind: OperationRiskKind,
+    ) -> Result<Option<OperationRiskDeclaration>, RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
 

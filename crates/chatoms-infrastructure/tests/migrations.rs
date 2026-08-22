@@ -22,8 +22,9 @@ use chatoms_ports::{
 use rusqlite::{Connection, params};
 
 use support::{
-    TestDatabase, count_rows, create_active_task, foreign_key_violation_count, insert_lease,
-    insert_project, insert_task, is_constraint_error, table_exists,
+    TestDatabase, count_rows, create_active_task, foreign_key_violation_count,
+    insert_initial_transition, insert_lease, insert_project, insert_task, is_constraint_error,
+    table_exists,
 };
 
 fn run_registry(
@@ -36,7 +37,7 @@ fn run_registry(
 
 #[test]
 fn production_registry_and_checksum_policy_are_valid() {
-    assert_eq!(FOUNDATION_MIGRATION.len(), 22);
+    assert_eq!(FOUNDATION_MIGRATION.len(), 23);
     assert_eq!(FOUNDATION_MIGRATION[0].version, 1);
     assert_eq!(FOUNDATION_MIGRATION[0].name, "foundation");
     assert_eq!(FOUNDATION_MIGRATION[1].version, 2);
@@ -99,6 +100,11 @@ fn production_registry_and_checksum_policy_are_valid() {
     );
     assert_eq!(FOUNDATION_MIGRATION[21].version, 22);
     assert_eq!(FOUNDATION_MIGRATION[21].name, "task_merge_abort_approvals");
+    assert_eq!(FOUNDATION_MIGRATION[22].version, 23);
+    assert_eq!(
+        FOUNDATION_MIGRATION[22].name,
+        "task_operation_risk_declarations"
+    );
     validate_registry(&FOUNDATION_MIGRATION).expect("production registry must be valid");
 
     for migration in FOUNDATION_MIGRATION {
@@ -116,6 +122,180 @@ fn production_registry_and_checksum_policy_are_valid() {
         checksum_sha256(b"same bytes"),
         checksum_sha256(b"same bytes")
     );
+}
+
+#[test]
+fn v23_adds_operation_risk_declarations_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+
+    assert_eq!(outcome.schema_version, 23);
+    assert!(table_exists(
+        &database.open_raw(),
+        "task_operation_risk_declarations"
+    ));
+    assert!(table_exists(
+        &database.open_raw(),
+        "task_operation_risk_categories"
+    ));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 23);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn operation_risk_schema_distinguishes_explicit_empty_and_enforces_exact_bindings() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project-risk");
+    let transaction = connection.transaction().expect("begin task transaction");
+    insert_task(
+        &transaction,
+        "task-risk",
+        "project-risk",
+        "AwaitingDesignApproval",
+        3,
+        None,
+        None,
+    )
+    .expect("insert task");
+    insert_initial_transition(&transaction, "task-risk").expect("insert transition");
+    insert_lease(&transaction, "task-risk").expect("insert lease");
+    transaction.commit().expect("commit task");
+
+    assert_eq!(
+        count_rows(&connection, "task_operation_risk_declarations"),
+        0
+    );
+    connection
+        .execute(
+            "INSERT INTO task_operation_risk_declarations (
+                task_id, approved_task_version, operation_kind,
+                target_identity_digest_hex, declared_at_ms
+             ) VALUES (?1, ?2, 'ProviderImplementation', ?3, 200)",
+            params!["task-risk", 3, "11".repeat(32)],
+        )
+        .expect("insert explicit empty declaration");
+    assert_eq!(
+        count_rows(&connection, "task_operation_risk_declarations"),
+        1
+    );
+    assert_eq!(count_rows(&connection, "task_operation_risk_categories"), 0);
+
+    for invalid in [
+        connection.execute(
+            "INSERT INTO task_operation_risk_declarations (
+                task_id, approved_task_version, operation_kind,
+                target_identity_digest_hex, declared_at_ms
+             ) VALUES ('task-risk', 2, 'ProviderImplementation', ?1, 200)",
+            ["22".repeat(32)],
+        ),
+        connection.execute(
+            "INSERT INTO task_operation_risk_declarations (
+                task_id, approved_task_version, operation_kind,
+                target_identity_digest_hex, declared_at_ms
+             ) VALUES ('task-risk', 3, 'Planning', ?1, 200)",
+            ["22".repeat(32)],
+        ),
+        connection.execute(
+            "INSERT INTO task_operation_risk_declarations (
+                task_id, approved_task_version, operation_kind,
+                target_identity_digest_hex, declared_at_ms
+             ) VALUES ('missing-task', 3, 'ProviderImplementation', ?1, 200)",
+            ["22".repeat(32)],
+        ),
+        connection.execute(
+            "INSERT INTO task_operation_risk_declarations (
+                task_id, approved_task_version, operation_kind,
+                target_identity_digest_hex, declared_at_ms
+             ) VALUES ('task-risk', 3, 'ProviderImplementation', 'ABC', 200)",
+            [],
+        ),
+    ] {
+        assert!(invalid.as_ref().is_err_and(is_constraint_error));
+    }
+}
+
+#[test]
+fn operation_risk_schema_requires_parent_and_high_risk_approval_and_is_immutable() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project-risk-fk");
+    let transaction = connection.transaction().expect("begin task transaction");
+    insert_task(
+        &transaction,
+        "task-risk-fk",
+        "project-risk-fk",
+        "AwaitingDesignApproval",
+        4,
+        None,
+        None,
+    )
+    .expect("insert task");
+    insert_initial_transition(&transaction, "task-risk-fk").expect("insert transition");
+    insert_lease(&transaction, "task-risk-fk").expect("insert lease");
+    transaction.commit().expect("commit task");
+
+    let missing_parent = connection.execute(
+        "INSERT INTO task_operation_risk_categories (
+            task_id, approved_task_version, operation_kind, risk_category
+         ) VALUES ('task-risk-fk', 4, 'ProviderImplementation', 'ArchitectureChange')",
+        [],
+    );
+    assert!(missing_parent.as_ref().is_err_and(is_constraint_error));
+
+    connection
+        .execute(
+            "INSERT INTO task_operation_risk_declarations (
+                task_id, approved_task_version, operation_kind,
+                target_identity_digest_hex, declared_at_ms
+             ) VALUES ('task-risk-fk', 4, 'ProviderImplementation', ?1, 200)",
+            ["33".repeat(32)],
+        )
+        .expect("insert declaration");
+    let missing_approval = connection.execute(
+        "INSERT INTO task_operation_risk_categories (
+            task_id, approved_task_version, operation_kind, risk_category
+         ) VALUES ('task-risk-fk', 4, 'ProviderImplementation', 'ArchitectureChange')",
+        [],
+    );
+    assert!(missing_approval.as_ref().is_err_and(is_constraint_error));
+
+    connection
+        .execute(
+            "INSERT INTO task_high_risk_approvals (
+                task_id, approved_task_version, risk_category, approved_at_ms
+             ) VALUES ('task-risk-fk', 4, 'ArchitectureChange', 190)",
+            [],
+        )
+        .expect("insert high-risk approval");
+    connection
+        .execute(
+            "INSERT INTO task_operation_risk_categories (
+                task_id, approved_task_version, operation_kind, risk_category
+             ) VALUES ('task-risk-fk', 4, 'ProviderImplementation', 'ArchitectureChange')",
+            [],
+        )
+        .expect("insert declared category");
+
+    for immutable in [
+        connection.execute(
+            "UPDATE task_operation_risk_declarations SET declared_at_ms = 999",
+            [],
+        ),
+        connection.execute("DELETE FROM task_operation_risk_declarations", []),
+        connection.execute(
+            "UPDATE task_operation_risk_categories SET risk_category = 'DataMigration'",
+            [],
+        ),
+        connection.execute("DELETE FROM task_operation_risk_categories", []),
+    ] {
+        assert!(immutable.as_ref().is_err_and(is_constraint_error));
+    }
+    assert_eq!(foreign_key_violation_count(&connection), 0);
 }
 
 #[test]
@@ -602,8 +782,8 @@ fn registry_rejects_zero_non_one_start_duplicates_order_and_empty_fields() {
 fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     let database = TestDatabase::empty();
     let first = run_registry(&database, &FOUNDATION_MIGRATION).expect("first migration run");
-    assert_eq!(first.schema_version, 22);
-    assert_eq!(first.applied_count, 22);
+    assert_eq!(first.schema_version, 23);
+    assert_eq!(first.applied_count, 23);
 
     let connection = database.open_raw();
     let metadata: (i64, String, String, i64) = connection
@@ -629,7 +809,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     drop(connection);
 
     let second = run_registry(&database, &FOUNDATION_MIGRATION).expect("second migration run");
-    assert_eq!(second.schema_version, 22);
+    assert_eq!(second.schema_version, 23);
     assert_eq!(second.applied_count, 0);
     let connection = database.open_raw();
     let schema_after: String = connection
@@ -641,7 +821,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
         )
         .expect("read schema snapshot after reopen");
     assert_eq!(schema_after, schema_before);
-    assert_eq!(count_rows(&connection, "schema_migrations"), 22);
+    assert_eq!(count_rows(&connection, "schema_migrations"), 23);
     let metadata_after: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
@@ -1440,8 +1620,8 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let outcome = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("apply provider-neutral state migration");
-            assert_eq!(outcome.schema_version, 22);
-            assert_eq!(outcome.applied_count, 19);
+            assert_eq!(outcome.schema_version, 23);
+            assert_eq!(outcome.applied_count, 20);
 
             let connection = database.open_raw();
             assert_provider_state_fixture_migrated(
@@ -1456,7 +1636,7 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let rerun = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("re-run provider-neutral state migration");
-            assert_eq!(rerun.schema_version, 22);
+            assert_eq!(rerun.schema_version, 23);
             assert_eq!(rerun.applied_count, 0);
         }
     }
@@ -1500,13 +1680,13 @@ fn v5_adds_task_briefs_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(&database.open_raw(), "task_briefs"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1564,13 +1744,13 @@ fn v6_adds_provider_consents_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(&database.open_raw(), "task_provider_consents"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1674,13 +1854,13 @@ fn v7_adds_task_planning_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(&database.open_raw(), "task_planning_results"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2122,8 +2302,8 @@ fn v17_adds_context_package_manifests_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(
         &database.open_raw(),
         "context_package_manifests"
@@ -2131,7 +2311,7 @@ fn v17_adds_context_package_manifests_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2278,13 +2458,13 @@ fn v15_adds_task_review_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(&database.open_raw(), "task_review_results"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2395,8 +2575,8 @@ fn v9_adds_task_implementation_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(
         &database.open_raw(),
         "task_implementation_results"
@@ -2404,7 +2584,7 @@ fn v9_adds_task_implementation_results_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2501,8 +2681,8 @@ fn v10_adds_task_validation_command_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(
         &database.open_raw(),
         "task_validation_command_approvals"
@@ -2510,7 +2690,7 @@ fn v10_adds_task_validation_command_approvals_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2675,8 +2855,8 @@ fn v13_adds_task_validation_command_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(
         &database.open_raw(),
         "task_validation_command_results"
@@ -2684,7 +2864,7 @@ fn v13_adds_task_validation_command_results_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2693,8 +2873,8 @@ fn v18_adds_task_high_risk_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(
         &database.open_raw(),
         "task_high_risk_approvals"
@@ -2702,7 +2882,7 @@ fn v18_adds_task_high_risk_approvals_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2825,13 +3005,13 @@ fn v19_adds_task_diff_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(&database.open_raw(), "task_diff_approvals"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -3260,8 +3440,8 @@ fn v22_adds_task_merge_abort_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 22);
-    assert_eq!(outcome.applied_count, 22);
+    assert_eq!(outcome.schema_version, 23);
+    assert_eq!(outcome.applied_count, 23);
     assert!(table_exists(
         &database.open_raw(),
         "task_merge_abort_approvals"
@@ -3269,7 +3449,7 @@ fn v22_adds_task_merge_abort_approvals_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.schema_version, 23);
     assert_eq!(rerun.applied_count, 0);
 }
 
