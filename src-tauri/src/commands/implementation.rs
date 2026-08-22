@@ -16,7 +16,8 @@ use chatoms_application::{
 };
 use chatoms_domain::TaskId;
 use chatoms_infrastructure::{
-    claude_implementation::ClaudeImplementationAdapter, process::StdProcessRunner,
+    claude_implementation::ClaudeImplementationAdapter,
+    policy_gated_implementation::PolicyGatedImplementationExecutor, process::StdProcessRunner,
     provider::StdProviderCapabilityAdapter, redaction::SecretRedactor,
 };
 use chatoms_ports::{
@@ -53,8 +54,8 @@ impl Drop for UnregisterOnDrop {
     }
 }
 
-/// Starts a Claude Implementation attempt: fresh-checks capability and
-/// commits the `AwaitingDesignApproval -> Implementing` transition
+/// Starts a Claude Implementation attempt: evaluates policy, fresh-checks
+/// capability, and commits the `AwaitingDesignApproval -> Implementing` transition
 /// synchronously (so the caller gets an immediate, accurate `TaskDto`), then
 /// runs the actual provider process and records its outcome on a detached
 /// background thread. The thread is necessary — not merely convenient —
@@ -90,13 +91,18 @@ pub fn handle_start_claude_implementation(
 
     let mut repository = ready.repository.clone();
     let mut time = ready.time.clone();
-    let inputs =
-        ImplementationExecutionStarter::new(&mut repository, &mut time, &mut precheck_capability)
-            .begin(BeginImplementationExecutionRequest::new(
-                id,
-                expected_version,
-            ))
-            .map_err(IpcErrorDto::from)?;
+    let mut policy_filesystem = ready.filesystem.clone();
+    let inputs = ImplementationExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut precheck_capability,
+        &mut policy_filesystem,
+    )
+    .begin(BeginImplementationExecutionRequest::new(
+        id,
+        expected_version,
+    ))
+    .map_err(start_error)?;
 
     let started_at_ms = time.now_ms().map_err(|_| IpcErrorDto::internal())?;
     let task_dto = TaskDto::from(inputs.task.clone());
@@ -132,8 +138,10 @@ pub fn handle_start_claude_implementation(
     let worktree_path = inputs.worktree_path;
     let brief = inputs.brief;
     let plan_text = inputs.plan_text;
+    let policy_permit = inputs.policy_permit;
     let mut repository_for_thread = ready.repository.clone();
     let mut time_for_thread = ready.time.clone();
+    let filesystem_for_thread = ready.filesystem.clone();
 
     std::thread::spawn(move || {
         let _unregister_guard = UnregisterOnDrop {
@@ -145,13 +153,15 @@ pub fn handle_start_claude_implementation(
             preflight_dir_handle,
             StdProcessRunner::new(),
         );
-        let mut adapter = ClaudeImplementationAdapter::new(
+        let adapter = ClaudeImplementationAdapter::new(
             executor_capability,
             StdProcessRunner::new(),
             executable_path,
             preflight_dir_path,
             redactor,
         );
+        let mut adapter =
+            PolicyGatedImplementationExecutor::new(adapter, filesystem_for_thread, policy_permit);
         let _ =
             ImplementationExecutionRecorder::new(&mut repository_for_thread, &mut time_for_thread)
                 .run_and_record_with_panic_containment(
@@ -215,16 +225,18 @@ pub fn handle_start_claude_implementation_context_package(
 
     let mut repository = ready.repository.clone();
     let mut time = ready.time.clone();
+    let mut policy_filesystem = ready.filesystem.clone();
     let inputs = ContextPackageImplementationExecutionStarter::new(
         &mut repository,
         &mut time,
         &mut precheck_capability,
+        &mut policy_filesystem,
     )
     .begin(BeginContextPackageImplementationExecutionRequest::new(
         id,
         expected_version,
     ))
-    .map_err(IpcErrorDto::from)?;
+    .map_err(start_error)?;
 
     let started_at_ms = time.now_ms().map_err(|_| IpcErrorDto::internal())?;
     let task_dto = TaskDto::from(inputs.task.clone());
@@ -259,8 +271,10 @@ pub fn handle_start_claude_implementation_context_package(
     let worktree_path = inputs.worktree_path;
     let brief = inputs.brief;
     let plan_text = inputs.plan_text;
+    let policy_permit = inputs.policy_permit;
     let mut repository_for_thread = ready.repository.clone();
     let mut time_for_thread = ready.time.clone();
+    let filesystem_for_thread = ready.filesystem.clone();
 
     std::thread::spawn(move || {
         let _unregister_guard = UnregisterOnDrop {
@@ -272,13 +286,15 @@ pub fn handle_start_claude_implementation_context_package(
             preflight_dir_handle,
             StdProcessRunner::new(),
         );
-        let mut adapter = ClaudeImplementationAdapter::new(
+        let adapter = ClaudeImplementationAdapter::new(
             executor_capability,
             StdProcessRunner::new(),
             executable_path,
             preflight_dir_path,
             redactor,
         );
+        let mut adapter =
+            PolicyGatedImplementationExecutor::new(adapter, filesystem_for_thread, policy_permit);
         let _ = ContextPackageImplementationExecutionRecorder::new(
             &mut repository_for_thread,
             &mut time_for_thread,
@@ -342,6 +358,10 @@ fn registry_conflict_error() -> IpcErrorDto {
     .into()
 }
 
+fn start_error(error: ApplicationError) -> IpcErrorDto {
+    error.into()
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn start_claude_implementation(
     state: tauri::State<'_, ManagedRuntime>,
@@ -370,7 +390,13 @@ pub fn cancel_claude_implementation(
 
 #[cfg(test)]
 mod tests {
-    use super::UnregisterOnDrop;
+    use chatoms_application::{
+        context_package_implementation_execution::ContextPackageImplementationExecutionInputs,
+        error::ApplicationError, implementation_execution::ImplementationExecutionInputs,
+    };
+    use chatoms_ports::error::FailureCategory;
+
+    use super::{UnregisterOnDrop, start_error};
     use crate::state::ImplementationRunRegistry;
     use chatoms_domain::TaskId;
 
@@ -411,5 +437,31 @@ mod tests {
             !registry.request_cancellation(task_id),
             "the guard's Drop must unregister the entry during unwinding, not only on normal exit"
         );
+    }
+
+    #[test]
+    fn permit_bearing_inputs_are_sendable_only_through_the_internal_worker_boundary() {
+        fn assert_send_static<T: Send + 'static>() {}
+
+        assert_send_static::<ImplementationExecutionInputs>();
+        assert_send_static::<ContextPackageImplementationExecutionInputs>();
+    }
+
+    #[test]
+    fn policy_start_rejection_uses_only_the_fixed_safe_ipc_surface() {
+        let error = start_error(ApplicationError::from_failure(
+            FailureCategory::InvalidState,
+            FailureCategory::InvalidState.default_severity(),
+            FailureCategory::InvalidState.default_retry(),
+        ));
+
+        assert_eq!(error.code, "APP_INVALID_STATE");
+        assert_eq!(
+            error.message,
+            "The operation is not valid in the current state."
+        );
+        for forbidden in ["path", "digest", "stdout", "approval"] {
+            assert!(!error.to_string().to_lowercase().contains(forbidden));
+        }
     }
 }

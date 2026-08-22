@@ -164,6 +164,13 @@ Review 결과 저장은 마스킹·크기 제한된 최종 review text와 outcom
 - 통과한 평가만 task id, exact version, `ProviderImplementation`, target identity digest에 결합된 in-memory `PolicyPermit`을 발급한다. permit은 public constructor, `Clone`, `Debug`, serde 구현, persistence·DTO·IPC/UI 변환이 없고 raw path/source/diff/plan/prompt/output/executable/environment/auth/session 정보를 담지 않는다.
 - 이 Unit은 read-only evaluation과 permit 발급만 구현한다. task transition, consent/Context Package, registry, adapter construction, subprocess spawn, Tauri/UI, provider/model 선택, `AutoFixing`/`ReviewFixing`, validation/merge gate는 변경하지 않는다. migration과 state-machine edge도 추가하지 않는다.
 
+## Provider Implementation policy execution gate (Phase 5g-2d)
+
+- LegacyPhase4와 ContextPackageV1 Implementation starter는 기존 isolation·Planning result·TaskBrief evidence를 확인한 뒤 중앙 Policy Engine을 평가한다. `Authorized(PolicyPermit)`만 fresh provider capability probe와 기존 consent/transition 경로로 진행하며, assessment 부재·closed denial·stale state/version/lease·approval/target mismatch와 repository/filesystem 오류에서는 consent, task/history/version, Context Package manifest, registry, adapter와 provider process가 모두 시작되지 않는다.
+- permit은 application 내부 input으로만 반환되어 Tauri detached worker로 한 번 이동한다. `TaskDto`, IPC request/response, `AppRuntime`, run registry, cancellation state와 persistence에는 들어가지 않으며 public constructor, `Clone`, `Debug`, serde 변환도 계속 없다.
+- worker는 permit을 소유한 policy-gated executor만 application recorder에 제공한다. 이 executor는 task id, transition 후 exact version, `ProviderImplementation` operation과 permit binding을 확인하고 worktree stable object identity를 다시 읽은 뒤에만 기존 Claude adapter를 호출한다. identity 교체·inspection 실패는 content-free `PreflightRejected`로 접어 subprocess를 시작하지 않으며, 이미 `Implementing`으로 전이된 task는 기존 recorder가 `RecoveryRequired`로 기록하고 active lease를 유지한다.
+- 이 Unit은 policy operation vocabulary, declaration migration, state-machine edge, provider/model UI, `AutoFixing`/`ReviewFixing`, validation/merge policy gate, Codex와 raw content 경계를 변경하지 않는다.
+
 ## ProjectRoot approval merge gate (Phase 5d-4c)
 
 - `approve_user_diff_and_start_merge`는 동일 `(task_id, approved_task_version, ProjectRoot)` scope의 fixed Cargo `Test`와 `Build` approval이 모두 존재하는지 먼저 확인한다. 누락·stale version·state mismatch·approval lookup failure이면 diff approval, `Merging` 전이, Git adapter 준비와 background execution을 시작하지 않는다.

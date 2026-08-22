@@ -12,8 +12,11 @@ use chatoms_application::{
         PolicyDecision, PolicyDenialReason, PolicyEngine, PolicyEvaluationRequest, PolicyOperation,
     },
 };
-use chatoms_domain::{HighRiskCategory, TaskId};
-use chatoms_ports::repository::HighRiskApprovalRecord;
+use chatoms_domain::{HighRiskCategory, OperationRiskKind, TaskId};
+use chatoms_ports::{
+    provider_implementation_policy::ProviderImplementationPolicyBinding,
+    repository::HighRiskApprovalRecord,
+};
 
 use operation_risk_support::fixture;
 
@@ -67,11 +70,41 @@ fn explicit_empty_declaration_authorizes_provider_implementation() {
         Vec::new(),
     );
 
-    assert!(matches!(
-        evaluate(&mut repository, &mut filesystem, task.id(), task.version())
-            .expect("evaluate policy"),
-        PolicyDecision::Authorized(_)
-    ));
+    let decision = evaluate(&mut repository, &mut filesystem, task.id(), task.version())
+        .expect("evaluate policy");
+    let PolicyDecision::Authorized(permit) = decision else {
+        panic!("explicit empty assessment must authorize");
+    };
+    let declaration = repository
+        .operation_risk_declarations
+        .get(&(
+            task.id(),
+            task.version(),
+            OperationRiskKind::ProviderImplementation,
+        ))
+        .expect("declaration");
+    assert_eq!(permit.task_id(), task.id());
+    assert_eq!(permit.approved_task_version(), task.version());
+    assert_eq!(
+        permit.operation_kind(),
+        OperationRiskKind::ProviderImplementation
+    );
+    assert_eq!(
+        permit.target_identity_digest(),
+        declaration.record.target_identity_digest
+    );
+    assert!(
+        permit.matches_worktree_object_identity(
+            "0000000000000002",
+            "22222222222222222222222222222222"
+        )
+    );
+    assert!(
+        !permit.matches_worktree_object_identity(
+            "0000000000000002",
+            "33333333333333333333333333333333"
+        )
+    );
 }
 
 #[test]

@@ -19,6 +19,7 @@ pub mod permissions;
 pub mod planning;
 pub mod process;
 pub mod provider;
+pub mod provider_implementation_policy;
 pub mod repository;
 pub mod review;
 pub mod validation;

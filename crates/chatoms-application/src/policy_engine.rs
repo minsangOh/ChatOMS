@@ -1,6 +1,6 @@
 use std::{collections::HashSet, path::Path};
 
-use chatoms_domain::{OperationRiskKind, TargetIdentityDigest, TaskId, TaskState};
+use chatoms_domain::{OperationRiskKind, TaskId, TaskState};
 use chatoms_ports::{
     error::FailureCategory,
     filesystem::FilesystemIdentityPort,
@@ -14,6 +14,11 @@ use crate::{
         derive_provider_implementation_target_identity_digest,
     },
 };
+
+mod implementation_binding;
+
+pub use implementation_binding::PolicyPermit;
+pub(crate) use implementation_binding::require_provider_implementation_permit;
 
 /// Closed Policy Engine operation vocabulary for Phase 5g-2c.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,47 +50,6 @@ pub enum PolicyDecision {
     Authorized(PolicyPermit),
     AssessmentRequired,
     Denied(PolicyDenialReason),
-}
-
-/// In-memory capability issued only by [`PolicyEngine`].
-///
-/// It deliberately has no public constructor or fields and does not implement
-/// `Clone`, `Debug`, `Serialize`, or `Deserialize`. No persistence, DTO, or IPC
-/// conversion is defined.
-///
-/// ```compile_fail
-/// use chatoms_application::policy_engine::PolicyPermit;
-/// fn clone_permit(permit: PolicyPermit) { let _ = permit.clone(); }
-/// ```
-///
-/// ```compile_fail
-/// use chatoms_application::policy_engine::PolicyPermit;
-/// fn debug_permit(permit: &PolicyPermit) { let _ = format!("{permit:?}"); }
-/// ```
-///
-/// ```compile_fail
-/// use chatoms_application::policy_engine::PolicyPermit;
-/// fn expose_task_id(permit: PolicyPermit) { let _ = permit.task_id; }
-/// ```
-pub struct PolicyPermit {
-    task_id: TaskId,
-    approved_task_version: u64,
-    operation_kind: OperationRiskKind,
-    target_identity_digest: TargetIdentityDigest,
-}
-
-impl PolicyPermit {
-    pub(crate) fn matches_provider_implementation(
-        &self,
-        task_id: TaskId,
-        expected_version: u64,
-        target_identity_digest: TargetIdentityDigest,
-    ) -> bool {
-        self.task_id == task_id
-            && self.approved_task_version == expected_version
-            && self.operation_kind == OperationRiskKind::ProviderImplementation
-            && self.target_identity_digest == target_identity_digest
-    }
 }
 
 pub struct PolicyEngine<'a, R, F> {
@@ -249,6 +213,8 @@ where
             approved_task_version: request.expected_version,
             operation_kind: OperationRiskKind::ProviderImplementation,
             target_identity_digest,
+            worktree_volume_serial_hex: live_worktree.volume_serial_hex,
+            worktree_file_id_hex: live_worktree.file_id_hex,
         };
         debug_assert!(permit.matches_provider_implementation(
             task.id(),

@@ -9,7 +9,9 @@ use std::path::Path;
 
 use crate::error::PortFailure;
 use crate::process::CancellationSignal;
+use crate::provider_implementation_policy::ProviderImplementationPolicyBinding;
 use crate::repository::ImplementationResultOutcome;
+use chatoms_domain::TaskId;
 
 /// The three fixed `TaskBrief` fields plus the previously stored Claude
 /// Planning result text a Claude Implementation attempt is run against,
@@ -58,4 +60,28 @@ pub trait ClaudeImplementationExecutor {
         brief: ImplementationExecutionBrief<'_>,
         cancellation: &dyn CancellationSignal,
     ) -> Result<ImplementationExecutionStartOutcome, PortFailure>;
+}
+
+pub trait PolicyGatedClaudeImplementationExecutor {
+    fn start_implementation(
+        &mut self,
+        task_id: TaskId,
+        started_task_version: u64,
+        worktree: &Path,
+        brief: ImplementationExecutionBrief<'_>,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<ImplementationExecutionStartOutcome, PortFailure>;
+}
+
+pub fn binding_matches_started_task(
+    binding: &dyn ProviderImplementationPolicyBinding,
+    task_id: TaskId,
+    started_task_version: u64,
+) -> bool {
+    binding.task_id() == task_id
+        && binding
+            .approved_task_version()
+            .checked_add(1)
+            .is_some_and(|version| version == started_task_version)
+        && binding.operation_kind() == chatoms_domain::OperationRiskKind::ProviderImplementation
 }

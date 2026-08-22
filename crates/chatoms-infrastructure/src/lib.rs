@@ -15,6 +15,7 @@ pub mod merge_abort;
 pub mod merge_conflict_inspection;
 pub mod merge_continue;
 pub mod merge_execution;
+pub mod policy_gated_implementation;
 pub mod process;
 pub mod provider;
 pub mod redaction;
