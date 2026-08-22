@@ -544,6 +544,62 @@ it("shows a safe recovery notice when Claude Review cancel finds no matching reg
   expect(await screen.findByText(/No active Claude Review execution was found/)).toBeVisible();
 });
 
+it("shows read-only post-merge validation results for a completed task", async () => {
+  const getPostMergeValidationResults = vi.fn().mockResolvedValue([
+    {
+      commandKind: "test",
+      attemptSequence: 1,
+      outcome: "success",
+      exitCode: 0,
+      safeSummary: "post-merge validation completed successfully",
+      startedAtMs: 1,
+      completedAtMs: 2,
+    },
+    {
+      commandKind: "build",
+      attemptSequence: 1,
+      outcome: "success",
+      exitCode: 0,
+      safeSummary: "post-merge validation completed successfully",
+      startedAtMs: 3,
+      completedAtMs: 4,
+    },
+  ]);
+  const { isolation } = renderActiveTask("completed", { getPostMergeValidationResults });
+
+  expect(await screen.findByRole("heading", { name: "Post-merge validation results" })).toBeVisible();
+  expect(screen.getByText("Test")).toBeVisible();
+  expect(screen.getByText("Build")).toBeVisible();
+  expect(screen.getAllByText(/Outcome: success/)).toHaveLength(2);
+  expect(screen.getAllByText("post-merge validation completed successfully")).toHaveLength(2);
+  expect(getPostMergeValidationResults).toHaveBeenCalledWith(isolation.taskId);
+  expect(document.body.textContent).not.toContain("C:\\\\private");
+});
+
+it("shows a safe empty state for a RecoveryRequired task without post-merge results", async () => {
+  const getPostMergeValidationResults = vi.fn().mockResolvedValue([]);
+  const { isolation } = renderActiveTask("recoveryRequired", { getPostMergeValidationResults });
+
+  expect(await screen.findByText("No post-merge validation results are available for this task.")).toBeVisible();
+  expect(getPostMergeValidationResults).toHaveBeenCalledWith(isolation.taskId);
+});
+
+it("does not fetch post-merge results while validation is still running", async () => {
+  const getPostMergeValidationResults = vi.fn().mockResolvedValue([]);
+  renderActiveTask("postMergeTesting", { getPostMergeValidationResults });
+
+  await screen.findByText(/Post-merge validation is pending/);
+  await waitFor(() => expect(getPostMergeValidationResults).not.toHaveBeenCalled());
+});
+
+it("shows a safe error state when post-merge results cannot be loaded", async () => {
+  const getPostMergeValidationResults = vi.fn().mockRejectedValue(new Error("raw repository failure"));
+  renderActiveTask("completed", { getPostMergeValidationResults });
+
+  expect(await screen.findByText("Post-merge validation results could not be loaded. Refresh to try again.")).toBeVisible();
+  expect(document.body.textContent).not.toContain("raw repository failure");
+});
+
 it("shows the stored Claude Review result read-only while awaiting user diff approval", async () => {
   const getReviewResult = vi.fn().mockResolvedValue({
     outcome: "completed",
@@ -1351,10 +1407,256 @@ it("shows merge progress and safe terminal merge guidance without a cancel actio
 
 it("shows conflict and recovery messages without exposing Git command output", async () => {
   const { unmount } = renderActiveTask("mergeConflict");
-  expect(await screen.findByText(/Git reported a merge conflict/)).toBeVisible();
+  expect(await screen.findByText(/No merge conflict inspection is available/)).toBeVisible();
   expect(document.body.textContent).not.toContain("fatal:");
   unmount();
 
   renderActiveTask("recoveryRequired");
   expect(await screen.findByText("The task result could not be confirmed. Review the repository safely before proceeding.")).toBeVisible();
+});
+
+it("shows only typed merge-conflict counts and fixed safe messages", async () => {
+  const counts = {
+    total: 2,
+    bothModified: 1,
+    bothAdded: 0,
+    bothDeleted: 0,
+    addedByUs: 0,
+    addedByThem: 1,
+    deletedByUs: 0,
+    deletedByThem: 0,
+  } as const;
+  const getMergeConflictInspection = vi.fn().mockResolvedValue({
+    outcome: "confirmedUnresolved",
+    counts,
+  });
+  const { isolation, unmount } = renderActiveTask("mergeConflict", { getMergeConflictInspection });
+  expect(await screen.findByText("Git reported merge conflicts. ChatOMS did not modify or resolve them.")).toBeVisible();
+  expect(screen.getByText("Total: 2")).toBeVisible();
+  expect(screen.getByText("Both modified: 1")).toBeVisible();
+  expect(screen.getByText("Added by them: 1")).toBeVisible();
+  expect(document.body.textContent).not.toContain("tracked.txt");
+  expect(getMergeConflictInspection).toHaveBeenCalledWith(isolation.taskId);
+  expect(screen.queryByRole("button", { name: "Refresh isolation" })).toBeNull();
+  unmount();
+
+  for (const outcome of [
+    ["resolvedPendingConfirmation", "Git no longer reports unmerged entries, but ChatOMS has not confirmed or completed the merge."],
+    ["inconsistent", "The saved task and current Git merge state do not match. No merge action was attempted."],
+    ["unavailable", "The merge conflict state could not be verified safely. No merge action was attempted."],
+  ] as const) {
+    const { unmount: unmountOutcome } = renderActiveTask("mergeConflict", {
+      getMergeConflictInspection: async () => ({ outcome: outcome[0], counts }),
+    });
+    expect(await screen.findByText(outcome[1])).toBeVisible();
+    unmountOutcome();
+  }
+});
+
+it("does not inspect Git for non-conflict task states", async () => {
+  const getMergeConflictInspection = vi.fn();
+  for (const taskState of ["merging", "postMergeTesting", "completed", "recoveryRequired"] as const) {
+    const { unmount } = renderActiveTask(taskState, { getMergeConflictInspection });
+    await screen.findByLabelText("Isolation for Foundation");
+    await waitFor(() => expect(getMergeConflictInspection).not.toHaveBeenCalled());
+    unmount();
+  }
+});
+
+const noConflictCounts = {
+  total: 0,
+  bothModified: 0,
+  bothAdded: 0,
+  bothDeleted: 0,
+  addedByUs: 0,
+  addedByThem: 0,
+  deletedByUs: 0,
+  deletedByThem: 0,
+} as const;
+
+it("shows the fixed staged-resolution confirmation action only when Git reports it resolved", async () => {
+  const { unmount } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+  });
+  expect(await screen.findByRole("button", { name: "Confirm the staged merge resolution" })).toBeVisible();
+  unmount();
+
+  for (const outcome of ["confirmedUnresolved", "inconsistent", "unavailable"] as const) {
+    const { unmount: unmountOutcome } = renderActiveTask("mergeConflict", {
+      getMergeConflictInspection: async () => ({ outcome, counts: noConflictCounts }),
+    });
+    await screen.findByLabelText("Isolation for Foundation");
+    expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+    unmountOutcome();
+  }
+
+  const { unmount: unmountLoading } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: () => new Promise(() => {}),
+  });
+  await screen.findByText("Checking the Git merge state safely…");
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+  unmountLoading();
+
+  const { unmount: unmountError } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => { throw new Error("boom"); },
+  });
+  await screen.findByText("The merge conflict state could not be loaded safely.");
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+  unmountError();
+});
+
+it("requires an explicit checkbox before confirming, prevents duplicate submission, and reflects Merging on success", async () => {
+  const confirmManualResolutionAndStartMergeContinue = vi.fn().mockResolvedValue(restoredTask("merging"));
+  const { isolation } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    confirmManualResolutionAndStartMergeContinue,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Confirm the staged merge resolution" }));
+  expect(await screen.findByRole("heading", { name: "Confirm the staged merge resolution" })).toBeVisible();
+  expect(
+    screen.getByText(/Git reports no unresolved entries\. Continuing will create a merge commit from the currently staged resolution/),
+  ).toBeVisible();
+  expect(screen.getByText("This confirmation is separate from the earlier task diff approval.")).toBeVisible();
+  expect(document.body.textContent).not.toContain("fatal:");
+  expect(screen.queryByRole("button", { name: /abort/i })).toBeNull();
+  expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
+  expect(screen.queryByRole("button", { name: /automatic/i })).toBeNull();
+
+  const confirmButton = screen.getByRole("button", { name: "Confirm and continue" });
+  expect(confirmButton).toBeDisabled();
+  expect(confirmManualResolutionAndStartMergeContinue).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed the staged merge resolution/ }));
+  expect(confirmButton).not.toBeDisabled();
+
+  fireEvent.click(confirmButton);
+  fireEvent.click(confirmButton);
+
+  await waitFor(() => expect(confirmManualResolutionAndStartMergeContinue).toHaveBeenCalledTimes(1));
+  expect(confirmManualResolutionAndStartMergeContinue).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion);
+  expect(await screen.findByText(/approved change is being committed and merged/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: /cancel merge/i })).toBeNull();
+});
+
+it("keeps the confirmation dialog open and does not advance the task when the combined command fails", async () => {
+  const confirmManualResolutionAndStartMergeContinue = vi.fn().mockRejectedValue(
+    new FrontendError({
+      code: "APP_CONFLICT",
+      message: "The staged resolution no longer matches the confirmed digest.",
+      severity: "error",
+      retry: "afterStateRefresh",
+    }),
+  );
+  renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    confirmManualResolutionAndStartMergeContinue,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Confirm the staged merge resolution" }));
+  fireEvent.click(await screen.findByRole("checkbox", { name: /I reviewed the staged merge resolution/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and continue" }));
+
+  expect(await screen.findByText("The staged resolution no longer matches the confirmed digest.")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "Confirm the staged merge resolution" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Confirm and continue" })).toBeVisible();
+  expect(confirmManualResolutionAndStartMergeContinue).toHaveBeenCalledTimes(1);
+});
+
+it("shows the fixed merge-abort action only for the three approved inspection outcomes", async () => {
+  for (const outcome of [
+    "confirmedUnresolved",
+    "resolvedPendingConfirmation",
+    "restoredPendingAbortConfirmation",
+  ] as const) {
+    const { unmount } = renderActiveTask("mergeConflict", {
+      getMergeConflictInspection: async () => ({ outcome, counts: noConflictCounts }),
+    });
+    expect(await screen.findByRole("button", { name: "Abort the in-progress merge" })).toBeVisible();
+    unmount();
+  }
+
+  for (const outcome of ["inconsistent", "unavailable"] as const) {
+    const { unmount } = renderActiveTask("mergeConflict", {
+      getMergeConflictInspection: async () => ({ outcome, counts: noConflictCounts }),
+    });
+    await screen.findByLabelText("Isolation for Foundation");
+    expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+    unmount();
+  }
+
+  const { unmount: unmountLoading } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: () => new Promise(() => {}),
+  });
+  await screen.findByText("Checking the Git merge state safely…");
+  expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+  unmountLoading();
+});
+
+it("shows a safe restored-repository message for restoredPendingAbortConfirmation without raw Git content", async () => {
+  renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "restoredPendingAbortConfirmation", counts: noConflictCounts }),
+  });
+  expect(
+    await screen.findByText(/Git reports no merge in progress, and the original checkout already matches the base state/),
+  ).toBeVisible();
+  expect(document.body.textContent).not.toContain("fatal:");
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+});
+
+it("requires an explicit checkbox before confirming a merge abort, prevents duplicate submission, and hides the continue action once started", async () => {
+  const confirmMergeAbortAndStart = vi.fn().mockResolvedValue({ started: true });
+  const { isolation } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    confirmMergeAbortAndStart,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Abort the in-progress merge" }));
+  expect(await screen.findByRole("heading", { name: "Abort the in-progress merge" })).toBeVisible();
+  expect(
+    screen.getByText(/This discards the staged merge resolution in the original checkout and restores it to the base commit/),
+  ).toBeVisible();
+  expect(
+    screen.getByText("This approval is separate from the earlier task diff approval and from any staged-resolution confirmation."),
+  ).toBeVisible();
+  expect(document.body.textContent).not.toContain("fatal:");
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+
+  const confirmButton = screen.getByRole("button", { name: "Confirm abort" });
+  expect(confirmButton).toBeDisabled();
+  expect(confirmMergeAbortAndStart).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("checkbox", { name: "I approve aborting the in-progress merge and cancelling this task." }));
+  expect(confirmButton).not.toBeDisabled();
+
+  fireEvent.click(confirmButton);
+  fireEvent.click(confirmButton);
+
+  await waitFor(() => expect(confirmMergeAbortAndStart).toHaveBeenCalledTimes(1));
+  expect(confirmMergeAbortAndStart).toHaveBeenCalledWith(isolation.taskId, isolation.taskVersion);
+
+  // Task state stays `mergeConflict` while the background abort runs, so
+  // both the continue and (a second) abort action must be replaced by a
+  // status message rather than remaining independently clickable.
+  expect(await screen.findByText("A merge abort is in progress for this task. This status updates automatically.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+});
+
+it("shows a safe already-processing notice without a raw error when the abort command reports started: false", async () => {
+  const confirmMergeAbortAndStart = vi.fn().mockResolvedValue({ started: false });
+  renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "confirmedUnresolved", counts: noConflictCounts }),
+    confirmMergeAbortAndStart,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Abort the in-progress merge" }));
+  fireEvent.click(await screen.findByRole("checkbox", { name: "I approve aborting the in-progress merge and cancelling this task." }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm abort" }));
+
+  expect(
+    await screen.findByText("A merge abort is already in progress for this task. Refresh to check its status."),
+  ).toBeVisible();
+  expect(screen.getByRole("heading", { name: "Abort the in-progress merge" })).toBeVisible();
+  expect(confirmMergeAbortAndStart).toHaveBeenCalledTimes(1);
 });

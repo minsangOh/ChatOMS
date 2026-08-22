@@ -11,6 +11,7 @@ use chatoms_ports::{
     error::{CategorizedFailure, FailureCategory, PortFailure},
     filesystem::FilesystemIdentityPort,
     git::{GitService, RepositoryKind},
+    manual_merge_resolution::ManualResolutionDigest,
     path::ResolvedAppPaths,
     permissions::PermissionStatus,
     provider::ProviderKind,
@@ -18,6 +19,7 @@ use chatoms_ports::{
         ActiveLease, AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
         DiffApprovalRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
         GitOperationReceipt, GitOperationReceiptKind, HighRiskApprovalRecord,
+        ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
         PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
         ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
         ProviderConsent, RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
@@ -692,6 +694,16 @@ impl FoundationRepository for SharedFoundationRepository {
         })
     }
 
+    fn get_diff_approval_for_task_version(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_diff_approval_for_task_version(task_id, approved_task_version)
+        })
+    }
+
     fn ensure_diff_approval(
         &mut self,
         task_id: TaskId,
@@ -706,6 +718,108 @@ impl FoundationRepository for SharedFoundationRepository {
                 diff_content_hash,
                 approved_at_ms,
             )
+        })
+    }
+
+    fn get_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_manual_merge_resolution_confirmation(
+                task_id,
+                merge_conflict_task_version,
+                resolution_digest,
+            )
+        })
+    }
+
+    fn ensure_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Result<ManualMergeResolutionConfirmationRecord, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.ensure_manual_merge_resolution_confirmation(
+                task_id,
+                merge_conflict_task_version,
+                source_approval_task_version,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                resolution_digest,
+                confirmed_at_ms,
+            )
+        })
+    }
+
+    fn save_manual_merge_resolution_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_manual_merge_resolution_transition(
+                expected_version,
+                task,
+                transition,
+                resolution_digest,
+            )
+        })
+    }
+
+    fn get_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+    ) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_merge_abort_approval(task_id, merge_conflict_task_version)
+        })
+    }
+
+    fn ensure_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        approved_at_ms: i64,
+    ) -> Result<MergeAbortApprovalRecord, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.ensure_merge_abort_approval(
+                task_id,
+                merge_conflict_task_version,
+                source_approval_task_version,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                approved_at_ms,
+            )
+        })
+    }
+
+    fn save_merge_abort_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_merge_abort_transition(expected_version, task, transition, terminal)
         })
     }
 

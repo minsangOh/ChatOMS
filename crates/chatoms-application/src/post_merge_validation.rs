@@ -71,18 +71,12 @@ where
             .repository
             .list_task_transitions(request.task_id)
             .map_err(repository_error)?;
-        let Some(chain) = transitions.windows(3).find(|chain| {
-            chain[0].to_state() == TaskState::AwaitingUserDiffApproval
-                && chain[1].from_state() == Some(TaskState::AwaitingUserDiffApproval)
-                && chain[1].to_state() == TaskState::Merging
-                && chain[2].from_state() == Some(TaskState::Merging)
-                && chain[2].to_state() == TaskState::PostMergeTesting
-                && chain[2].task_version() == request.expected_version
-        }) else {
+        let Some(approval_task_version) =
+            crate::merge_provenance::resolve_post_merge_approval_version(&transitions, &task)
+        else {
             return Err(category_error(FailureCategory::InvariantViolation));
         };
-        let approval_task_version = chain[0].task_version();
-        let mut approvals = self
+        let approvals = self
             .repository
             .list_validation_command_approvals_for_scope(
                 request.task_id,
@@ -90,11 +84,12 @@ where
                 ValidationExecutionScope::ProjectRoot,
             )
             .map_err(repository_error)?;
-        if ![ValidationCommandKind::Test, ValidationCommandKind::Build]
-            .iter()
-            .all(|required| approvals.iter().any(|approval| approval.kind == *required))
-        {
-            return Err(category_error(FailureCategory::NotFound));
+        let mut ordered_approvals = Vec::with_capacity(2);
+        for required in [ValidationCommandKind::Test, ValidationCommandKind::Build] {
+            let Some(approval) = approvals.iter().find(|approval| approval.kind == required) else {
+                return Err(category_error(FailureCategory::NotFound));
+            };
+            ordered_approvals.push(approval.clone());
         }
 
         let project = self
@@ -115,7 +110,7 @@ where
         if live_root.volume_serial_hex != project_identity.root_volume_serial_hex
             || live_root.file_id_hex != project_identity.root_file_id_hex
             || live_root.canonical_path.to_string_lossy() != project.root_path
-            || approvals.iter().any(|approval| {
+            || ordered_approvals.iter().any(|approval| {
                 approval.execution_scope != ValidationExecutionScope::ProjectRoot
                     || approval.approved_task_version != approval_task_version
                     || approval.target_project_id != Some(task.project_id())
@@ -128,12 +123,6 @@ where
         {
             return Err(category_error(FailureCategory::InvariantViolation));
         }
-        approvals.sort_by_key(|approval| {
-            ValidationCommandKind::ALL
-                .iter()
-                .position(|kind| *kind == approval.kind)
-                .unwrap_or(usize::MAX)
-        });
         Ok(PostMergeValidationInputs {
             task: TaskView::from(&task),
             approval_task_version,
@@ -142,7 +131,7 @@ where
                 project_identity_revision: project_identity.revision,
                 directory_identity: live_root,
             },
-            approvals,
+            approvals: ordered_approvals,
         })
     }
 }

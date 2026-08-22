@@ -3,7 +3,10 @@ mod context_package_planning_readiness;
 mod context_package_preparation;
 mod context_package_review_readiness;
 mod high_risk_approval;
+mod merge_abort;
+mod merge_conflict_inspection;
 mod planning_result;
+mod post_merge_validation_result;
 mod provider_eligibility;
 mod review_result;
 mod user_diff_review;
@@ -14,7 +17,14 @@ pub use context_package_planning_readiness::ContextPackagePlanningReadinessDto;
 pub use context_package_preparation::{ContextPackageDataScopeDto, ContextPackagePreparationDto};
 pub use context_package_review_readiness::ContextPackageReviewReadinessDto;
 pub use high_risk_approval::{HighRiskApprovalDto, HighRiskApprovalStatusDto, HighRiskCategoryDto};
+pub use merge_abort::MergeAbortStartDto;
+pub use merge_conflict_inspection::{
+    MergeConflictCountsDto, MergeConflictInspectionDto, MergeConflictInspectionOutcomeDto,
+};
 pub use planning_result::{PlanningOutcomeDto, PlanningResultDto};
+pub use post_merge_validation_result::{
+    PostMergeValidationOutcomeDto, PostMergeValidationResultDto,
+};
 pub use provider_eligibility::{
     ContractStatusDto, EligibilityBlockingReasonDto, ProviderEligibilityDto, ProviderKindDto,
     WorkKindDto,

@@ -70,6 +70,8 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
     startClaudePlanning: async () => { throw new Error("not implemented in frontend tests"); },
     cancelClaudePlanning: async () => { throw new Error("not implemented in frontend tests"); },
     getPlanningResult: async () => null,
+    getPostMergeValidationResults: async () => [],
+    getMergeConflictInspection: async () => null,
     getContextPackagePlanningReadiness: async () => ({ ready: false }),
     startClaudePlanningContextPackage: async () => { throw new Error("not implemented in frontend tests"); },
     startClaudeImplementation: async () => { throw new Error("not implemented in frontend tests"); },
@@ -96,6 +98,8 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
     getUserDiffForReview: async () => { throw new Error("not implemented in frontend tests"); },
     approveUserDiff: async () => { throw new Error("not implemented in frontend tests"); },
     approveUserDiffAndStartMerge: async () => { throw new Error("not implemented in frontend tests"); },
+    confirmManualResolutionAndStartMergeContinue: async () => { throw new Error("not implemented in frontend tests"); },
+    confirmMergeAbortAndStart: async () => { throw new Error("not implemented in frontend tests"); },
     ...overrides,
   };
 }

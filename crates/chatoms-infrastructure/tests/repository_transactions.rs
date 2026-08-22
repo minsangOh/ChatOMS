@@ -12,14 +12,16 @@ use chatoms_domain::{
 };
 use chatoms_infrastructure::database::{DatabaseConnection, SqliteFoundationRepository};
 use chatoms_ports::diff::DiffContentHash;
+use chatoms_ports::manual_merge_resolution::ManualResolutionDigest;
 use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
     ContextPackageManifestRecord, DiffApprovalRecord, FoundationRepository, GitIsolationStatus,
     GitOperationReceiptKind, HighRiskApprovalRecord, ImplementationResultOutcome,
-    PlanningResultOutcome, PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
-    ProviderConsent, RepositoryError, RepositoryErrorCode, ReviewResultOutcome, TaskBriefRecord,
-    TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
-    TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+    ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord, PlanningResultOutcome,
+    PostMergeValidationResultAttempt, PostMergeValidationResultOutcome, ProviderConsent,
+    RepositoryError, RepositoryErrorCode, ReviewResultOutcome, TaskBriefRecord, TaskGitIsolation,
+    TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
+    ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
     ValidationCommandResultOutcome,
 };
 use rusqlite::params;
@@ -164,6 +166,12 @@ fn advance_to_awaiting_user_diff_approval(
 ) {
     advance_to_reviewing(repository, task);
     advance(repository, task, TaskState::AwaitingUserDiffApproval, 190);
+}
+
+fn advance_to_merge_conflict(repository: &mut impl FoundationRepository, task: &mut Task) {
+    advance_to_awaiting_user_diff_approval(repository, task);
+    advance(repository, task, TaskState::Merging, 200);
+    advance(repository, task, TaskState::MergeConflict, 210);
 }
 
 fn project_root_validation_approval(
@@ -7080,4 +7088,735 @@ fn save_context_package_implementation_transition_rejects_a_non_completed_stored
             .expect("history unchanged"),
         history_before
     );
+}
+
+fn digest_of(byte: u8) -> ManualResolutionDigest {
+    ManualResolutionDigest::from_digest_bytes([byte; 32])
+}
+
+#[test]
+fn ensure_manual_merge_resolution_confirmation_first_call_creates_the_row() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    let created = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest_of(1),
+            300,
+        )
+        .expect("first call must create the confirmation");
+    assert_eq!(
+        created,
+        ManualMergeResolutionConfirmationRecord {
+            task_id: task.id(),
+            merge_conflict_task_version: expected_version,
+            source_approval_task_version: 0,
+            base_commit: "a".repeat(40),
+            task_commit: "b".repeat(40),
+            merge_head_commit: "b".repeat(40),
+            resolution_digest: digest_of(1),
+            confirmed_at_ms: 300,
+        }
+    );
+    assert_eq!(
+        count_rows(
+            &fixture.database.open_raw(),
+            "task_manual_merge_resolution_confirmations"
+        ),
+        1
+    );
+}
+
+#[test]
+fn ensure_manual_merge_resolution_confirmation_reuses_the_exact_identity_idempotently() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    let first = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest_of(1),
+            300,
+        )
+        .expect("first call creates the confirmation");
+    let second = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest_of(1),
+            999,
+        )
+        .expect("second call reuses the existing confirmation");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        second.confirmed_at_ms, 300,
+        "the original timestamp must be preserved"
+    );
+    assert_eq!(
+        count_rows(
+            &fixture.database.open_raw(),
+            "task_manual_merge_resolution_confirmations"
+        ),
+        1
+    );
+}
+
+#[test]
+fn ensure_manual_merge_resolution_confirmation_for_different_digests_are_independent() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    let first = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest_of(1),
+            300,
+        )
+        .expect("create the first digest's confirmation");
+    let second = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"c".repeat(40),
+            &"c".repeat(40),
+            digest_of(2),
+            310,
+        )
+        .expect("create the independent second digest's confirmation");
+
+    assert_ne!(first, second);
+    assert_eq!(
+        repository
+            .get_manual_merge_resolution_confirmation(task.id(), expected_version, digest_of(1))
+            .expect("read the first digest back"),
+        Some(first)
+    );
+    assert_eq!(
+        repository
+            .get_manual_merge_resolution_confirmation(task.id(), expected_version, digest_of(2))
+            .expect("read the second digest back"),
+        Some(second)
+    );
+    assert_eq!(
+        count_rows(
+            &fixture.database.open_raw(),
+            "task_manual_merge_resolution_confirmations"
+        ),
+        2
+    );
+}
+
+#[test]
+fn ensure_manual_merge_resolution_confirmation_rejects_a_task_not_in_merge_conflict() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (task, _) = create_task(&mut repository, fixture.project_id);
+    let expected_version = task.version();
+
+    let error = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest_of(1),
+            300,
+        )
+        .expect_err("a task not in MergeConflict must be rejected");
+    assert_code(error, RepositoryErrorCode::InvalidAggregate);
+    assert_eq!(
+        count_rows(
+            &fixture.database.open_raw(),
+            "task_manual_merge_resolution_confirmations"
+        ),
+        0
+    );
+}
+
+#[test]
+fn ensure_manual_merge_resolution_confirmation_rejects_a_stale_version_without_writing_anything() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let stale_version = task.version() - 1;
+
+    let error = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            stale_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest_of(1),
+            300,
+        )
+        .expect_err("a stale expected version must be rejected");
+    assert_code(error, RepositoryErrorCode::VersionConflict);
+    assert_eq!(
+        count_rows(
+            &fixture.database.open_raw(),
+            "task_manual_merge_resolution_confirmations"
+        ),
+        0
+    );
+}
+
+#[test]
+fn get_manual_merge_resolution_confirmation_fails_closed_on_a_corrupted_persisted_digest() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    drop(connection);
+
+    let raw = fixture.database.open_raw();
+    raw.execute_batch("PRAGMA ignore_check_constraints = 1;")
+        .expect("disable CHECK enforcement for this fixture connection only");
+    raw.execute(
+        "INSERT INTO task_manual_merge_resolution_confirmations (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex,
+            resolution_digest_hex, confirmed_at_ms
+         ) VALUES (?1, ?2, 0, ?3, ?4, ?4, 'not-a-valid-hex-digest', 100)",
+        params![
+            task.id().to_string(),
+            expected_version as i64,
+            "a".repeat(40),
+            "b".repeat(40),
+        ],
+    )
+    .expect("insert a row the CHECK constraint would normally reject");
+    drop(raw);
+
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let error = repository
+        .get_manual_merge_resolution_confirmation(task.id(), expected_version, digest_of(1))
+        .expect_err("a malformed persisted digest must fail the lookup closed");
+    assert_code(error, RepositoryErrorCode::InvalidPersistenceState);
+}
+
+#[test]
+fn save_manual_merge_resolution_transition_commits_merging_once_confirmed() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest_of(1),
+            300,
+        )
+        .expect("record the confirmation ahead of the transition");
+    let lease_before = repository.active_lease().expect("read lease before");
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Merging, 310)
+        .expect("domain transition");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 310);
+    repository
+        .save_manual_merge_resolution_transition(expected_version, &task, &record, digest_of(1))
+        .expect("the exact confirmed digest must allow the transition to commit");
+
+    let persisted = repository
+        .get_task(task.id())
+        .expect("read task after")
+        .expect("task still exists");
+    assert_eq!(persisted.state(), TaskState::Merging);
+    assert_eq!(persisted.version(), expected_version + 1);
+    let lease_after = repository.active_lease().expect("read lease after");
+    assert_eq!(
+        lease_before.map(|lease| lease.task_id),
+        lease_after.map(|lease| lease.task_id),
+        "Merging is non-terminal and must keep the active lease"
+    );
+}
+
+#[test]
+fn save_manual_merge_resolution_transition_rejects_a_missing_confirmation_without_writing() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    let before = task.clone();
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Merging, 310)
+        .expect("domain transition");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 310);
+    let error = repository
+        .save_manual_merge_resolution_transition(expected_version, &task, &record, digest_of(1))
+        .expect_err("no confirmation exists for this exact identity yet");
+    assert_code(error, RepositoryErrorCode::InvalidAggregate);
+
+    assert_eq!(
+        repository.get_task(before.id()).expect("task unchanged"),
+        Some(before)
+    );
+}
+
+#[test]
+fn save_manual_merge_resolution_transition_rejects_a_task_not_in_merge_conflict() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_awaiting_user_diff_approval(&mut repository, &mut task);
+    let expected_version = task.version();
+    let before = task.clone();
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Merging, 310)
+        .expect("domain transition");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 310);
+    let error = repository
+        .save_manual_merge_resolution_transition(expected_version, &task, &record, digest_of(1))
+        .expect_err("a task that was never in MergeConflict must be rejected");
+    assert_code(error, RepositoryErrorCode::InvalidAggregate);
+
+    assert_eq!(
+        repository.get_task(before.id()).expect("task unchanged"),
+        Some(before)
+    );
+}
+
+#[test]
+fn ensure_merge_abort_approval_first_call_creates_the_row() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    let created = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect("first call must create the approval");
+    assert_eq!(
+        created,
+        MergeAbortApprovalRecord {
+            task_id: task.id(),
+            merge_conflict_task_version: expected_version,
+            source_approval_task_version: 0,
+            base_commit: "a".repeat(40),
+            task_commit: "b".repeat(40),
+            merge_head_commit: "b".repeat(40),
+            approved_at_ms: 300,
+        }
+    );
+    assert_eq!(
+        count_rows(&fixture.database.open_raw(), "task_merge_abort_approvals"),
+        1
+    );
+}
+
+#[test]
+fn ensure_merge_abort_approval_reuses_the_exact_identity_idempotently() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    let first = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect("first call creates the approval");
+    let second = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            999,
+        )
+        .expect("second call reuses the existing approval");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        second.approved_at_ms, 300,
+        "the original timestamp must be preserved"
+    );
+    assert_eq!(
+        count_rows(&fixture.database.open_raw(), "task_merge_abort_approvals"),
+        1
+    );
+}
+
+#[test]
+fn ensure_merge_abort_approval_rejects_a_mismatched_commit_identity_for_the_same_task_version() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect("create the first approval");
+
+    // Unlike `task_manual_merge_resolution_confirmations` (keyed by digest,
+    // so a different digest is always an independent row), a merge-abort
+    // approval's identity is `(task_id, merge_conflict_task_version)` alone
+    // -- a different commit identity for that same pair can never be a
+    // second row, and must not silently reuse the first row's stored
+    // values either.
+    let error = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"c".repeat(40),
+            &"c".repeat(40),
+            310,
+        )
+        .expect_err("a different commit identity for the same (task, version) must be rejected");
+    assert_code(error, RepositoryErrorCode::InvalidAggregate);
+    assert_eq!(
+        count_rows(&fixture.database.open_raw(), "task_merge_abort_approvals"),
+        1
+    );
+}
+
+#[test]
+fn ensure_merge_abort_approval_rejects_a_task_not_in_merge_conflict() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (task, _) = create_task(&mut repository, fixture.project_id);
+    let expected_version = task.version();
+
+    let error = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect_err("a task not in MergeConflict must be rejected");
+    assert_code(error, RepositoryErrorCode::InvalidAggregate);
+    assert_eq!(
+        count_rows(&fixture.database.open_raw(), "task_merge_abort_approvals"),
+        0
+    );
+}
+
+#[test]
+fn ensure_merge_abort_approval_rejects_a_stale_version_without_writing_anything() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let stale_version = task.version() - 1;
+
+    let error = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            stale_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect_err("a stale expected version must be rejected");
+    assert_code(error, RepositoryErrorCode::VersionConflict);
+    assert_eq!(
+        count_rows(&fixture.database.open_raw(), "task_merge_abort_approvals"),
+        0
+    );
+}
+
+#[test]
+fn get_merge_abort_approval_fails_closed_on_a_corrupted_persisted_commit() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    drop(connection);
+
+    let raw = fixture.database.open_raw();
+    raw.execute_batch("PRAGMA ignore_check_constraints = 1;")
+        .expect("disable CHECK enforcement for this fixture connection only");
+    raw.execute(
+        "INSERT INTO task_merge_abort_approvals (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+         ) VALUES (?1, ?2, 0, ?3, 'not-a-valid-hex-commit', 'not-a-valid-hex-commit', 100)",
+        params![
+            task.id().to_string(),
+            expected_version as i64,
+            "a".repeat(40),
+        ],
+    )
+    .expect("insert a row the CHECK constraint would normally reject");
+    drop(raw);
+
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let error = repository
+        .get_merge_abort_approval(task.id(), expected_version)
+        .expect_err("a malformed persisted commit must fail the lookup closed");
+    assert_code(error, RepositoryErrorCode::InvalidPersistenceState);
+}
+
+#[test]
+fn save_merge_abort_transition_commits_cancelled_and_releases_the_lease_once_approved() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect("record the approval ahead of the transition");
+    let lease_before = repository.active_lease().expect("read lease before");
+    assert_eq!(lease_before.map(|lease| lease.task_id), Some(task.id()));
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Cancelled, 310)
+        .expect("domain transition");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 310);
+    repository
+        .save_merge_abort_transition(expected_version, &task, &record, true)
+        .expect("an existing approval must allow the transition to commit");
+
+    let persisted = repository
+        .get_task(task.id())
+        .expect("read task after")
+        .expect("task still exists");
+    assert_eq!(persisted.state(), TaskState::Cancelled);
+    assert_eq!(persisted.version(), expected_version + 1);
+    let lease_after = repository.active_lease().expect("read lease after");
+    assert_eq!(
+        lease_after, None,
+        "Cancelled is terminal and must release the active lease in the same transaction"
+    );
+}
+
+#[test]
+fn save_merge_abort_transition_rejects_a_missing_approval_without_writing() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    let before = task.clone();
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Cancelled, 310)
+        .expect("domain transition");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 310);
+    let error = repository
+        .save_merge_abort_transition(expected_version, &task, &record, true)
+        .expect_err("no approval exists for this exact identity yet");
+    assert_code(error, RepositoryErrorCode::InvalidAggregate);
+
+    assert_eq!(
+        repository.get_task(before.id()).expect("task unchanged"),
+        Some(before.clone())
+    );
+    let lease_after = repository.active_lease().expect("read lease after");
+    assert_eq!(
+        lease_after.map(|lease| lease.task_id),
+        Some(before.id()),
+        "a rejected transition must not release the lease"
+    );
+}
+
+#[test]
+fn save_merge_abort_transition_rejects_a_task_not_in_merge_conflict() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let (mut task, _) = create_task(&mut repository, fixture.project_id);
+    advance_to_awaiting_user_diff_approval(&mut repository, &mut task);
+    let expected_version = task.version();
+    let before = task.clone();
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Cancelled, 310)
+        .expect("domain transition");
+    let record = transition(TaskStateTransitionId::new(), &task, previous_state, 310);
+    let error = repository
+        .save_merge_abort_transition(expected_version, &task, &record, true)
+        .expect_err("a task that was never in MergeConflict must be rejected");
+    assert_code(error, RepositoryErrorCode::InvalidAggregate);
+
+    assert_eq!(
+        repository.get_task(before.id()).expect("task unchanged"),
+        Some(before)
+    );
+}
+
+#[test]
+fn two_connections_ensuring_the_same_merge_abort_approval_concurrently_both_succeed_with_exactly_one_row()
+ {
+    let fixture = Fixture::new();
+    let (task, expected_version) = {
+        let mut connection = fixture.open();
+        let mut repository = SqliteFoundationRepository::new(&mut connection);
+        let (mut task, _) = create_task(&mut repository, fixture.project_id);
+        advance_to_merge_conflict(&mut repository, &mut task);
+        let expected_version = task.version();
+        (task, expected_version)
+    };
+
+    let path = Arc::new(fixture.database.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(2));
+    let (sender, receiver) = mpsc::channel();
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let path = Arc::clone(&path);
+        let barrier = Arc::clone(&barrier);
+        let sender = sender.clone();
+        let task_id = task.id();
+        handles.push(thread::spawn(move || {
+            let mut database = DatabaseConnection::open(path.as_ref()).expect("open connection");
+            let mut repository = SqliteFoundationRepository::new(&mut database);
+            barrier.wait();
+            let result = repository
+                .ensure_merge_abort_approval(
+                    task_id,
+                    expected_version,
+                    0,
+                    &"a".repeat(40),
+                    &"b".repeat(40),
+                    &"b".repeat(40),
+                    // Distinct timestamps prove whichever thread loses the race reuses the
+                    // winner's persisted value instead of its own.
+                    200 + index as i64,
+                )
+                .map_err(|error| error.code());
+            sender.send(result).expect("send ensure result");
+        }));
+    }
+    drop(sender);
+
+    let results = (0..2)
+        .map(|_| {
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("concurrent ensure timed out")
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        handle.join().expect("ensure thread panicked");
+    }
+
+    let successes = results
+        .iter()
+        .filter(|result| result.is_ok())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        successes.len(),
+        2,
+        "an idempotent create-or-reuse must let both concurrent callers succeed: {results:?}"
+    );
+    assert_eq!(
+        successes[0], successes[1],
+        "both concurrent callers must observe the exact same persisted approval, proving no \
+         duplicate PK failure was exposed as a distinct successful result"
+    );
+
+    let connection = fixture.database.open_raw();
+    assert_eq!(count_rows(&connection, "task_merge_abort_approvals"), 1);
+    assert_eq!(foreign_key_violation_count(&connection), 0);
 }

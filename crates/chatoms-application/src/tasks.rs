@@ -9,12 +9,16 @@ use chatoms_ports::{
     TimeProvider,
     diff::DiffContentHash,
     error::FailureCategory,
+    manual_merge_resolution::ManualResolutionDigest,
+    merge_abort::MergeAbortOutcome,
+    merge_continue::MergeContinueOutcome,
     merge_execution::MergeExecutionOutcome,
     provider::ProviderKind,
     repository::{
         ActiveLease, ContextPackagePreparation, DiffApprovalRecord, FoundationRepository,
         GitIsolationStatus, HighRiskApprovalRecord, ImplementationResultOutcome,
-        PlanningResultOutcome, PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
+        ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord, PlanningResultOutcome,
+        PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
         PostMergeValidationResultRecord, ProviderConsent, ReviewResultOutcome, TaskBriefRecord,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
         ValidationCommandResultAttempt, ValidationCommandResultOutcome,
@@ -616,6 +620,225 @@ impl RecordMergeResultRequest {
     }
 }
 
+/// Records (creates or reuses) an immutable manual-resolution confirmation
+/// for one task's `MergeConflict`. Carries every content-free field a
+/// confirmation row needs — never touches task state, version, transition
+/// history, or the `ActiveTaskLease`.
+pub struct RecordManualMergeResolutionConfirmationRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    source_approval_task_version: u64,
+    base_commit: String,
+    task_commit: String,
+    merge_head_commit: String,
+    resolution_digest: ManualResolutionDigest,
+    confirmed_at_ms: i64,
+}
+
+impl RecordManualMergeResolutionConfirmationRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        source_approval_task_version: u64,
+        base_commit: String,
+        task_commit: String,
+        merge_head_commit: String,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            source_approval_task_version,
+            base_commit,
+            task_commit,
+            merge_head_commit,
+            resolution_digest,
+            confirmed_at_ms,
+        }
+    }
+}
+
+/// Read-only view of an immutable [`ManualMergeResolutionConfirmationRecord`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualMergeResolutionConfirmationView {
+    pub task_id: TaskId,
+    pub merge_conflict_task_version: u64,
+    pub source_approval_task_version: u64,
+    pub base_commit: String,
+    pub task_commit: String,
+    pub merge_head_commit: String,
+    pub resolution_digest: ManualResolutionDigest,
+    pub confirmed_at_ms: i64,
+}
+
+impl From<ManualMergeResolutionConfirmationRecord> for ManualMergeResolutionConfirmationView {
+    fn from(value: ManualMergeResolutionConfirmationRecord) -> Self {
+        Self {
+            task_id: value.task_id,
+            merge_conflict_task_version: value.merge_conflict_task_version,
+            source_approval_task_version: value.source_approval_task_version,
+            base_commit: value.base_commit,
+            task_commit: value.task_commit,
+            merge_head_commit: value.merge_head_commit,
+            resolution_digest: value.resolution_digest,
+            confirmed_at_ms: value.confirmed_at_ms,
+        }
+    }
+}
+
+/// Requests an atomic create-or-reuse merge-abort approval for the exact
+/// `(task_id, expected_version)` identity. Unlike
+/// [`RecordManualMergeResolutionConfirmationRequest`], this never binds to a
+/// resolution digest — see [`chatoms_ports::repository::MergeAbortApprovalRecord`].
+/// Carries the approval timestamp explicitly, like
+/// [`ApproveHighRiskOperationRequest`], because this use case has no state
+/// transition to derive "now" from.
+pub struct RecordMergeAbortApprovalRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    source_approval_task_version: u64,
+    base_commit: String,
+    task_commit: String,
+    merge_head_commit: String,
+    approved_at_ms: i64,
+}
+
+impl RecordMergeAbortApprovalRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        source_approval_task_version: u64,
+        base_commit: String,
+        task_commit: String,
+        merge_head_commit: String,
+        approved_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            source_approval_task_version,
+            base_commit,
+            task_commit,
+            merge_head_commit,
+            approved_at_ms,
+        }
+    }
+}
+
+/// Read-only view of an immutable [`MergeAbortApprovalRecord`]. Content-free
+/// like the record it mirrors — never a raw path, Git stdout/stderr, or any
+/// resolution digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeAbortApprovalView {
+    pub task_id: TaskId,
+    pub merge_conflict_task_version: u64,
+    pub source_approval_task_version: u64,
+    pub base_commit: String,
+    pub task_commit: String,
+    pub merge_head_commit: String,
+    pub approved_at_ms: i64,
+}
+
+impl From<MergeAbortApprovalRecord> for MergeAbortApprovalView {
+    fn from(value: MergeAbortApprovalRecord) -> Self {
+        Self {
+            task_id: value.task_id,
+            merge_conflict_task_version: value.merge_conflict_task_version,
+            source_approval_task_version: value.source_approval_task_version,
+            base_commit: value.base_commit,
+            task_commit: value.task_commit,
+            merge_head_commit: value.merge_head_commit,
+            approved_at_ms: value.approved_at_ms,
+        }
+    }
+}
+
+pub struct RecordMergeAbortResultRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: MergeAbortOutcome,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl RecordMergeAbortResultRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        outcome: MergeAbortOutcome,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            outcome,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+pub struct StartMergeContinueRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    resolution_digest: ManualResolutionDigest,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl StartMergeContinueRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        resolution_digest: ManualResolutionDigest,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            resolution_digest,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+pub struct RecordMergeContinueResultRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: MergeContinueOutcome,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl RecordMergeContinueResultRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        outcome: MergeContinueOutcome,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            outcome,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
 impl RecordReviewResultRequest {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -829,6 +1052,34 @@ impl From<TaskReviewResultRecord> for ReviewResultView {
     }
 }
 
+/// Read-only view of an immutable ProjectRoot post-merge validation result.
+/// This is a direct passthrough of the bounded `safe_summary` persisted by
+/// the validation recorder and never carries raw process output or paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostMergeValidationResultView {
+    pub kind: ValidationCommandKind,
+    pub attempt_sequence: u32,
+    pub outcome: PostMergeValidationResultOutcome,
+    pub exit_code: Option<i32>,
+    pub safe_summary: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+}
+
+impl From<PostMergeValidationResultRecord> for PostMergeValidationResultView {
+    fn from(value: PostMergeValidationResultRecord) -> Self {
+        Self {
+            kind: value.kind,
+            attempt_sequence: value.attempt_sequence,
+            outcome: value.outcome,
+            exit_code: value.exit_code,
+            safe_summary: value.safe_summary,
+            started_at_ms: value.started_at_ms,
+            completed_at_ms: value.completed_at_ms,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskBriefView {
     pub requirements: String,
@@ -1004,6 +1255,44 @@ where
             .get_task_review_result(task_id)
             .map(|result| result.map(ReviewResultView::from))
             .map_err(|error| ApplicationError::from_categorized(&error))
+    }
+
+    /// Reads the immutable ProjectRoot post-merge result rows for the one
+    /// merge chain associated with `task_id`. The approval and post-merge
+    /// versions come from transition history; no current-version arithmetic
+    /// or latest-approval fallback is used. Results are deterministic: all
+    /// Test attempts precede all Build attempts, with each command's stored
+    /// `attempt_sequence` order preserved by the repository.
+    pub fn get_post_merge_validation_results(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Vec<PostMergeValidationResultView>, ApplicationError> {
+        let transitions = self
+            .repository
+            .list_task_transitions(task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        let Some((approval_task_version, post_merge_task_version)) =
+            post_merge_version_pair(&transitions)
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut results = Vec::new();
+        for kind in [ValidationCommandKind::Test, ValidationCommandKind::Build] {
+            results.extend(
+                self.repository
+                    .list_post_merge_validation_results(
+                        task_id,
+                        approval_task_version,
+                        post_merge_task_version,
+                        kind,
+                    )
+                    .map_err(|error| ApplicationError::from_categorized(&error))?
+                    .into_iter()
+                    .map(PostMergeValidationResultView::from),
+            );
+        }
+        Ok(results)
     }
 
     pub fn task_history(
@@ -1420,6 +1709,38 @@ where
         Ok(TaskView::from(&task))
     }
 
+    /// Commits `MergeConflict -> Merging` for a manual-resolution
+    /// continuation, requiring — and re-verifying inside the same
+    /// repository transaction — that an exact `(task_id, expected_version,
+    /// resolution_digest)` manual-resolution confirmation already exists
+    /// (see
+    /// `chatoms_ports::repository::FoundationRepository::save_manual_merge_resolution_transition`).
+    /// Never creates a confirmation row of its own.
+    pub fn start_merge_continue(
+        &mut self,
+        request: StartMergeContinueRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::MergeConflict {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        task.transition_to(TaskState::Merging, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_manual_merge_resolution_transition(
+                request.expected_version,
+                &task,
+                &transition,
+                request.resolution_digest,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
     /// Read-only: reports whether an exact `(task_id, Claude, Review,
     /// expected_version, ContextPackageV1)` consent and its FK-bound
     /// manifest already exist, without creating, reusing, or mutating
@@ -1550,6 +1871,65 @@ where
             )
             .map_err(|error| ApplicationError::from_categorized(&error))?;
         Ok(DiffApprovalView::from(approval))
+    }
+
+    /// Records (creates or reuses) an immutable manual-resolution
+    /// confirmation for the exact `(task_id, expected_version,
+    /// resolution_digest)` identity. Callers (see
+    /// `chatoms_application::manual_merge_resolution::ManualMergeResolutionConfirmationService`)
+    /// are responsible for having already verified every precondition and
+    /// read the live candidate digest — this method itself does not
+    /// re-verify the candidate. Never touches task state, transition
+    /// history, or the `ActiveTaskLease`.
+    pub fn record_manual_merge_resolution_confirmation(
+        &mut self,
+        request: RecordManualMergeResolutionConfirmationRequest,
+    ) -> Result<ManualMergeResolutionConfirmationView, ApplicationError> {
+        self.load_expected_task(request.task_id, request.expected_version)?;
+        let confirmation = self
+            .repository
+            .ensure_manual_merge_resolution_confirmation(
+                request.task_id,
+                request.expected_version,
+                request.source_approval_task_version,
+                &request.base_commit,
+                &request.task_commit,
+                &request.merge_head_commit,
+                request.resolution_digest,
+                request.confirmed_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(ManualMergeResolutionConfirmationView::from(confirmation))
+    }
+
+    /// Atomically creates-or-reuses the exact `(task_id, expected_version)`
+    /// merge-abort approval: verifies the task exists and is at
+    /// `expected_version`, then delegates the entire
+    /// read-existing-or-insert-new decision to
+    /// [`chatoms_ports::repository::FoundationRepository::ensure_merge_abort_approval`],
+    /// which re-verifies the version and current `MergeConflict` state and
+    /// performs the create-or-reuse atomically inside its own transaction.
+    /// This method does not itself re-verify live Git state — callers (see
+    /// `chatoms_application::merge_abort::MergeAbortApprovalService`) must
+    /// run the read-only preflight first.
+    pub fn record_merge_abort_approval(
+        &mut self,
+        request: RecordMergeAbortApprovalRequest,
+    ) -> Result<MergeAbortApprovalView, ApplicationError> {
+        self.load_expected_task(request.task_id, request.expected_version)?;
+        let approval = self
+            .repository
+            .ensure_merge_abort_approval(
+                request.task_id,
+                request.expected_version,
+                request.source_approval_task_version,
+                &request.base_commit,
+                &request.task_commit,
+                &request.merge_head_commit,
+                request.approved_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(MergeAbortApprovalView::from(approval))
     }
 
     /// Prepares (creates or reuses) the exact `(task_id, Claude, Planning,
@@ -1994,6 +2374,130 @@ where
         }
     }
 
+    /// Records a `git merge --continue` attempt's outcome and, in the same
+    /// transaction, drives the resulting state transition: `Continued ->
+    /// PostMergeTesting`, confirmed `ConfirmationStale`/`ConfirmedMergePending`
+    /// -> `MergeConflict`, and every other outcome (`PreWriteRejected`,
+    /// `PostWriteUncertain`) -> `RecoveryRequired`.
+    pub fn record_merge_continue_result(
+        &mut self,
+        request: RecordMergeContinueResultRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::Merging {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let target = match request.outcome {
+            MergeContinueOutcome::Continued => TaskState::PostMergeTesting,
+            MergeContinueOutcome::ConfirmationStale
+            | MergeContinueOutcome::ConfirmedMergePending => TaskState::MergeConflict,
+            MergeContinueOutcome::PreWriteRejected | MergeContinueOutcome::PostWriteUncertain => {
+                TaskState::RecoveryRequired
+            }
+        };
+        task.transition_to(target, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition =
+            self.next_transition(&task, from_state, actor_kind.clone(), reason_code.clone())?;
+        match self
+            .repository
+            .save_transition(request.expected_version, &task, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&task)),
+            Err(error) => self.recover_after_merge_continue_persistence_failure(
+                request.task_id,
+                error,
+                actor_kind,
+                reason_code,
+            ),
+        }
+    }
+
+    fn recover_after_merge_continue_persistence_failure(
+        &mut self,
+        task_id: TaskId,
+        original: chatoms_ports::repository::RepositoryError,
+        actor_kind: ActorKind,
+        reason_code: ReasonCode,
+    ) -> Result<TaskView, ApplicationError> {
+        let Ok(Some(mut persisted)) = self.repository.get_task(task_id) else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted.state() != TaskState::Merging {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let expected_version = persisted.version();
+        let from_state = persisted.state();
+        let Ok(now) = self.now_ms() else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted
+            .transition_to(TaskState::RecoveryRequired, now)
+            .is_err()
+        {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let Ok(transition) = self.next_transition(&persisted, from_state, actor_kind, reason_code)
+        else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        match self
+            .repository
+            .save_transition(expected_version, &persisted, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&persisted)),
+            Err(_) => Err(ApplicationError::from_categorized(&original)),
+        }
+    }
+
+    /// Records the outcome of one `git merge --abort` attempt. Unlike every
+    /// other `record_*_result` method in this module, a fail-closed outcome
+    /// (`PreWriteRejected`/`PostWriteUncertain`) does **not** drive any
+    /// state transition — `MergeConflict -> RecoveryRequired` is
+    /// deliberately not an edge this Unit adds (see `docs/DECISIONS.md`'s
+    /// "Merge-abort write contract"), so the task simply remains
+    /// `MergeConflict` and this returns a typed error instead. The
+    /// immutable approval row (see [`Self::record_merge_abort_approval`])
+    /// is never touched by this method and remains valid for a retry. Only
+    /// `Aborted` and `ConfirmedNotInMerge` commit `MergeConflict ->
+    /// Cancelled`, releasing the `ActiveTaskLease` in the same repository
+    /// transaction as the state update, transition history, and the
+    /// approval re-verification (see
+    /// [`chatoms_ports::repository::FoundationRepository::save_merge_abort_transition`]).
+    /// If that atomic write itself fails, the error is propagated as-is —
+    /// never masked as success, and never a `RecoveryRequired` fallback,
+    /// since none exists for this edge: the task remains `MergeConflict`
+    /// and a subsequent abort attempt can recover via the same
+    /// `ConfirmedNotInMerge` path.
+    pub fn record_merge_abort_result(
+        &mut self,
+        request: RecordMergeAbortResultRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::MergeConflict {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        match request.outcome {
+            MergeAbortOutcome::Aborted | MergeAbortOutcome::ConfirmedNotInMerge => {}
+            MergeAbortOutcome::PreWriteRejected(_) | MergeAbortOutcome::PostWriteUncertain => {
+                return Err(category_error(FailureCategory::Conflict));
+            }
+        }
+        let from_state = task.state();
+        task.transition_to(TaskState::Cancelled, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_merge_abort_transition(request.expected_version, &task, &transition, true)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
     /// Finalizes one Testing batch attempt: appends the batch's final
     /// validation command result and, in the same repository transaction,
     /// drives the resulting state transition (`Success -> Reviewing`,
@@ -2370,6 +2874,34 @@ where
         .map(Some)
     }
 
+    pub fn reconcile_startup_merge(&mut self) -> Result<Option<TaskView>, ApplicationError> {
+        let Some(lease) = self
+            .repository
+            .active_lease()
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+        else {
+            return Ok(None);
+        };
+        let task = self
+            .repository
+            .get_task(lease.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::InvariantViolation))?;
+        if !matches!(
+            task.state(),
+            TaskState::Merging | TaskState::PostMergeTesting
+        ) {
+            return Ok(None);
+        }
+        self.mark_recovery_required(TaskActionRequest::new(
+            task.id(),
+            task.version(),
+            "application".to_owned(),
+            "merge.startup.recovery-required".to_owned(),
+        ))
+        .map(Some)
+    }
+
     pub fn complete_task(
         &mut self,
         request: TaskActionRequest,
@@ -2500,6 +3032,17 @@ where
             .now_ms()
             .map_err(|error| ApplicationError::from_categorized(&error))
     }
+}
+
+fn post_merge_version_pair(transitions: &[TaskStateTransition]) -> Option<(u64, u64)> {
+    transitions.windows(3).find_map(|chain| {
+        (chain[0].to_state() == TaskState::AwaitingUserDiffApproval
+            && chain[1].from_state() == Some(TaskState::AwaitingUserDiffApproval)
+            && chain[1].to_state() == TaskState::Merging
+            && chain[2].from_state() == Some(TaskState::Merging)
+            && chain[2].to_state() == TaskState::PostMergeTesting)
+            .then_some((chain[0].task_version(), chain[2].task_version()))
+    })
 }
 
 fn parse_actor(value: &str) -> Result<ActorKind, ApplicationError> {

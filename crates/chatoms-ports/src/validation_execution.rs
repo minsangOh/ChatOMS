@@ -71,6 +71,7 @@ pub enum ValidationBindingRejection {
     /// The approved executable's current canonical path resolves inside the
     /// explicit execution target passed to this attempt.
     ExecutableInsideExecutionTarget,
+    BindingInsideExecutionTarget,
     /// `approval`'s `(executable, arguments)` does not exactly match this
     /// implementation's own fixed vocabulary for `approval.kind` — a
     /// defense-in-depth re-check that never trusts a stored row blindly.

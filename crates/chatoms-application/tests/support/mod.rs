@@ -14,12 +14,14 @@ use chatoms_ports::{
     TimeProvider,
     diff::DiffContentHash,
     error::{FailureCategory, PortFailure},
+    manual_merge_resolution::ManualResolutionDigest,
     provider::ProviderKind,
     repository::{
         ActiveLease, ContextPackageManifestRecord, ContextPackagePreparation, DiffApprovalRecord,
         FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationAttempt,
         GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
-        HighRiskApprovalRecord, PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
+        HighRiskApprovalRecord, ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
+        PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
         ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderConsent,
         RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
@@ -53,6 +55,9 @@ pub struct FakeRepository {
     pub post_merge_validation_results: Vec<PostMergeValidationResultRecord>,
     pub high_risk_approvals: HashMap<(TaskId, u64, HighRiskCategory), HighRiskApprovalRecord>,
     pub diff_approvals: HashMap<(TaskId, u64, DiffContentHash), DiffApprovalRecord>,
+    pub manual_merge_resolution_confirmations:
+        HashMap<(TaskId, u64, ManualResolutionDigest), ManualMergeResolutionConfirmationRecord>,
+    pub merge_abort_approvals: HashMap<(TaskId, u64), MergeAbortApprovalRecord>,
     pub approvals: Vec<GitInitApproval>,
     pub attempts: HashMap<chatoms_domain::GitOperationId, GitOperationAttempt>,
     pub receipts: Vec<GitOperationReceipt>,
@@ -505,6 +510,23 @@ impl FoundationRepository for FakeRepository {
             .copied())
     }
 
+    fn get_diff_approval_for_task_version(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.record("get_diff_approval_for_task_version");
+        self.maybe_fail("get_diff_approval_for_task_version")?;
+        Ok(self
+            .diff_approvals
+            .values()
+            .find(|approval| {
+                approval.task_id == task_id
+                    && approval.approved_task_version == approved_task_version
+            })
+            .copied())
+    }
+
     fn ensure_diff_approval(
         &mut self,
         task_id: TaskId,
@@ -533,6 +555,185 @@ impl FoundationRepository for FakeRepository {
         };
         self.diff_approvals.insert(key, approval);
         Ok(approval)
+    }
+
+    fn get_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+        self.record("get_manual_merge_resolution_confirmation");
+        self.maybe_fail("get_manual_merge_resolution_confirmation")?;
+        Ok(self
+            .manual_merge_resolution_confirmations
+            .get(&(task_id, merge_conflict_task_version, resolution_digest))
+            .cloned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Result<ManualMergeResolutionConfirmationRecord, RepositoryError> {
+        self.record("ensure_manual_merge_resolution_confirmation");
+        self.maybe_fail("ensure_manual_merge_resolution_confirmation")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != merge_conflict_task_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let key = (task_id, merge_conflict_task_version, resolution_digest);
+        if let Some(existing) = self.manual_merge_resolution_confirmations.get(&key) {
+            return Ok(existing.clone());
+        }
+        let confirmation = ManualMergeResolutionConfirmationRecord {
+            task_id,
+            merge_conflict_task_version,
+            source_approval_task_version,
+            base_commit: base_commit.to_owned(),
+            task_commit: task_commit.to_owned(),
+            merge_head_commit: merge_head_commit.to_owned(),
+            resolution_digest,
+            confirmed_at_ms,
+        };
+        self.manual_merge_resolution_confirmations
+            .insert(key, confirmation.clone());
+        Ok(confirmation)
+    }
+
+    fn save_manual_merge_resolution_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_manual_merge_resolution_transition");
+        self.maybe_fail("save_manual_merge_resolution_transition")?;
+        if task.state() != TaskState::Merging {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        if !self.manual_merge_resolution_confirmations.contains_key(&(
+            task.id(),
+            expected_version,
+            resolution_digest,
+        )) {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        Ok(())
+    }
+
+    fn get_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+    ) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+        self.record("get_merge_abort_approval");
+        self.maybe_fail("get_merge_abort_approval")?;
+        Ok(self
+            .merge_abort_approvals
+            .get(&(task_id, merge_conflict_task_version))
+            .cloned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        approved_at_ms: i64,
+    ) -> Result<MergeAbortApprovalRecord, RepositoryError> {
+        self.record("ensure_merge_abort_approval");
+        self.maybe_fail("ensure_merge_abort_approval")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != merge_conflict_task_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let key = (task_id, merge_conflict_task_version);
+        if let Some(existing) = self.merge_abort_approvals.get(&key) {
+            return Ok(existing.clone());
+        }
+        let approval = MergeAbortApprovalRecord {
+            task_id,
+            merge_conflict_task_version,
+            source_approval_task_version,
+            base_commit: base_commit.to_owned(),
+            task_commit: task_commit.to_owned(),
+            merge_head_commit: merge_head_commit.to_owned(),
+            approved_at_ms,
+        };
+        self.merge_abort_approvals.insert(key, approval.clone());
+        Ok(approval)
+    }
+
+    fn save_merge_abort_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_merge_abort_transition");
+        self.maybe_fail("save_merge_abort_transition")?;
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        if !self
+            .merge_abort_approvals
+            .contains_key(&(task.id(), expected_version))
+        {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        if terminal {
+            self.active_lease = None;
+        }
+        Ok(())
     }
 
     fn save_planning_transition(

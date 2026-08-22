@@ -97,6 +97,7 @@ pub enum GitWriteCommand {
     Stage,
     Commit,
     Merge,
+    MergeAbort,
 }
 
 pub trait GitWriteCommandObserver: Send + Sync {
@@ -320,6 +321,31 @@ impl GitCliAdapter {
         self.at_str(root, arguments)
     }
 
+    pub(crate) fn capture_read_only(
+        &mut self,
+        root: &Path,
+        arguments: &[&str],
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> Result<BoundedCaptureOutcome, PortFailure> {
+        if !root.is_absolute() {
+            return Err(PortFailure::new(FailureCategory::InvalidInput));
+        }
+        self.ensure_control_paths()?;
+        self.validate_runtime()?;
+        self.validate_control_paths()?;
+        let mut command = Command::new(self.runtime.executable());
+        command
+            .env_clear()
+            .current_dir(&self.control.home)
+            .args(self.common_arguments())
+            .arg("-C")
+            .arg(root)
+            .args(arguments);
+        configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        capture_bounded_stdout(command, max_bytes, timeout)
+    }
+
     pub fn set_write_command_observer(
         &mut self,
         observer: Option<Arc<dyn GitWriteCommandObserver>>,
@@ -333,10 +359,25 @@ impl GitCliAdapter {
         command_kind: GitWriteCommand,
         arguments: [&str; N],
     ) -> GitWriteCommandOutcome {
+        self.run_write_command_with_env(root, command_kind, arguments, &[])
+    }
+
+    /// Identical to [`Self::run_write_command`], but adds `extra_env`
+    /// key/value pairs to the child process's environment on top of the
+    /// shared controlled environment — never logged or persisted by this
+    /// method. Used only where a write must not depend on ambient Git
+    /// config for author identity (e.g. `merge --continue`).
+    pub(crate) fn run_write_command_with_env<const N: usize>(
+        &mut self,
+        root: &Path,
+        command_kind: GitWriteCommand,
+        arguments: [&str; N],
+        extra_env: &[(&str, &OsStr)],
+    ) -> GitWriteCommandOutcome {
         let mut args = vec![OsString::from("-C"), root.as_os_str().to_owned()];
         args.extend(arguments.into_iter().map(OsString::from));
         let deadline = Instant::now() + GIT_WRITE_TIMEOUT;
-        let result = self.bounded_write_output(args, command_kind, deadline);
+        let result = self.bounded_write_output(args, command_kind, deadline, extra_env);
         match result {
             Ok(BoundedCaptureOutcome::Success(_)) => GitWriteCommandOutcome::Succeeded,
             Ok(BoundedCaptureOutcome::ExitFailure) => GitWriteCommandOutcome::Failed,
@@ -352,6 +393,7 @@ impl GitCliAdapter {
         arguments: Vec<OsString>,
         command_kind: GitWriteCommand,
         deadline: Instant,
+        extra_env: &[(&str, &OsStr)],
     ) -> Result<BoundedCaptureOutcome, PortFailure> {
         self.ensure_control_paths()?;
         self.validate_runtime()?;
@@ -369,7 +411,50 @@ impl GitCliAdapter {
             .args(self.common_arguments())
             .args(arguments);
         configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         capture_bounded_stdout(command, DIFF_MAX_BYTES, timeout)
+    }
+
+    /// Resolves the commit author/committer identity (`user.name`,
+    /// `user.email`) the same way Git itself would for `root` — local
+    /// config first, falling back to global — without ever logging or
+    /// persisting the resolved values. Returns `None` if either value is
+    /// missing or empty at both scopes, mirroring [`Self::has_commit_author`]'s
+    /// precedence exactly.
+    pub(crate) fn commit_author_identity(
+        &mut self,
+        root: &Path,
+    ) -> Result<Option<(String, String)>, PortFailure> {
+        let name = self.resolved_config_value(root, "user.name")?;
+        let email = self.resolved_config_value(root, "user.email")?;
+        Ok(match (name, email) {
+            (Some(name), Some(email)) => Some((name, email)),
+            _ => None,
+        })
+    }
+
+    fn resolved_config_value(
+        &mut self,
+        root: &Path,
+        key: &str,
+    ) -> Result<Option<String>, PortFailure> {
+        let local = self.author_output(root, key, true)?;
+        if local.status.success() {
+            let value = trimmed_utf8(&local.stdout)?;
+            if !value.is_empty() {
+                return Ok(Some(value.to_owned()));
+            }
+        }
+        let global = self.author_output(root, key, false)?;
+        if global.status.success() {
+            let value = trimmed_utf8(&global.stdout)?;
+            if !value.is_empty() {
+                return Ok(Some(value.to_owned()));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn output_text(output: &Output) -> Result<&str, PortFailure> {
@@ -1078,7 +1163,7 @@ fn diff_arguments(worktree: &Path) -> Vec<OsString> {
 /// mechanics (spawn, drain stdout/stderr, enforce a byte cap and a
 /// deadline) can be unit-tested against an arbitrary fixture process,
 /// independent of the trusted Git runtime.
-enum BoundedCaptureOutcome {
+pub(crate) enum BoundedCaptureOutcome {
     Success(Vec<u8>),
     ExitFailure,
     TooLarge,

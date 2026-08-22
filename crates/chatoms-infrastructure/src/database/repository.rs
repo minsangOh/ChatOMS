@@ -8,13 +8,15 @@ use chatoms_domain::{
 };
 use chatoms_ports::diff::DiffContentHash;
 use chatoms_ports::git::RepositoryKind;
+use chatoms_ports::manual_merge_resolution::ManualResolutionDigest;
 use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
     ActiveLease, AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
     DiffApprovalRecord, FoundationRepository, GitInitApproval, GitIsolationStatus,
     GitOperationAttempt, GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt,
     GitOperationReceiptKind, HighRiskApprovalRecord, ImplementationResultOutcome,
-    PlanningResultOutcome, PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
+    ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord, PlanningResultOutcome,
+    PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
     PostMergeValidationResultRecord, ProjectFilesystemIdentityRecord, ProjectRecord,
     ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError, RepositoryErrorCode,
     ReviewResultOutcome, TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
@@ -966,6 +968,14 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         )
     }
 
+    fn get_diff_approval_for_task_version(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        load_diff_approval_for_task_version(self.database.raw_mut(), task_id, approved_task_version)
+    }
+
     fn ensure_diff_approval(
         &mut self,
         task_id: TaskId,
@@ -1003,6 +1013,260 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         };
         transaction.commit().map_err(operation_failed)?;
         Ok(approval)
+    }
+
+    fn get_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+        load_manual_merge_resolution_confirmation(
+            self.database.raw_mut(),
+            task_id,
+            merge_conflict_task_version,
+            resolution_digest,
+        )
+    }
+
+    fn ensure_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Result<ManualMergeResolutionConfirmationRecord, RepositoryError> {
+        validate_manual_merge_resolution_confirmation_shape(
+            base_commit,
+            task_commit,
+            merge_head_commit,
+            confirmed_at_ms,
+        )?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != merge_conflict_task_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::MergeConflict {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let existing = load_manual_merge_resolution_confirmation(
+            &transaction,
+            task_id,
+            merge_conflict_task_version,
+            resolution_digest,
+        )?;
+        let confirmation = match existing {
+            Some(confirmation) => confirmation,
+            None => {
+                let confirmation = ManualMergeResolutionConfirmationRecord {
+                    task_id,
+                    merge_conflict_task_version,
+                    source_approval_task_version,
+                    base_commit: base_commit.to_owned(),
+                    task_commit: task_commit.to_owned(),
+                    merge_head_commit: merge_head_commit.to_owned(),
+                    resolution_digest,
+                    confirmed_at_ms,
+                };
+                insert_manual_merge_resolution_confirmation(&transaction, &confirmation)?;
+                confirmation
+            }
+        };
+        transaction.commit().map_err(operation_failed)?;
+        Ok(confirmation)
+    }
+
+    fn save_manual_merge_resolution_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<(), RepositoryError> {
+        if task.state() != TaskState::Merging {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::MergeConflict {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        // Re-verify inside this transaction that an immutable manual-resolution
+        // confirmation actually exists for this exact `(task_id,
+        // expected_version, resolution_digest)` identity — never trust the
+        // caller's earlier read-only check alone. Its absence is a normal
+        // "not confirmed for the current staged index yet" precondition
+        // failure, not corruption.
+        let confirmation = load_manual_merge_resolution_confirmation(
+            &transaction,
+            task.id(),
+            expected_version,
+            resolution_digest,
+        )?;
+        if confirmation.is_none() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn get_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+    ) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+        load_merge_abort_approval(
+            self.database.raw_mut(),
+            task_id,
+            merge_conflict_task_version,
+        )
+    }
+
+    fn ensure_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        approved_at_ms: i64,
+    ) -> Result<MergeAbortApprovalRecord, RepositoryError> {
+        validate_manual_merge_resolution_confirmation_shape(
+            base_commit,
+            task_commit,
+            merge_head_commit,
+            approved_at_ms,
+        )?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != merge_conflict_task_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::MergeConflict {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let existing =
+            load_merge_abort_approval(&transaction, task_id, merge_conflict_task_version)?;
+        let approval = match existing {
+            Some(approval) => {
+                if approval.source_approval_task_version != source_approval_task_version
+                    || approval.base_commit != base_commit
+                    || approval.task_commit != task_commit
+                    || approval.merge_head_commit != merge_head_commit
+                {
+                    return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+                }
+                approval
+            }
+            None => {
+                let approval = MergeAbortApprovalRecord {
+                    task_id,
+                    merge_conflict_task_version,
+                    source_approval_task_version,
+                    base_commit: base_commit.to_owned(),
+                    task_commit: task_commit.to_owned(),
+                    merge_head_commit: merge_head_commit.to_owned(),
+                    approved_at_ms,
+                };
+                insert_merge_abort_approval(&transaction, &approval)?;
+                approval
+            }
+        };
+        transaction.commit().map_err(operation_failed)?;
+        Ok(approval)
+    }
+
+    fn save_merge_abort_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        if task.state().is_terminal() != terminal {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        task.validate_invariants()
+            .map_err(|_| repository_error(RepositoryErrorCode::InvalidAggregate))?;
+        validate_nonnegative_task(task)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, task.id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::MergeConflict {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        validate_transition_persistence(
+            &transaction,
+            expected_version,
+            &current,
+            task,
+            transition,
+        )?;
+        // Re-verify inside this transaction that an immutable merge-abort
+        // approval actually exists for this exact `(task_id,
+        // expected_version)` identity — never trust the caller's earlier
+        // read-only check alone. Its absence is a normal "not approved for
+        // this exact MergeConflict occurrence yet" precondition failure,
+        // not corruption.
+        let approval = load_merge_abort_approval(&transaction, task.id(), expected_version)?;
+        if approval.is_none() {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let lease = query_active_lease(&transaction)?;
+        if lease.as_ref().map(|active| active.task_id) != Some(task.id()) {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        update_task(&transaction, expected_version, task)?;
+        insert_transition(&transaction, transition).map_err(operation_failed)?;
+        if terminal {
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM active_task_leases WHERE task_id = ?1",
+                    [task.id().to_string()],
+                )
+                .map_err(operation_failed)?;
+            if deleted != 1 {
+                return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+            }
+        }
+        transaction.commit().map_err(operation_failed)
     }
 
     fn save_planning_result(
@@ -2643,6 +2907,261 @@ fn load_diff_approval(
         diff_content_hash,
         approved_at_ms,
     }))
+}
+
+fn load_diff_approval_for_task_version(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT diff_content_hash_hex, approved_at_ms FROM task_diff_approvals
+             WHERE task_id = ?1 AND approved_task_version = ?2
+             ORDER BY approved_at_ms ASC, diff_content_hash_hex ASC",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map(params![task_id.to_string(), version], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(operation_failed)?;
+    let mut found = None;
+    for row in rows {
+        let (persisted_hash_hex, approved_at_ms) = row.map_err(operation_failed)?;
+        let diff_content_hash = DiffContentHash::from_hex(&persisted_hash_hex)
+            .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        if found.is_none() {
+            found = Some(DiffApprovalRecord {
+                task_id,
+                approved_task_version,
+                diff_content_hash,
+                approved_at_ms,
+            });
+        }
+    }
+    Ok(found)
+}
+
+fn validate_manual_merge_resolution_confirmation_shape(
+    base_commit: &str,
+    task_commit: &str,
+    merge_head_commit: &str,
+    confirmed_at_ms: i64,
+) -> Result<(), RepositoryError> {
+    if confirmed_at_ms < 0
+        || !valid_commit_hex(base_commit)
+        || !valid_commit_hex(task_commit)
+        || !valid_commit_hex(merge_head_commit)
+        || task_commit != merge_head_commit
+        || base_commit == task_commit
+    {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    Ok(())
+}
+
+fn valid_commit_hex(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn insert_manual_merge_resolution_confirmation(
+    connection: &Connection,
+    confirmation: &ManualMergeResolutionConfirmationRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_manual_merge_resolution_confirmations (
+                task_id, merge_conflict_task_version, source_approval_task_version,
+                base_commit_hex, task_commit_hex, merge_head_hex,
+                resolution_digest_hex, confirmed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                confirmation.task_id.to_string(),
+                to_sql_integer(confirmation.merge_conflict_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                to_sql_integer(confirmation.source_approval_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                confirmation.base_commit,
+                confirmation.task_commit,
+                confirmation.merge_head_commit,
+                confirmation.resolution_digest.to_hex(),
+                confirmation.confirmed_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+/// Looks up the confirmation row for the exact `(task_id,
+/// merge_conflict_task_version, resolution_digest)` identity. Scans every
+/// row recorded for `(task_id, merge_conflict_task_version)` and parses
+/// each persisted `resolution_digest_hex` via
+/// [`ManualResolutionDigest::from_hex`] rather than filtering on the
+/// requested digest as a raw SQL string — mirroring [`load_diff_approval`]'s
+/// reasoning exactly: a corrupted or hand-edited row for that task/version
+/// fails the whole lookup closed as `RepositoryErrorCode::InvalidPersistenceState`
+/// even when a different, well-formed row for the same task/version would
+/// otherwise have satisfied the request.
+fn load_manual_merge_resolution_confirmation(
+    connection: &Connection,
+    task_id: TaskId,
+    merge_conflict_task_version: u64,
+    resolution_digest: ManualResolutionDigest,
+) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+    let version = to_sql_integer(merge_conflict_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT source_approval_task_version, base_commit_hex, task_commit_hex,
+                    merge_head_hex, resolution_digest_hex, confirmed_at_ms
+             FROM task_manual_merge_resolution_confirmations
+             WHERE task_id = ?1 AND merge_conflict_task_version = ?2",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map(params![task_id.to_string(), version], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(operation_failed)?;
+    let mut found = None;
+    for row in rows {
+        let (
+            source_approval_task_version,
+            base_commit,
+            task_commit,
+            merge_head_commit,
+            persisted_digest_hex,
+            confirmed_at_ms,
+        ) = row.map_err(operation_failed)?;
+        let parsed_digest = ManualResolutionDigest::from_hex(&persisted_digest_hex)
+            .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        if parsed_digest == resolution_digest {
+            found = Some(ManualMergeResolutionConfirmationRecord {
+                task_id,
+                merge_conflict_task_version,
+                source_approval_task_version: u64::try_from(source_approval_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::InvalidPersistenceState))?,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                resolution_digest,
+                confirmed_at_ms,
+            });
+        }
+    }
+    Ok(found)
+}
+
+fn insert_merge_abort_approval(
+    connection: &Connection,
+    approval: &MergeAbortApprovalRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_merge_abort_approvals (
+                task_id, merge_conflict_task_version, source_approval_task_version,
+                base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                approval.task_id.to_string(),
+                to_sql_integer(approval.merge_conflict_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                to_sql_integer(approval.source_approval_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                approval.base_commit,
+                approval.task_commit,
+                approval.merge_head_commit,
+                approval.approved_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+/// Looks up the approval row for the exact `(task_id,
+/// merge_conflict_task_version)` identity. Unlike
+/// [`load_manual_merge_resolution_confirmation`], approval identity here
+/// does not include a digest, so at most one row can ever match and a
+/// direct `WHERE` filter is safe — there is no other well-formed row for
+/// the same `(task_id, merge_conflict_task_version)` that a corrupted row
+/// could be confused with. The persisted commit hex values are still
+/// parsed and validated rather than trusted blindly: a corrupted or
+/// hand-edited row fails closed as `RepositoryErrorCode::InvalidPersistenceState`
+/// rather than exposing the raw stored value.
+fn load_merge_abort_approval(
+    connection: &Connection,
+    task_id: TaskId,
+    merge_conflict_task_version: u64,
+) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+    let version = to_sql_integer(merge_conflict_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    connection
+        .query_row(
+            "SELECT source_approval_task_version, base_commit_hex, task_commit_hex,
+                    merge_head_hex, approved_at_ms
+             FROM task_merge_abort_approvals
+             WHERE task_id = ?1 AND merge_conflict_task_version = ?2",
+            params![task_id.to_string(), version],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(operation_failed)?
+        .map(
+            |(
+                source_approval_task_version,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                approved_at_ms,
+            )| {
+                if !valid_commit_hex(&base_commit)
+                    || !valid_commit_hex(&task_commit)
+                    || !valid_commit_hex(&merge_head_commit)
+                {
+                    return Err(repository_error(
+                        RepositoryErrorCode::InvalidPersistenceState,
+                    ));
+                }
+                Ok(MergeAbortApprovalRecord {
+                    task_id,
+                    merge_conflict_task_version,
+                    source_approval_task_version: u64::try_from(source_approval_task_version)
+                        .map_err(|_| {
+                            repository_error(RepositoryErrorCode::InvalidPersistenceState)
+                        })?,
+                    base_commit,
+                    task_commit,
+                    merge_head_commit,
+                    approved_at_ms,
+                })
+            },
+        )
+        .transpose()
 }
 
 /// Shared core of `prepare_planning_context_package`/

@@ -42,6 +42,29 @@ export type TaskState =
   | "cleanupPending"
   | "archived";
 
+export type MergeConflictInspectionOutcome =
+  | "confirmedUnresolved"
+  | "resolvedPendingConfirmation"
+  | "restoredPendingAbortConfirmation"
+  | "inconsistent"
+  | "unavailable";
+
+export type MergeConflictCountsDto = {
+  readonly total: number;
+  readonly bothModified: number;
+  readonly bothAdded: number;
+  readonly bothDeleted: number;
+  readonly addedByUs: number;
+  readonly addedByThem: number;
+  readonly deletedByUs: number;
+  readonly deletedByThem: number;
+};
+
+export type MergeConflictInspectionDto = {
+  readonly outcome: MergeConflictInspectionOutcome;
+  readonly counts: MergeConflictCountsDto;
+};
+
 export type WorkKind = "planning" | "implementation" | "review";
 export type ProviderKind = "claude" | "codex";
 export type ContractStatus = "approved" | "notApproved";
@@ -314,6 +337,10 @@ export interface CancelReviewDto {
   requested: boolean;
 }
 
+export interface MergeAbortStartDto {
+  started: boolean;
+}
+
 export type ValidationCommandKind = "format" | "lint" | "typecheck" | "test" | "build";
 
 export interface ValidationCommandCandidateDto {
@@ -406,6 +433,26 @@ export interface PlanningResultDto {
   startedAtMs: number;
   completedAtMs: number;
   planText: string | null;
+}
+
+export type PostMergeValidationCommandKind = "test" | "build";
+export type PostMergeValidationOutcome =
+  | "success"
+  | "exitFailure"
+  | "timedOut"
+  | "stdoutBoundExceeded"
+  | "bindingRejected"
+  | "cancelled"
+  | "uncertain";
+
+export interface PostMergeValidationResultDto {
+  commandKind: PostMergeValidationCommandKind;
+  attemptSequence: number;
+  outcome: PostMergeValidationOutcome;
+  exitCode: number | null;
+  safeSummary: string;
+  startedAtMs: number;
+  completedAtMs: number;
 }
 
 export type ReviewOutcome = "completed" | "failed" | "cancelled" | "recoveryRequired";

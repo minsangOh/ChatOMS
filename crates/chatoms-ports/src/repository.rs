@@ -7,6 +7,7 @@ use chatoms_domain::{
 
 use crate::diff::DiffContentHash;
 use crate::git::RepositoryKind;
+use crate::manual_merge_resolution::ManualResolutionDigest;
 use crate::provider::ProviderKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,6 +521,51 @@ pub struct DiffApprovalRecord {
     pub task_id: TaskId,
     pub approved_task_version: u64,
     pub diff_content_hash: DiffContentHash,
+    pub approved_at_ms: i64,
+}
+
+/// Immutable, content-free confirmation that a user reviewed and approved
+/// the exact staged index a manual `MergeConflict` resolution left in the
+/// original checkout, for one `(task_id, merge_conflict_task_version,
+/// resolution_digest)` identity. Distinct from [`DiffApprovalRecord`] (which
+/// binds to the task diff reviewed *before* `Merging` starts) — this
+/// approval only exists once a real `MergeConflict` requires a human
+/// decision, and it is never foreign-keyed to `task_diff_approvals`,
+/// `task_provider_consents`, `context_package_manifests`, or
+/// `task_high_risk_approvals`. Never carries a raw path, file content, or
+/// Git stdout/stderr — only commit identity and the digest itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualMergeResolutionConfirmationRecord {
+    pub task_id: TaskId,
+    pub merge_conflict_task_version: u64,
+    pub source_approval_task_version: u64,
+    pub base_commit: String,
+    pub task_commit: String,
+    pub merge_head_commit: String,
+    pub resolution_digest: ManualResolutionDigest,
+    pub confirmed_at_ms: i64,
+}
+
+/// Immutable, content-free approval that a user explicitly approved
+/// aborting one task's in-progress `MergeConflict` merge, for one
+/// `(task_id, merge_conflict_task_version)` identity. A distinct approval
+/// axis from [`ManualMergeResolutionConfirmationRecord`]: that confirmation
+/// approves *continuing* a specific staged resolution and binds to its
+/// resolution digest, while this approval discards it entirely and
+/// deliberately does not bind to any resolution digest. Never foreign-keyed
+/// to `task_diff_approvals`, `task_provider_consents`,
+/// `context_package_manifests`, `task_high_risk_approvals`, or
+/// `task_manual_merge_resolution_confirmations` — a task may need any
+/// combination of these entirely independently. Never carries a raw path,
+/// file content, or Git stdout/stderr — only commit identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeAbortApprovalRecord {
+    pub task_id: TaskId,
+    pub merge_conflict_task_version: u64,
+    pub source_approval_task_version: u64,
+    pub base_commit: String,
+    pub task_commit: String,
+    pub merge_head_commit: String,
     pub approved_at_ms: i64,
 }
 
@@ -1145,6 +1191,14 @@ pub trait FoundationRepository {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
 
+    fn get_diff_approval_for_task_version(
+        &mut self,
+        _task_id: TaskId,
+        _approved_task_version: u64,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
     /// Atomically creates-or-reuses one immutable [`DiffApprovalRecord`] for
     /// the exact `(task_id, expected_version, diff_content_hash)` identity,
     /// inside a single `IMMEDIATE` transaction: re-verify the task exists
@@ -1168,6 +1222,138 @@ pub trait FoundationRepository {
         _diff_content_hash: DiffContentHash,
         _approved_at_ms: i64,
     ) -> Result<DiffApprovalRecord, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Looks up the immutable manual-resolution confirmation for the exact
+    /// `(task_id, merge_conflict_task_version, resolution_digest)` identity.
+    /// Returns `None` when no confirmation has been recorded for that exact
+    /// identity — never falls back to a different version or digest. A
+    /// malformed persisted commit hash or digest (a corrupted or
+    /// hand-edited row) fails closed as a typed persistence error rather
+    /// than exposing the raw stored value or silently defaulting to `None`.
+    fn get_manual_merge_resolution_confirmation(
+        &mut self,
+        _task_id: TaskId,
+        _merge_conflict_task_version: u64,
+        _resolution_digest: ManualResolutionDigest,
+    ) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically creates-or-reuses one immutable
+    /// [`ManualMergeResolutionConfirmationRecord`] for the exact `(task_id,
+    /// merge_conflict_task_version, resolution_digest)` identity, inside a
+    /// single `IMMEDIATE` transaction: re-verify the task exists and its
+    /// current version and state equal `merge_conflict_task_version` and
+    /// `MergeConflict`, look up the exact existing confirmation, and either
+    /// return it unchanged or insert a new one and return that — never
+    /// both, and never a duplicate row. A different `resolution_digest` for
+    /// the same `(task_id, merge_conflict_task_version)` is always a
+    /// separate immutable row; an earlier confirmation is never updated or
+    /// deleted. Never validates or changes `Task` state, transition
+    /// history, the `ActiveTaskLease`, or any other approval/consent row.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_manual_merge_resolution_confirmation(
+        &mut self,
+        _task_id: TaskId,
+        _merge_conflict_task_version: u64,
+        _source_approval_task_version: u64,
+        _base_commit: &str,
+        _task_commit: &str,
+        _merge_head_commit: &str,
+        _resolution_digest: ManualResolutionDigest,
+        _confirmed_at_ms: i64,
+    ) -> Result<ManualMergeResolutionConfirmationRecord, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically commits the `MergeConflict -> Merging` state update and
+    /// its transition history record, requiring — and re-verifying inside
+    /// the same `IMMEDIATE` transaction — that an exact
+    /// `(task_id, expected_version, resolution_digest)` manual-resolution
+    /// confirmation already exists (see
+    /// [`Self::ensure_manual_merge_resolution_confirmation`]). If it is
+    /// absent, this is a normal (not corrupted) precondition failure: the
+    /// caller has not confirmed a resolution for the *current* staged index
+    /// yet, and this returns `RepositoryErrorCode::InvalidAggregate`
+    /// without writing anything. Never inserts a confirmation row of its
+    /// own and never shares a write path with
+    /// [`Self::ensure_manual_merge_resolution_confirmation`].
+    fn save_manual_merge_resolution_transition(
+        &mut self,
+        _expected_version: u64,
+        _task: &Task,
+        _transition: &TaskStateTransition,
+        _resolution_digest: ManualResolutionDigest,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Looks up the immutable merge-abort approval for the exact
+    /// `(task_id, merge_conflict_task_version)` identity. Returns `None`
+    /// when no approval has been recorded for that exact identity — never
+    /// falls back to a different version. A malformed persisted commit hash
+    /// (a corrupted or hand-edited row) fails closed as a typed persistence
+    /// error rather than exposing the raw stored value or silently
+    /// defaulting to `None`.
+    fn get_merge_abort_approval(
+        &mut self,
+        _task_id: TaskId,
+        _merge_conflict_task_version: u64,
+    ) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically creates-or-reuses one immutable [`MergeAbortApprovalRecord`]
+    /// for the exact `(task_id, merge_conflict_task_version)` identity,
+    /// inside a single `IMMEDIATE` transaction: re-verify the task exists
+    /// and its current version and state equal
+    /// `merge_conflict_task_version` and `MergeConflict`, look up the exact
+    /// existing approval, and either return it unchanged or insert a new
+    /// one and return that — never both, and never a duplicate row. Unlike
+    /// [`Self::ensure_manual_merge_resolution_confirmation`], approval
+    /// identity does not include a resolution digest, so this is the only
+    /// approval row this `(task_id, merge_conflict_task_version)` pair can
+    /// ever have; a stored `base_commit`/`task_commit`/`merge_head_commit`
+    /// that disagrees with the caller's request is a mismatch against a
+    /// different merge identity and is rejected rather than reused. Never
+    /// validates or changes `Task` state, transition history, the
+    /// `ActiveTaskLease`, or any other approval/consent row.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_merge_abort_approval(
+        &mut self,
+        _task_id: TaskId,
+        _merge_conflict_task_version: u64,
+        _source_approval_task_version: u64,
+        _base_commit: &str,
+        _task_commit: &str,
+        _merge_head_commit: &str,
+        _approved_at_ms: i64,
+    ) -> Result<MergeAbortApprovalRecord, RepositoryError> {
+        Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
+    }
+
+    /// Atomically commits the `MergeConflict -> Cancelled` state update, its
+    /// transition history record, and — because `Cancelled` is terminal —
+    /// releases the `ActiveTaskLease`, requiring — and re-verifying inside
+    /// the same `IMMEDIATE` transaction — that an exact `(task_id,
+    /// expected_version)` merge-abort approval already exists (see
+    /// [`Self::ensure_merge_abort_approval`]). If it is absent, this is a
+    /// normal (not corrupted) precondition failure: the caller has not
+    /// approved aborting this exact `MergeConflict` occurrence yet, and this
+    /// returns `RepositoryErrorCode::InvalidAggregate` without writing
+    /// anything. `terminal` must equal `task.state().is_terminal()`
+    /// (`true` for the only outcome this method supports, `Cancelled`).
+    /// Never inserts an approval row of its own and never shares a write
+    /// path with [`Self::ensure_merge_abort_approval`].
+    fn save_merge_abort_transition(
+        &mut self,
+        _expected_version: u64,
+        _task: &Task,
+        _transition: &TaskStateTransition,
+        _terminal: bool,
+    ) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(RepositoryErrorCode::OperationFailed))
     }
 

@@ -375,6 +375,10 @@ a:focus-visible {
 .form-row, .card-actions { display: flex; flex-wrap: wrap; gap: 0.65rem; }
 .form-row input { min-width: min(100%, 28rem); flex: 1; min-height: 2.75rem; padding: 0.6rem 0.75rem; border: 1px solid #bfc8d8; border-radius: 0.55rem; background: transparent; color: inherit; }
 .candidate-panel, .isolation-panel { padding: 1rem; border: 1px solid #d6dce7; border-radius: 0.7rem; }
+.post-merge-validation-panel { display: grid; gap: 0.75rem; margin-top: 1rem; padding: 1rem; border: 1px solid #d6dce7; border-radius: 0.7rem; }
+.post-merge-validation-panel h3 { margin: 0; font-size: 1rem; }
+.post-merge-validation-panel ul { display: grid; gap: 0.75rem; margin: 0; padding: 0; list-style: none; }
+.post-merge-validation-panel li { display: grid; gap: 0.25rem; padding: 0.75rem; border: 1px solid #e7eaf0; border-radius: 0.55rem; overflow-wrap: anywhere; }
 .inline-notice { display: grid; gap: 0.25rem; margin-top: 0.75rem; }
 
 @media (max-width: 760px) {

@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { FrontendError, isRecord, toFrontendError } from "./errors";
 import { isHighRiskApprovalDto, isHighRiskApprovalStatusDto } from "./high_risk_approval";
+import { isMergeAbortStartDto } from "./merge_abort";
 import { isNullablePlanningResultDto } from "./planning_result";
+import { isPostMergeValidationResultDtoArray } from "./post_merge_validation_result";
+import { isNullableMergeConflictInspectionDto } from "./merge_conflict_inspection";
 import { isProviderEligibilityDtoArray } from "./provider_eligibility";
 import { isCancelReviewDto, isNullableReviewResultDto } from "./review_result";
 import { isRawUserDiffForReviewDto, isUserDiffApprovalDto } from "./user_diff_review";
@@ -42,7 +45,10 @@ import type {
   HighRiskCategory,
   LoggingStatus,
   LegacyMigrationDiagnosticDto,
+  MergeAbortStartDto,
   PlanningResultDto,
+  PostMergeValidationResultDto,
+  MergeConflictInspectionDto,
   ProjectDto,
   ProjectRootValidationApprovalStatusDto,
   ProviderEligibilityDto,
@@ -90,6 +96,8 @@ export const IPC_COMMANDS = {
   startClaudePlanning: "start_claude_planning",
   cancelClaudePlanning: "cancel_claude_planning",
   getPlanningResult: "get_planning_result",
+  getPostMergeValidationResults: "get_post_merge_validation_results",
+  getMergeConflictInspection: "get_merge_conflict_inspection",
   getContextPackagePlanningReadiness: "get_context_package_planning_readiness",
   startClaudePlanningContextPackage: "start_claude_planning_context_package",
   startClaudeImplementation: "start_claude_implementation",
@@ -116,6 +124,8 @@ export const IPC_COMMANDS = {
   getUserDiffForReview: "get_user_diff_for_review",
   approveUserDiff: "approve_user_diff",
   approveUserDiffAndStartMerge: "approve_user_diff_and_start_merge",
+  confirmManualResolutionAndStartMergeContinue: "confirm_manual_resolution_and_start_merge_continue",
+  confirmMergeAbortAndStart: "confirm_merge_abort_and_start",
 } as const;
 
 export type InvokeTransport = (
@@ -146,6 +156,8 @@ export interface IpcClient {
   startClaudePlanning(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudePlanning(taskId: string): Promise<CancelPlanningDto>;
   getPlanningResult(taskId: string): Promise<PlanningResultDto | null>;
+  getPostMergeValidationResults(taskId: string): Promise<readonly PostMergeValidationResultDto[]>;
+  getMergeConflictInspection(taskId: string): Promise<MergeConflictInspectionDto | null>;
   getContextPackagePlanningReadiness(
     taskId: string,
     expectedVersion: number,
@@ -217,6 +229,8 @@ export interface IpcClient {
     expectedVersion: number,
     expectedDiffContentHash: string,
   ): Promise<TaskDto>;
+  confirmManualResolutionAndStartMergeContinue(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  confirmMergeAbortAndStart(taskId: string, expectedVersion: number): Promise<MergeAbortStartDto>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -279,6 +293,10 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
       request(IPC_COMMANDS.cancelClaudePlanning, isCancelPlanningDto, { taskId }),
     getPlanningResult: (taskId) =>
       request(IPC_COMMANDS.getPlanningResult, isNullablePlanningResultDto, { taskId }),
+    getPostMergeValidationResults: (taskId) =>
+      request(IPC_COMMANDS.getPostMergeValidationResults, isPostMergeValidationResultDtoArray, { taskId }),
+    getMergeConflictInspection: (taskId) =>
+      request(IPC_COMMANDS.getMergeConflictInspection, isNullableMergeConflictInspectionDto, { taskId }),
     getContextPackagePlanningReadiness: (taskId, expectedVersion) =>
       request(
         IPC_COMMANDS.getContextPackagePlanningReadiness,
@@ -397,6 +415,16 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
         taskId,
         expectedVersion,
         expectedDiffContentHash,
+      }),
+    confirmManualResolutionAndStartMergeContinue: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.confirmManualResolutionAndStartMergeContinue, isExactTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
+    confirmMergeAbortAndStart: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.confirmMergeAbortAndStart, isMergeAbortStartDto, {
+        taskId,
+        expectedVersion,
       }),
   };
 }
@@ -579,6 +607,36 @@ function isTaskDto(value: unknown): value is TaskDto {
     isNullableNumber(value.terminalAtMs) &&
     (value.brief === null || isTaskBriefDto(value.brief))
   );
+}
+
+const TASK_DTO_KEYS = [
+  "id",
+  "projectId",
+  "state",
+  "version",
+  "branchIdentity",
+  "resumeTargetState",
+  "createdAtMs",
+  "updatedAtMs",
+  "terminalAtMs",
+  "brief",
+] as const;
+
+function hasExactTaskDtoKeys(value: Record<string, unknown>): boolean {
+  const keys = Object.keys(value);
+  const allowed: readonly string[] = TASK_DTO_KEYS;
+  return keys.length === allowed.length && keys.every((key) => allowed.includes(key));
+}
+
+// Stricter than `isTaskDto`: also rejects any key beyond backend `TaskDto`'s
+// exact serialized key set (e.g. a resolution digest, raw path, or Git
+// stdout/stderr accidentally attached to a future response). Used only for
+// `confirmManualResolutionAndStartMergeContinue`, whose merge-continue write
+// must never let such content reach this response even if the backend
+// changes later -- `isTaskDto` itself stays loose for every other command
+// that already relies on it.
+function isExactTaskDto(value: unknown): value is TaskDto {
+  return isRecord(value) && hasExactTaskDtoKeys(value) && isTaskDto(value);
 }
 
 function isTaskTransitionDto(value: unknown): value is TaskTransitionDto {

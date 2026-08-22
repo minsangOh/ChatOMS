@@ -1,12 +1,16 @@
 use chatoms_application::{
     error::ApplicationError,
     merge_execution::{BeginMergeExecutionRequest, MergeExecutionRecorder, MergeExecutionStarter},
-    tasks::{RecordMergeResultRequest, TaskService},
+    post_merge_validation::{BeginPostMergeValidationRequest, PostMergeValidationStarter},
+    post_merge_validation_execution::PostMergeValidationRecorder,
+    tasks::{RecordMergeResultRequest, TaskActionRequest, TaskService},
     user_diff_approval::{ApproveUserDiffRequest, UserDiffApprovalService},
 };
+use chatoms_domain::TaskState;
 use chatoms_infrastructure::git::GitCliAdapter;
 use chatoms_ports::{
     diff::DiffContentHash, error::FailureCategory, merge_execution::MergeExecutionOutcome,
+    process::AtomicCancellationSignal, repository::FoundationRepository,
 };
 
 use crate::{dto::TaskDto, error::IpcErrorDto, state::ManagedRuntime};
@@ -61,6 +65,8 @@ pub fn handle_approve_user_diff_and_start_merge(
     let expected_version = inputs.task.version;
     let mut repository_for_thread = ready.repository.clone();
     let mut time_for_thread = ready.time.clone();
+    let mut filesystem_for_thread = ready.filesystem.clone();
+    let app_temp_dir = ready.app_temp_dir();
 
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -84,17 +90,28 @@ pub fn handle_approve_user_diff_and_start_merge(
                         &merge_request,
                         &mut adapter,
                     );
-            if result.is_err() {
-                record_uncertain_merge(
+            match result {
+                Ok(view) if view.state == TaskState::PostMergeTesting => {
+                    run_post_merge_validation(
+                        &mut repository_for_thread,
+                        &mut time_for_thread,
+                        &mut filesystem_for_thread,
+                        app_temp_dir,
+                        id,
+                        view.version,
+                    );
+                }
+                Ok(_) => {}
+                Err(_) => record_uncertain_merge(
                     &mut repository_for_thread,
                     &mut time_for_thread,
                     id,
                     expected_version,
-                );
+                ),
             }
         }));
         if result.is_err() {
-            record_uncertain_merge(
+            record_uncertain_background(
                 &mut repository_for_thread,
                 &mut time_for_thread,
                 id,
@@ -104,6 +121,40 @@ pub fn handle_approve_user_diff_and_start_merge(
     });
 
     Ok(task_dto)
+}
+
+pub(crate) fn run_post_merge_validation(
+    repository: &mut crate::state::RepositoryHandle,
+    time: &mut crate::state::TimeProviderHandle,
+    filesystem: &mut crate::state::FilesystemIdentityHandle,
+    app_temp_dir: Option<std::path::PathBuf>,
+    task_id: chatoms_domain::TaskId,
+    expected_version: u64,
+) {
+    let inputs = match PostMergeValidationStarter::new(repository, filesystem).begin(
+        BeginPostMergeValidationRequest::new(task_id, expected_version),
+    ) {
+        Ok(inputs) => inputs,
+        Err(_) => {
+            record_post_merge_recovery(repository, time, task_id, expected_version);
+            return;
+        }
+    };
+    let Some(app_temp_dir) = app_temp_dir else {
+        record_post_merge_recovery(repository, time, task_id, expected_version);
+        return;
+    };
+    let mut adapter = chatoms_infrastructure::validation_execution::CargoValidationAdapter::new(
+        chatoms_infrastructure::process::StdProcessRunner::new(),
+        filesystem.clone(),
+        app_temp_dir,
+    );
+    let cancellation = AtomicCancellationSignal::new();
+    let result = PostMergeValidationRecorder::new(repository, time)
+        .run_and_record_with_panic_containment(&inputs, &mut adapter, &cancellation);
+    if result.is_err() {
+        record_post_merge_recovery(repository, time, task_id, expected_version);
+    }
 }
 
 fn record_uncertain_merge(
@@ -119,6 +170,42 @@ fn record_uncertain_merge(
         ACTOR_KIND.to_owned(),
         RESULT_REASON.to_owned(),
     ));
+}
+
+pub(crate) fn record_post_merge_recovery(
+    repository: &mut crate::state::RepositoryHandle,
+    time: &mut crate::state::TimeProviderHandle,
+    task_id: chatoms_domain::TaskId,
+    expected_version: u64,
+) {
+    let _ = TaskService::new(repository, time).mark_recovery_required(TaskActionRequest::new(
+        task_id,
+        expected_version,
+        "application".to_owned(),
+        "task.post-merge-validation.recovery-required".to_owned(),
+    ));
+}
+
+fn record_uncertain_background(
+    repository: &mut crate::state::RepositoryHandle,
+    time: &mut crate::state::TimeProviderHandle,
+    task_id: chatoms_domain::TaskId,
+    expected_version: u64,
+) {
+    let state = repository
+        .get_task(task_id)
+        .ok()
+        .flatten()
+        .map(|task| task.state());
+    match state {
+        Some(TaskState::Merging) => {
+            record_uncertain_merge(repository, time, task_id, expected_version);
+        }
+        Some(TaskState::PostMergeTesting) => {
+            record_post_merge_recovery(repository, time, task_id, expected_version);
+        }
+        _ => {}
+    }
 }
 
 fn invalid_hash_error() -> IpcErrorDto {

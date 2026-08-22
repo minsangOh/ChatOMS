@@ -1,9 +1,13 @@
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 
 use chatoms_application::{
     post_merge_validation::{BeginPostMergeValidationRequest, PostMergeValidationStarter},
+    post_merge_validation_execution::PostMergeValidationRecorder,
     tasks::{
         AppendPostMergeValidationResultRequest, FinalizePostMergeValidationBatchRequest,
         TaskService,
@@ -16,13 +20,59 @@ use chatoms_domain::{
 use chatoms_ports::{
     error::{FailureCategory, PortFailure},
     filesystem::{DirectoryIdentity, DirectoryIdentityGuard, FilesystemIdentityPort},
+    process::{AtomicCancellationSignal, CancellationSignal},
     repository::{
         PostMergeValidationResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord,
         RepositoryErrorCode, ValidationCommandApprovalRecord,
     },
+    validation_execution::{
+        ValidationCommandExecutor, ValidationExecutionOutcome, ValidationExecutionRequest,
+        ValidationExecutionStartOutcome,
+    },
 };
 
 use support::{FakeRepository, FakeTime, restored_task};
+
+enum ScriptedOutcome {
+    Completed(ValidationExecutionOutcome),
+    BindingRejected,
+    Panic,
+}
+
+struct ScriptedExecutor {
+    outcomes: VecDeque<ScriptedOutcome>,
+    observed: Vec<ValidationCommandKind>,
+}
+
+impl ScriptedExecutor {
+    fn new(outcomes: impl IntoIterator<Item = ScriptedOutcome>) -> Self {
+        Self {
+            outcomes: outcomes.into_iter().collect(),
+            observed: Vec::new(),
+        }
+    }
+}
+
+impl ValidationCommandExecutor for ScriptedExecutor {
+    fn start_validation_command(
+        &mut self,
+        request: ValidationExecutionRequest<'_>,
+        _cancellation: &dyn CancellationSignal,
+    ) -> Result<ValidationExecutionStartOutcome, PortFailure> {
+        self.observed.push(request.approval.kind);
+        match self.outcomes.pop_front().expect("scripted outcome") {
+            ScriptedOutcome::Completed(outcome) => {
+                Ok(ValidationExecutionStartOutcome::Completed(outcome))
+            }
+            ScriptedOutcome::BindingRejected => Ok(
+                ValidationExecutionStartOutcome::BindingRejected(
+                    chatoms_ports::validation_execution::ValidationBindingRejection::IdentityMismatch,
+                ),
+            ),
+            ScriptedOutcome::Panic => panic!("post-merge executor panic"),
+        }
+    }
+}
 
 fn transition(
     task_id: TaskId,
@@ -181,6 +231,88 @@ fn post_merge_repository(approval_version: u64) -> (FakeRepository, TaskId) {
     (repository, task_id)
 }
 
+/// Mirrors [`post_merge_repository`] but with the conflict-resolved
+/// provenance chain: `AwaitingUserDiffApproval -> Merging -> MergeConflict
+/// -> Merging -> PostMergeTesting`.
+fn post_merge_repository_conflict_resolved(approval_version: u64) -> (FakeRepository, TaskId) {
+    let (task, _) = restored_task(TaskState::PostMergeTesting, 7, 50, None);
+    let task_id = task.id();
+    let project_id = task.project_id();
+    let history = vec![
+        transition(
+            task_id,
+            1,
+            TaskState::Reviewing,
+            TaskState::AwaitingUserDiffApproval,
+            approval_version,
+        ),
+        transition(
+            task_id,
+            2,
+            TaskState::AwaitingUserDiffApproval,
+            TaskState::Merging,
+            4,
+        ),
+        transition(task_id, 3, TaskState::Merging, TaskState::MergeConflict, 5),
+        transition(task_id, 4, TaskState::MergeConflict, TaskState::Merging, 6),
+        transition(
+            task_id,
+            5,
+            TaskState::Merging,
+            TaskState::PostMergeTesting,
+            7,
+        ),
+    ];
+    let mut repository = FakeRepository::default();
+    repository.project_records.insert(
+        project_id,
+        ProjectRecord {
+            id: project_id,
+            name: "project".to_owned(),
+            root_path: "C:/projects/root".to_owned(),
+            canonical_path_key: "c:/projects/root".to_owned(),
+            display_path: "C:/projects/root".to_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+    );
+    repository.project_identities.insert(
+        project_id,
+        ProjectFilesystemIdentityRecord {
+            project_id,
+            root_volume_serial_hex: root_identity().volume_serial_hex,
+            root_file_id_hex: root_identity().file_id_hex,
+            repository_kind: chatoms_ports::git::RepositoryKind::Git,
+            git_common_volume_serial_hex: None,
+            git_common_file_id_hex: None,
+            confirmed: true,
+            revision: 7,
+            verified_at_ms: 1,
+        },
+    );
+    for kind in [ValidationCommandKind::Test, ValidationCommandKind::Build] {
+        repository.project_root_validation_approvals.insert(
+            (task_id, approval_version, kind),
+            approval(task_id, project_id, approval_version, kind),
+        );
+    }
+    repository.seed_task(task, history);
+    (repository, task_id)
+}
+
+#[test]
+fn starter_accepts_the_conflict_resolved_provenance_chain() {
+    let (mut repository, task_id) = post_merge_repository_conflict_resolved(3);
+    let mut filesystem = RootFilesystem;
+
+    let inputs = PostMergeValidationStarter::new(&mut repository, &mut filesystem)
+        .begin(BeginPostMergeValidationRequest::new(task_id, 7))
+        .expect("conflict-resolved provenance is accepted");
+
+    assert_eq!(inputs.approval_task_version, 3);
+    assert_eq!(inputs.approvals.len(), 2);
+}
+
 #[test]
 fn starter_binds_project_root_approvals_to_the_merge_chain_source_version() {
     let (mut repository, task_id) = post_merge_repository(3);
@@ -215,6 +347,101 @@ fn starter_rejects_approvals_from_a_version_other_than_the_transition_history_so
         error.code(),
         chatoms_application::error::ApplicationErrorCode::NotFound
     );
+}
+
+#[test]
+fn recorder_runs_test_then_build_and_completes_atomically() {
+    let (mut repository, task_id) = post_merge_repository(3);
+    let mut filesystem = RootFilesystem;
+    let inputs = PostMergeValidationStarter::new(&mut repository, &mut filesystem)
+        .begin(BeginPostMergeValidationRequest::new(task_id, 5))
+        .expect("matching provenance is accepted");
+    let mut time = FakeTime::at(100);
+    let mut executor = ScriptedExecutor::new([
+        ScriptedOutcome::Completed(ValidationExecutionOutcome::Success),
+        ScriptedOutcome::Completed(ValidationExecutionOutcome::Success),
+    ]);
+    let cancellation = AtomicCancellationSignal::new();
+
+    let view = PostMergeValidationRecorder::new(&mut repository, &mut time)
+        .run_and_record_with_panic_containment(&inputs, &mut executor, &cancellation)
+        .expect("the approved Test then Build batch succeeds");
+
+    assert_eq!(
+        executor.observed,
+        [ValidationCommandKind::Test, ValidationCommandKind::Build]
+    );
+    assert_eq!(view.state, TaskState::Completed);
+    assert_eq!(repository.post_merge_validation_results.len(), 2);
+    assert!(repository.active_lease.is_none());
+}
+
+#[test]
+fn test_failure_records_recovery_and_does_not_start_build() {
+    let (mut repository, task_id) = post_merge_repository(3);
+    let mut filesystem = RootFilesystem;
+    let inputs = PostMergeValidationStarter::new(&mut repository, &mut filesystem)
+        .begin(BeginPostMergeValidationRequest::new(task_id, 5))
+        .expect("matching provenance is accepted");
+    let mut time = FakeTime::at(100);
+    let mut executor = ScriptedExecutor::new([
+        ScriptedOutcome::Completed(ValidationExecutionOutcome::ExitFailure { exit_code: 1 }),
+        ScriptedOutcome::Completed(ValidationExecutionOutcome::Success),
+    ]);
+    let cancellation = AtomicCancellationSignal::new();
+
+    let view = PostMergeValidationRecorder::new(&mut repository, &mut time)
+        .run_and_record_with_panic_containment(&inputs, &mut executor, &cancellation)
+        .expect("a confirmed Test failure is recorded");
+
+    assert_eq!(executor.observed, [ValidationCommandKind::Test]);
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(repository.post_merge_validation_results.len(), 1);
+    assert!(repository.active_lease.is_some());
+}
+
+#[test]
+fn binding_rejection_records_typed_recovery_without_running_build() {
+    let (mut repository, task_id) = post_merge_repository(3);
+    let mut filesystem = RootFilesystem;
+    let inputs = PostMergeValidationStarter::new(&mut repository, &mut filesystem)
+        .begin(BeginPostMergeValidationRequest::new(task_id, 5))
+        .expect("matching provenance is accepted");
+    let mut time = FakeTime::at(100);
+    let mut executor = ScriptedExecutor::new([ScriptedOutcome::BindingRejected]);
+    let cancellation = AtomicCancellationSignal::new();
+
+    let view = PostMergeValidationRecorder::new(&mut repository, &mut time)
+        .run_and_record_with_panic_containment(&inputs, &mut executor, &cancellation)
+        .expect("a binding rejection is recorded");
+
+    assert_eq!(executor.observed, [ValidationCommandKind::Test]);
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert_eq!(
+        repository.post_merge_validation_results[0].outcome,
+        PostMergeValidationResultOutcome::BindingRejected
+    );
+    assert!(repository.active_lease.is_some());
+}
+
+#[test]
+fn executor_panic_is_uncertain_and_recovers_without_running_build() {
+    let (mut repository, task_id) = post_merge_repository(3);
+    let mut filesystem = RootFilesystem;
+    let inputs = PostMergeValidationStarter::new(&mut repository, &mut filesystem)
+        .begin(BeginPostMergeValidationRequest::new(task_id, 5))
+        .expect("matching provenance is accepted");
+    let mut time = FakeTime::at(100);
+    let mut executor = ScriptedExecutor::new([ScriptedOutcome::Panic]);
+    let cancellation = AtomicCancellationSignal::new();
+
+    let view = PostMergeValidationRecorder::new(&mut repository, &mut time)
+        .run_and_record_with_panic_containment(&inputs, &mut executor, &cancellation)
+        .expect("panic is reduced to an uncertain recovery result");
+
+    assert_eq!(executor.observed, [ValidationCommandKind::Test]);
+    assert_eq!(view.state, TaskState::RecoveryRequired);
+    assert!(repository.active_lease.is_some());
 }
 
 #[test]
@@ -333,6 +560,51 @@ fn primary_and_fallback_persistence_failure_is_never_reported_as_completed() {
         TaskState::PostMergeTesting
     );
     assert!(repository.post_merge_validation_results.is_empty());
+}
+
+#[test]
+fn post_merge_result_read_model_orders_test_before_build_and_keeps_safe_fields() {
+    let (mut repository, task_id) = post_merge_repository(3);
+    let mut time = FakeTime::at(100);
+
+    TaskService::new(&mut repository, &mut time)
+        .append_post_merge_validation_result(AppendPostMergeValidationResultRequest::new(
+            task_id,
+            3,
+            5,
+            ValidationCommandKind::Test,
+            Some(0),
+            "safe test summary".to_owned(),
+            70,
+            80,
+        ))
+        .expect("Test result is stored");
+    TaskService::new(&mut repository, &mut time)
+        .finalize_post_merge_validation_batch(FinalizePostMergeValidationBatchRequest::new(
+            task_id,
+            3,
+            5,
+            ValidationCommandKind::Build,
+            PostMergeValidationResultOutcome::Success,
+            Some(0),
+            "safe build summary".to_owned(),
+            90,
+            "application".to_owned(),
+            "task.post-merge-validation.result".to_owned(),
+        ))
+        .expect("Build result is stored");
+
+    let results = TaskService::new(&mut repository, &mut time)
+        .get_post_merge_validation_results(task_id)
+        .expect("post-merge results are readable");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].kind, ValidationCommandKind::Test);
+    assert_eq!(results[0].attempt_sequence, 1);
+    assert_eq!(results[0].safe_summary, "safe test summary");
+    assert_eq!(results[1].kind, ValidationCommandKind::Build);
+    assert_eq!(results[1].attempt_sequence, 1);
+    assert_eq!(results[1].safe_summary, "safe build summary");
 }
 
 #[test]

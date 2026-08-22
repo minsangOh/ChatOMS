@@ -3930,3 +3930,27 @@ fn record_diff_approval_never_touches_provider_consent_manifest_or_high_risk_app
         "exactly one diff approval must exist"
     );
 }
+
+#[test]
+fn reconcile_startup_merge_recovers_merging_and_post_merge_testing() {
+    for state in [TaskState::Merging, TaskState::PostMergeTesting] {
+        let (task, history) = restored_task(state, 4, 20, None);
+        let task_id = task.id();
+        let mut repository = FakeRepository::default();
+        repository.seed_task(task, history);
+        let mut time = FakeTime::at(30);
+
+        let view = TaskService::new(&mut repository, &mut time)
+            .reconcile_startup_merge()
+            .expect("startup reconciliation succeeds")
+            .expect("active merge work is recovered");
+
+        assert_eq!(view.state, TaskState::RecoveryRequired);
+        assert_eq!(view.version, 5);
+        assert_eq!(
+            repository.tasks[&task_id].state(),
+            TaskState::RecoveryRequired
+        );
+        assert!(repository.active_lease.is_some());
+    }
+}

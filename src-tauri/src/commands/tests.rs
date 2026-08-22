@@ -30,9 +30,9 @@ use chatoms_ports::{
 };
 
 use super::{
-    REGISTERED_HANDLERS, context_package, high_risk_approval, implementation, merge_execution,
-    planning, projects, provider_eligibility, review, system, tasks, testing, user_diff_review,
-    validation_commands,
+    REGISTERED_HANDLERS, context_package, high_risk_approval, implementation, merge_abort,
+    merge_continue, merge_execution, planning, post_merge_validation, projects,
+    provider_eligibility, review, system, tasks, testing, user_diff_review, validation_commands,
 };
 use crate::{
     dto::HealthStateDto,
@@ -522,6 +522,8 @@ fn ready_runtime_with_git_and_claude_binding(
             implementation_runs: crate::state::ImplementationRunRegistry::new(),
             testing_runs: crate::state::TestingRunRegistry::new(),
             review_runs: crate::state::ReviewRunRegistry::new(),
+            merge_abort_runs: crate::state::MergeAbortRunRegistry::new(),
+            merge_conflict_writes: crate::state::MergeConflictWriteLock::new(),
         },
         RuntimeResources::default(),
     ))
@@ -571,6 +573,8 @@ fn ready_runtime_with_task(
             implementation_runs: crate::state::ImplementationRunRegistry::new(),
             testing_runs: crate::state::TestingRunRegistry::new(),
             review_runs: crate::state::ReviewRunRegistry::new(),
+            merge_abort_runs: crate::state::MergeAbortRunRegistry::new(),
+            merge_conflict_writes: crate::state::MergeConflictWriteLock::new(),
         },
         RuntimeResources::default(),
     ))
@@ -623,6 +627,8 @@ fn ready_runtime_with_task_and_review_result(
             implementation_runs: crate::state::ImplementationRunRegistry::new(),
             testing_runs: crate::state::TestingRunRegistry::new(),
             review_runs: crate::state::ReviewRunRegistry::new(),
+            merge_abort_runs: crate::state::MergeAbortRunRegistry::new(),
+            merge_conflict_writes: crate::state::MergeConflictWriteLock::new(),
         },
         RuntimeResources::default(),
     ))
@@ -679,6 +685,8 @@ fn ready_runtime_with_task_isolation_and_context_package_outcome(
             implementation_runs: crate::state::ImplementationRunRegistry::new(),
             testing_runs: crate::state::TestingRunRegistry::new(),
             review_runs: crate::state::ReviewRunRegistry::new(),
+            merge_abort_runs: crate::state::MergeAbortRunRegistry::new(),
+            merge_conflict_writes: crate::state::MergeConflictWriteLock::new(),
         },
         RuntimeResources::default(),
     ))
@@ -765,6 +773,8 @@ fn ready_runtime_with_task_isolation_filesystem_and_resolved_paths(
             implementation_runs: crate::state::ImplementationRunRegistry::new(),
             testing_runs: crate::state::TestingRunRegistry::new(),
             review_runs: crate::state::ReviewRunRegistry::new(),
+            merge_abort_runs: crate::state::MergeAbortRunRegistry::new(),
+            merge_conflict_writes: crate::state::MergeConflictWriteLock::new(),
         },
         RuntimeResources {
             paths: Arc::new(std::sync::Mutex::new(Some(resolved_app_paths_stub()))),
@@ -830,6 +840,8 @@ fn ready_runtime_with_blocking_git(
             implementation_runs: crate::state::ImplementationRunRegistry::new(),
             testing_runs: crate::state::TestingRunRegistry::new(),
             review_runs: crate::state::ReviewRunRegistry::new(),
+            merge_abort_runs: crate::state::MergeAbortRunRegistry::new(),
+            merge_conflict_writes: crate::state::MergeConflictWriteLock::new(),
         },
         RuntimeResources::default(),
     ))
@@ -995,7 +1007,7 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 
 #[test]
 fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 48);
+    assert_eq!(REGISTERED_HANDLERS.len(), 52);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -1021,6 +1033,8 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "start_claude_planning",
             "cancel_claude_planning",
             "get_planning_result",
+            "get_post_merge_validation_results",
+            "get_merge_conflict_inspection",
             "get_context_package_planning_readiness",
             "start_claude_planning_context_package",
             "start_claude_implementation",
@@ -1047,6 +1061,8 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "get_user_diff_for_review",
             "approve_user_diff",
             "approve_user_diff_and_start_merge",
+            "confirm_manual_resolution_and_start_merge_continue",
+            "confirm_merge_abort_and_start",
         ]
     );
     for forbidden in [
@@ -1973,6 +1989,34 @@ fn get_planning_result_for_a_missing_task_is_a_safe_not_found_error() {
 }
 
 #[test]
+fn get_post_merge_validation_results_is_hidden_during_post_merge_testing() {
+    let task = task_in_state(chatoms_domain::TaskState::PostMergeTesting);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let results = post_merge_validation::handle_get_post_merge_validation_results(
+        &runtime,
+        &task.id().to_string(),
+    )
+    .expect("partial post-merge results remain hidden");
+    assert!(results.is_empty());
+}
+
+#[test]
+fn get_post_merge_validation_results_is_empty_for_unrelated_recovery() {
+    let task = task_in_state(chatoms_domain::TaskState::RecoveryRequired);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let results = post_merge_validation::handle_get_post_merge_validation_results(
+        &runtime,
+        &task.id().to_string(),
+    )
+    .expect("unrelated recovery remains a safe empty state");
+    assert!(results.is_empty());
+}
+
+#[test]
 fn start_claude_review_without_a_configured_executable_is_unsupported_and_starts_nothing() {
     let calls = Arc::new(CallCounts::default());
     let runtime = ready_runtime_with_git_and_claude_binding(calls.clone(), Ok(true), None);
@@ -2837,5 +2881,526 @@ fn approve_user_diff_rejects_a_malformed_hash_before_touching_git_or_repository(
         )
         .expect_err("malformed hash must be rejected");
         assert_eq!(error.code, "APP_INVALID_INPUT");
+    }
+}
+
+// The remaining preconditions for this combined command --
+// (`ManualMergeResolutionConfirmationService::confirm` re-verifying diff
+// approval, `ProjectRoot` Test/Build approvals, isolation/project identity,
+// live filesystem identity, and the manual-resolution candidate itself, then
+// `MergeContinueStarter::begin` requiring an exact existing confirmation
+// before committing `MergeConflict -> Merging`) all sit behind
+// `GitCliAdapter::from_environment()`, which this crate's other combined
+// merge commands also stop short of exercising in unit tests (see
+// `approve_user_diff_and_start_merge_rejects_missing_project_root_approvals_before_diff_approval_or_merge`
+// above). That confirmation-then-start ordering, the requirement that a
+// stale `expected_version` cannot start a second Git write, the `Continued
+// -> PostMergeTesting` handoff into the reused post-merge validation path,
+// and panic/error containment into `RecoveryRequired` are already covered
+// with real Git fixtures by `chatoms-application`'s
+// `manual_merge_resolution.rs`/`merge_continue.rs` test suites and
+// `chatoms-infrastructure`'s `merge_continue.rs` test suite.
+#[test]
+fn confirm_manual_resolution_and_start_merge_continue_rejects_an_unparseable_task_id_before_confirmation_or_merge()
+ {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        "not-a-task-id",
+        1,
+    )
+    .expect_err("malformed task id must be rejected");
+    assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn confirm_manual_resolution_and_start_merge_continue_rejects_an_unknown_task_before_confirmation_or_merge()
+ {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &TaskId::new().to_string(),
+        1,
+    )
+    .expect_err("a task that does not exist must be rejected");
+    assert_eq!(error.code, "APP_NOT_FOUND");
+}
+
+#[test]
+fn confirm_manual_resolution_and_start_merge_continue_rejects_a_stale_version_before_confirmation_or_merge()
+ {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &task.id().to_string(),
+        task.version() + 1,
+    )
+    .expect_err("a stale expected_version must be rejected before any confirmation or Git write");
+    assert_eq!(error.code, "APP_VERSION_CONFLICT");
+}
+
+#[test]
+fn confirm_manual_resolution_and_start_merge_continue_rejects_a_task_not_in_merge_conflict_before_confirmation_or_merge()
+ {
+    let task = task_in_state(chatoms_domain::TaskState::Testing);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err(
+        "a task outside MergeConflict must be rejected before any confirmation or Git write",
+    );
+    assert_eq!(error.code, "APP_INVALID_STATE");
+}
+
+// `confirm_merge_abort_and_start`'s success path (registering the run,
+// approving, re-running the preflight, and spawning the background
+// `MergeAbortRecorder`) requires a real trusted `GitCliAdapter::from_environment()`,
+// which this crate's other combined merge commands also stop short of
+// exercising in unit tests (see the identical note on
+// `confirm_manual_resolution_and_start_merge_continue`'s tests above). The
+// approval/preflight re-verification, the 4-way outcome mapping into
+// `Cancelled`/no-transition, and panic containment are already covered with
+// real Git fixtures by `chatoms-application`'s `merge_abort.rs` test suite
+// and `chatoms-infrastructure`'s `merge_abort.rs` test suite. What is tested
+// here is strictly this command's own Tauri-layer wiring: the cheap
+// Git-free fail-fast (identical in shape to merge-continue's), and that a
+// task id already registered in `merge_abort_runs` is rejected as
+// `{ started: false }` before this command ever reaches
+// `GitCliAdapter::from_environment()`.
+#[test]
+fn confirm_merge_abort_and_start_rejects_an_unparseable_task_id_before_any_registry_or_git_access()
+{
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error = merge_abort::handle_confirm_merge_abort_and_start(&runtime, "not-a-task-id", 1)
+        .expect_err("malformed task id must be rejected");
+    assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn confirm_merge_abort_and_start_rejects_an_unknown_task_before_any_registry_or_git_access() {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+    let error =
+        merge_abort::handle_confirm_merge_abort_and_start(&runtime, &TaskId::new().to_string(), 1)
+            .expect_err("a task that does not exist must be rejected");
+    assert_eq!(error.code, "APP_NOT_FOUND");
+}
+
+#[test]
+fn confirm_merge_abort_and_start_rejects_a_stale_version_before_any_registry_or_git_access() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let error = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version() + 1,
+    )
+    .expect_err("a stale expected_version must be rejected before any registry or Git access");
+    assert_eq!(error.code, "APP_VERSION_CONFLICT");
+}
+
+#[test]
+fn confirm_merge_abort_and_start_rejects_a_task_not_in_merge_conflict_before_any_registry_or_git_access()
+ {
+    let task = task_in_state(chatoms_domain::TaskState::Testing);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+
+    let error = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("a task outside MergeConflict must be rejected before any registry or Git access");
+    assert_eq!(error.code, "APP_INVALID_STATE");
+}
+
+#[test]
+fn confirm_merge_abort_and_start_returns_started_false_without_touching_git_when_an_abort_is_already_registered()
+ {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    assert!(
+        ready.merge_abort_runs.register(task.id()),
+        "the first registration must succeed so this test simulates a genuinely in-flight abort"
+    );
+
+    let result = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("a duplicate in-flight abort must not be reported as an error");
+
+    assert!(
+        !result.started,
+        "a task id already registered must not start a second background execution"
+    );
+}
+
+// Phase 5e-6: the process-local `MergeConflictWriteLock` shared by
+// `confirm_manual_resolution_and_start_merge_continue` and
+// `confirm_merge_abort_and_start`. Both commands acquire it after their
+// cheap Git-free fail-fast and before anything else -- before
+// `GitCliAdapter::from_environment()`, before any confirmation/approval row
+// is recorded, before `MergeConflict -> Merging` is committed, and before a
+// background thread is spawned -- so a rejection here provably has written
+// nothing. `calls.task` (incremented only by `RepositoryFake::get_task`) is
+// asserted to be exactly 1 on the rejection paths: the single cheap
+// fail-fast read, with no `verify_preconditions`/`verify_abort_preconditions`
+// pass behind it. The RAII release of the lock on background-thread
+// completion and on panic is covered by the guard tests in
+// `commands::merge_continue` and `commands::merge_abort` themselves, which
+// exercise the exact `Drop` impls these commands hand to their threads.
+
+#[test]
+fn merge_continue_is_rejected_as_a_conflict_when_the_shared_write_lock_is_already_held() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_task(Arc::clone(&calls), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    assert!(
+        ready.merge_conflict_writes.register(task.id()),
+        "the first acquisition must succeed so this test simulates a genuinely in-flight write"
+    );
+    let calls_before = calls.task.load(Ordering::SeqCst);
+
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("a merge-conflict write already in flight must reject merge-continue");
+
+    assert_eq!(error.code, "APP_CONFLICT");
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst) - calls_before,
+        1,
+        "only the cheap fail-fast read may run: no confirmation preflight, no starter"
+    );
+    assert!(
+        !ready.merge_conflict_writes.register(task.id()),
+        "the rejected call must not have released the lock held by the in-flight write"
+    );
+}
+
+#[test]
+fn merge_continue_releases_the_shared_write_lock_when_a_synchronous_step_fails() {
+    // With `RepositoryFake::active_lease` returning `Ok(None)`, the
+    // manual-resolution confirmation's preflight fails closed (no active
+    // lease for this task). Whether this call fails there or one step
+    // earlier at `GitCliAdapter::from_environment()`, the lock acquired
+    // just before must be released on the way out.
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("the fake repository cannot satisfy the confirmation preconditions");
+
+    // Not the busy rejection: this call passed the lock gate, which means it
+    // really did acquire the lock, so the assertion below is not vacuous.
+    assert_ne!(
+        error.code, "APP_CONFLICT",
+        "this call must fail after acquiring the lock, not be rejected by it"
+    );
+    assert!(
+        ready.merge_conflict_writes.register(task.id()),
+        "a synchronous failure must release the shared write lock, not leave it held"
+    );
+}
+
+#[test]
+fn merge_abort_returns_started_false_and_leaks_nothing_when_the_shared_write_lock_is_held() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_task(Arc::clone(&calls), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    assert!(
+        ready.merge_conflict_writes.register(task.id()),
+        "the first acquisition must succeed so this test simulates a genuinely in-flight write"
+    );
+    let calls_before = calls.task.load(Ordering::SeqCst);
+
+    let result = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("a blocked abort must not be reported as an error");
+
+    assert!(
+        !result.started,
+        "an abort must not start while another merge-conflict write holds the lock"
+    );
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst) - calls_before,
+        1,
+        "only the cheap fail-fast read may run: no approval, no preflight, no Git write"
+    );
+    assert!(
+        ready.merge_abort_runs.register(task.id()),
+        "the abort-only registry entry taken before the lock check must not be leaked"
+    );
+    assert!(
+        !ready.merge_conflict_writes.register(task.id()),
+        "the blocked abort must not have released the lock held by the in-flight write"
+    );
+}
+
+#[test]
+fn a_duplicate_abort_attempt_never_releases_the_in_flight_abort_shared_lock() {
+    // Ordering invariant: `confirm_merge_abort_and_start` checks its
+    // abort-only registry *before* the shared lock, so a second abort for a
+    // task whose first abort is still writing is rejected without ever
+    // touching -- and therefore without ever releasing -- the lock that
+    // first abort still holds.
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    // An abort whose background write is in flight holds both.
+    assert!(ready.merge_abort_runs.register(task.id()));
+    assert!(ready.merge_conflict_writes.register(task.id()));
+
+    let result = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("a duplicate abort must not be reported as an error");
+
+    assert!(!result.started);
+    assert!(
+        !ready.merge_conflict_writes.register(task.id()),
+        "a duplicate abort must not release the shared lock the in-flight abort still holds"
+    );
+    assert!(
+        !ready.merge_abort_runs.register(task.id()),
+        "a duplicate abort must not release the in-flight abort's own registry entry either"
+    );
+}
+
+#[test]
+fn merge_abort_releases_both_holds_when_approval_or_preflight_fails() {
+    // `RepositoryFake::active_lease` returns `Ok(None)`, so the abort's
+    // approval preflight fails closed. Whether this call fails there or one
+    // step earlier at `GitCliAdapter::from_environment()`, both the
+    // abort-only registry entry and the shared write lock must be released.
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+
+    merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("the fake repository cannot satisfy the abort preconditions");
+
+    assert!(
+        ready.merge_abort_runs.register(task.id()),
+        "a failed abort must release its abort-only registry entry"
+    );
+    assert!(
+        ready.merge_conflict_writes.register(task.id()),
+        "a failed abort must release the shared write lock"
+    );
+}
+
+#[test]
+fn an_in_flight_merge_continue_write_blocks_merge_abort_until_it_finishes() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    // Stands in for a merge-continue whose background write is executing:
+    // the lock is exactly what that thread holds for its duration.
+    assert!(ready.merge_conflict_writes.register(task.id()));
+
+    let blocked = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("a blocked abort must not be reported as an error");
+    assert!(
+        !blocked.started,
+        "an abort must not start while a merge-continue write is executing"
+    );
+
+    // The merge-continue thread finishes and its guard releases the lock.
+    ready.merge_conflict_writes.unregister(task.id());
+
+    // The abort now gets past the lock and fails only on the fake
+    // repository's preconditions -- proving the lock is no longer the
+    // blocker -- and releases both holds again on the way out.
+    merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("the fake repository cannot satisfy the abort preconditions");
+    assert!(
+        ready.merge_conflict_writes.register(task.id()),
+        "the second abort attempt must have acquired and then released the lock"
+    );
+}
+
+#[test]
+fn an_in_flight_merge_abort_write_blocks_merge_continue_until_it_finishes() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    // Stands in for an abort whose background write is executing: it holds
+    // both its abort-only entry and the shared lock for that duration.
+    assert!(ready.merge_abort_runs.register(task.id()));
+    assert!(ready.merge_conflict_writes.register(task.id()));
+
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("merge-continue must not start while an abort write is executing");
+    assert_eq!(error.code, "APP_CONFLICT");
+
+    // The abort thread finishes and its single guard releases both holds.
+    ready.merge_abort_runs.unregister(task.id());
+    ready.merge_conflict_writes.unregister(task.id());
+
+    // Merge-continue now gets past the lock and fails only on the fake
+    // repository's preconditions, releasing the lock again on the way out.
+    merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("the fake repository cannot satisfy the confirmation preconditions");
+    assert!(
+        ready.merge_conflict_writes.register(task.id()),
+        "the second merge-continue attempt must have acquired and then released the lock"
+    );
+}
+
+#[test]
+fn the_shared_write_lock_does_not_exclude_a_different_task() {
+    let held = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let other = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(other.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    assert!(ready.merge_conflict_writes.register(held.id()));
+
+    // A different task has its own original checkout, so its merge-continue
+    // must get past the lock and fail only on the fake repository's
+    // preconditions.
+    merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &other.id().to_string(),
+        other.version(),
+    )
+    .expect_err("the fake repository cannot satisfy the confirmation preconditions");
+
+    assert!(
+        !ready.merge_conflict_writes.register(held.id()),
+        "the other task's in-flight write must still hold its own lock"
+    );
+    assert!(
+        ready.merge_conflict_writes.register(other.id()),
+        "this task acquired and released its own lock independently"
+    );
+}
+
+#[test]
+fn a_blocked_merge_conflict_write_error_carries_no_path_or_git_detail() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+    assert!(ready.merge_conflict_writes.register(task.id()));
+
+    let error = merge_continue::handle_confirm_manual_resolution_and_start_merge_continue(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("a merge-conflict write already in flight must reject merge-continue");
+
+    // `IpcErrorDto`'s only textual fields are `&'static str`, so no runtime
+    // value can reach them by construction. Assert that concretely: this
+    // rejection carries exactly the shared fixed `Conflict` copy that every
+    // other conflict rejection uses, with no merge-specific detail added.
+    let expected = crate::error::IpcErrorDto::from(
+        chatoms_application::error::ApplicationError::from_failure(
+            chatoms_ports::error::FailureCategory::Conflict,
+            chatoms_ports::error::FailureCategory::Conflict.default_severity(),
+            chatoms_ports::error::FailureCategory::Conflict.default_retry(),
+        ),
+    );
+    assert_eq!(error.code, expected.code);
+    assert_eq!(error.message, expected.message);
+
+    let lowered = format!("{} {}", error.code, error.message).to_ascii_lowercase();
+    for forbidden in [
+        "\\",
+        "/",
+        ".git",
+        "merge_head",
+        "merge --continue",
+        "merge --abort",
+        "git",
+        "cargo",
+        "sha256",
+        "diff",
+        "@",
+        "worktree",
+        "checkout",
+        &task.id().to_string(),
+    ] {
+        assert!(
+            !lowered.contains(forbidden),
+            "the busy rejection must not leak `{forbidden}`: {} / {}",
+            error.code,
+            error.message
+        );
     }
 }

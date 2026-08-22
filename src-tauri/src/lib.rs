@@ -35,6 +35,8 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::planning::start_claude_planning,
             commands::planning::cancel_claude_planning,
             commands::planning::get_planning_result,
+            commands::post_merge_validation::get_post_merge_validation_results,
+            commands::merge_conflict_inspection::get_merge_conflict_inspection,
             commands::context_package::get_context_package_planning_readiness,
             commands::planning::start_claude_planning_context_package,
             commands::implementation::start_claude_implementation,
@@ -61,6 +63,8 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::user_diff_review::get_user_diff_for_review,
             commands::user_diff_review::approve_user_diff,
             commands::merge_execution::approve_user_diff_and_start_merge,
+            commands::merge_continue::confirm_manual_resolution_and_start_merge_continue,
+            commands::merge_abort::confirm_merge_abort_and_start,
         ])
         .run(tauri::generate_context!())
 }

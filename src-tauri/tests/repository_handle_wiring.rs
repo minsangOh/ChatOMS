@@ -27,12 +27,14 @@ use chatoms_ports::{
     DatabaseBootstrapPort, DatabaseBootstrapState,
     diff::DiffContentHash,
     git::RepositoryKind,
+    manual_merge_resolution::ManualResolutionDigest,
     path::ResolvedAppPaths,
     provider::ProviderKind,
     repository::{
         AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
         DiffApprovalRecord, FoundationRepository, GitIsolationStatus, HighRiskApprovalRecord,
-        ImplementationResultOutcome, PlanningResultOutcome, PostMergeValidationResultAttempt,
+        ImplementationResultOutcome, ManualMergeResolutionConfirmationRecord,
+        MergeAbortApprovalRecord, PlanningResultOutcome, PostMergeValidationResultAttempt,
         PostMergeValidationResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord,
         ProviderBindingRecord, ProviderConsent, ReviewResultOutcome, TaskGitIsolation,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
@@ -1613,5 +1615,206 @@ fn post_merge_validation_delegation_reaches_real_sqlite_through_both_wrapper_lay
             .expect("active_lease through both wrapper layers"),
         None,
         "Completed must release the active lease"
+    );
+}
+
+/// Advances `task` from `Created` all the way to `MergeConflict` via plain
+/// `save_transition` calls (mirroring `advance`'s "only the stored state
+/// matters" reasoning) -- neither `ensure_manual_merge_resolution_confirmation`/
+/// `save_manual_merge_resolution_transition` nor
+/// `ensure_merge_abort_approval`/`save_merge_abort_transition` need a real
+/// Git isolation record, only the task's current state and version.
+fn advance_to_merge_conflict(repository: &mut RepositoryHandle, task: &mut Task) {
+    advance(repository, task, TaskState::ProjectValidated, 110);
+    advance(repository, task, TaskState::WorktreeCreating, 120);
+    advance(repository, task, TaskState::WorktreeReady, 130);
+    advance(repository, task, TaskState::Planning, 140);
+    advance(repository, task, TaskState::AwaitingDesignApproval, 150);
+    advance(repository, task, TaskState::Implementing, 160);
+    advance(repository, task, TaskState::Testing, 170);
+    advance(repository, task, TaskState::Reviewing, 180);
+    advance(repository, task, TaskState::AwaitingUserDiffApproval, 190);
+    advance(repository, task, TaskState::Merging, 200);
+    advance(repository, task, TaskState::MergeConflict, 210);
+}
+
+#[test]
+fn manual_merge_resolution_confirmation_and_transition_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+ {
+    // Regression test for a delegation gap this Unit found: `RepositoryHandle`
+    // (src-tauri/src/state.rs) had no `with_inner` overrides at all for
+    // `get_manual_merge_resolution_confirmation`,
+    // `ensure_manual_merge_resolution_confirmation`, or
+    // `save_manual_merge_resolution_transition` -- every call silently fell
+    // through to the `FoundationRepository` trait's `OperationFailed`
+    // default instead of ever reaching `SharedFoundationRepository`, the
+    // same class of bug this file's module doc describes for provider
+    // binding and Claude Planning.
+    let (_dir, mut repository) = real_repository_handle("manual-merge-resolution");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    let digest = ManualResolutionDigest::from_digest_bytes([33u8; 32]);
+
+    assert_eq!(
+        repository
+            .get_manual_merge_resolution_confirmation(task.id(), expected_version, digest)
+            .expect(
+                "get_manual_merge_resolution_confirmation must reach the real repository, not \
+                 the trait's OperationFailed default"
+            ),
+        None,
+        "no confirmation has been recorded yet"
+    );
+
+    let created = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest,
+            300,
+        )
+        .expect(
+            "ensure_manual_merge_resolution_confirmation must reach the real repository, not \
+             the trait's OperationFailed default",
+        );
+    assert_eq!(
+        created,
+        ManualMergeResolutionConfirmationRecord {
+            task_id: task.id(),
+            merge_conflict_task_version: expected_version,
+            source_approval_task_version: 0,
+            base_commit: "a".repeat(40),
+            task_commit: "b".repeat(40),
+            merge_head_commit: "b".repeat(40),
+            resolution_digest: digest,
+            confirmed_at_ms: 300,
+        }
+    );
+
+    let reloaded = repository
+        .get_manual_merge_resolution_confirmation(task.id(), expected_version, digest)
+        .expect(
+            "get_manual_merge_resolution_confirmation after ensure must reach the real repository",
+        )
+        .expect("the confirmation just created must be persisted and readable back");
+    assert_eq!(reloaded, created);
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Merging, 310)
+        .expect("MergeConflict -> Merging is a valid domain transition");
+    let record = transition_record(&task, previous_state, 310);
+    repository
+        .save_manual_merge_resolution_transition(expected_version, &task, &record, digest)
+        .expect(
+            "save_manual_merge_resolution_transition must reach the real repository, not the \
+             trait's OperationFailed default",
+        );
+
+    let persisted = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task still exists");
+    assert_eq!(persisted.state(), TaskState::Merging);
+    assert_eq!(persisted.version(), expected_version + 1);
+}
+
+#[test]
+fn merge_abort_approval_and_transition_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+{
+    let (_dir, mut repository) = real_repository_handle("merge-abort");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    assert_eq!(
+        repository
+            .get_merge_abort_approval(task.id(), expected_version)
+            .expect(
+                "get_merge_abort_approval must reach the real repository, not the trait's \
+                 OperationFailed default"
+            ),
+        None,
+        "no approval has been recorded yet"
+    );
+
+    let created = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect(
+            "ensure_merge_abort_approval must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(
+        created,
+        MergeAbortApprovalRecord {
+            task_id: task.id(),
+            merge_conflict_task_version: expected_version,
+            source_approval_task_version: 0,
+            base_commit: "a".repeat(40),
+            task_commit: "b".repeat(40),
+            merge_head_commit: "b".repeat(40),
+            approved_at_ms: 300,
+        }
+    );
+
+    let reloaded = repository
+        .get_merge_abort_approval(task.id(), expected_version)
+        .expect("get_merge_abort_approval after ensure must reach the real repository")
+        .expect("the approval just created must be persisted and readable back");
+    assert_eq!(reloaded, created);
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Cancelled, 310)
+        .expect("MergeConflict -> Cancelled is a valid domain transition");
+    let record = transition_record(&task, previous_state, 310);
+    repository
+        .save_merge_abort_transition(expected_version, &task, &record, true)
+        .expect(
+            "save_merge_abort_transition must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+
+    let persisted = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task still exists");
+    assert_eq!(persisted.state(), TaskState::Cancelled);
+    assert_eq!(persisted.version(), expected_version + 1);
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active_lease through both wrapper layers"),
+        None,
+        "Cancelled must release the active lease"
     );
 }

@@ -8,7 +8,7 @@ import { UserDiffReviewModal } from "../components/UserDiffReviewModal";
 import type { IpcClient } from "../ipc/client";
 import { FrontendError, toFrontendError } from "../ipc/errors";
 import { HIGH_RISK_CATEGORIES } from "../ipc/high_risk_approval";
-import type { ApproveValidationCommandInput, EligibilityBlockingReason, HighRiskCategory, PlanningResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, ReviewResultDto, TaskBriefInput, TaskIsolationDto, ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKind } from "../ipc/types";
+import type { ApproveValidationCommandInput, EligibilityBlockingReason, HighRiskCategory, MergeConflictInspectionDto, PlanningResultDto, PostMergeValidationResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, ReviewResultDto, TaskBriefInput, TaskIsolationDto, ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKind } from "../ipc/types";
 
 type ContextPackagePlanningReadinessLoadState =
   | { kind: "loading" }
@@ -37,6 +37,14 @@ type PlanningResultLoadState =
 type ReviewResultLoadState =
   | { kind: "loading" }
   | { kind: "ready"; result: ReviewResultDto | null }
+  | { kind: "error" };
+type PostMergeValidationLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; results: readonly PostMergeValidationResultDto[] }
+  | { kind: "error" };
+type MergeConflictInspectionLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; result: MergeConflictInspectionDto | null }
   | { kind: "error" };
 type ValidationCandidatesLoadState =
   | { kind: "loading" }
@@ -81,6 +89,8 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [contextPackageReviewReadiness, setContextPackageReviewReadiness] = useState<Record<string, ContextPackageReviewReadinessLoadState>>({});
   const [planningResults, setPlanningResults] = useState<Record<string, PlanningResultLoadState>>({});
   const [reviewResults, setReviewResults] = useState<Record<string, ReviewResultLoadState>>({});
+  const [postMergeValidationResults, setPostMergeValidationResults] = useState<Record<string, PostMergeValidationLoadState>>({});
+  const [mergeConflictInspections, setMergeConflictInspections] = useState<Record<string, MergeConflictInspectionLoadState>>({});
   const [validationCandidates, setValidationCandidates] = useState<Record<string, ValidationCandidatesLoadState>>({});
   const [validationApprovals, setValidationApprovals] = useState<Record<string, ValidationApprovalLoadState>>({});
   const [validationForm, setValidationForm] = useState<ValidationCommandForm>(emptyValidationCommandForm);
@@ -89,6 +99,12 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [highRiskApprovals, setHighRiskApprovals] = useState<Record<string, Partial<Record<HighRiskCategory, HighRiskApprovalLoadState>>>>({});
   const [highRiskApprovalDialog, setHighRiskApprovalDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; category: HighRiskCategory } | null>(null);
   const [userDiffReviewDialog, setUserDiffReviewDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
+  const [mergeContinueDialog, setMergeContinueDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
+  const [mergeContinueConfirmed, setMergeContinueConfirmed] = useState(false);
+  const [mergeAbortDialog, setMergeAbortDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
+  const [mergeAbortConfirmed, setMergeAbortConfirmed] = useState(false);
+  const [mergeAbortNotice, setMergeAbortNotice] = useState<string | null>(null);
+  const [mergeAbortRuns, setMergeAbortRuns] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     let active = true;
@@ -260,6 +276,56 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
 
   useEffect(() => {
     const pending = Object.values(isolations).filter(
+      (isolation) =>
+        (isolation.taskState === "completed" || isolation.taskState === "recoveryRequired") &&
+        postMergeValidationResults[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setPostMergeValidationResults((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const results = await client.getPostMergeValidationResults(isolation.taskId);
+          if (active) setPostMergeValidationResults((current) => ({ ...current, [isolation.taskId]: { kind: "ready", results } }));
+        } catch {
+          if (active) setPostMergeValidationResults((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, postMergeValidationResults]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) => isolation.taskState === "mergeConflict" && mergeConflictInspections[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setMergeConflictInspections((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const result = await client.getMergeConflictInspection(isolation.taskId);
+          if (active) setMergeConflictInspections((current) => ({ ...current, [isolation.taskId]: { kind: "ready", result } }));
+        } catch {
+          if (active) setMergeConflictInspections((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, mergeConflictInspections]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
       (isolation) => isolation.taskState === "testing" && validationCandidates[isolation.taskId] === undefined,
     );
     if (pending.length === 0) return;
@@ -363,7 +429,7 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
 
   useEffect(() => {
     const activeExecutionEntries = Object.entries(isolations).filter(
-      ([, isolation]) => isolation.taskState === "planning" || isolation.taskState === "implementing" || isolation.taskState === "testing" || isolation.taskState === "reviewing" || isolation.taskState === "merging",
+      ([, isolation]) => isolation.taskState === "planning" || isolation.taskState === "implementing" || isolation.taskState === "testing" || isolation.taskState === "reviewing" || isolation.taskState === "merging" || isolation.taskState === "mergeConflict" || isolation.taskState === "postMergeTesting",
     );
     if (activeExecutionEntries.length === 0) return;
     const interval = setInterval(() => {
@@ -371,6 +437,22 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
         activeExecutionEntries.map(async ([projectId, isolation]) => {
           const next = await client.getTaskIsolation(isolation.taskId);
           setIsolations((current) => ({ ...current, [projectId]: next }));
+          if (next.taskState === "mergeConflict") {
+            try {
+              const result = await client.getMergeConflictInspection(next.taskId);
+              setMergeConflictInspections((current) => ({ ...current, [next.taskId]: { kind: "ready", result } }));
+            } catch {
+              setMergeConflictInspections((current) => ({ ...current, [next.taskId]: { kind: "error" } }));
+            }
+            // A background merge abort never changes task state until it is
+            // confirmed one way or another, so this task staying in
+            // `mergeConflict` across a full polling interval is the only
+            // available signal that enough time has passed to safely allow
+            // another attempt. The backend's `MergeAbortRunRegistry` is the
+            // actual safety net against a real duplicate write; this local
+            // flag only prevents an immediate double-click race.
+            setMergeAbortRuns((current) => (current[next.taskId] ? { ...current, [next.taskId]: false } : current));
+          }
         }),
       ).catch(() => {});
     }, 2000);
@@ -616,6 +698,43 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       }));
     });
   };
+  const confirmMergeContinue = async () => {
+    if (!mergeContinueDialog) return;
+    const dialog = mergeContinueDialog;
+    await run(async () => {
+      const result = await client.confirmManualResolutionAndStartMergeContinue(
+        dialog.taskId,
+        dialog.taskVersion,
+      );
+      setMergeContinueDialog(null);
+      setMergeContinueConfirmed(false);
+      setIsolations((current) => {
+        const existing = current[dialog.projectId];
+        if (!existing) return current;
+        return { ...current, [dialog.projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+      });
+    });
+  };
+  const confirmMergeAbort = async () => {
+    if (!mergeAbortDialog) return;
+    const dialog = mergeAbortDialog;
+    await run(async () => {
+      const result = await client.confirmMergeAbortAndStart(dialog.taskId, dialog.taskVersion);
+      if (result.started) {
+        setMergeAbortDialog(null);
+        setMergeAbortConfirmed(false);
+        setMergeAbortNotice(null);
+        // Task state stays `mergeConflict` while the background abort runs;
+        // this flag hides both the continue and abort actions for this task
+        // until the next polling tick (see the polling effect above), which
+        // is what keeps merge-continue and merge-abort from ever appearing
+        // simultaneously executable for the same task.
+        setMergeAbortRuns((current) => ({ ...current, [dialog.taskId]: true }));
+      } else {
+        setMergeAbortNotice("A merge abort is already in progress for this task. Refresh to check its status.");
+      }
+    });
+  };
 
   if (state.kind === "loading") return <LoadingState message="Loading projects" />;
   if (state.kind === "error") return <ErrorState error={state.error} onRetry={retry} />;
@@ -701,6 +820,43 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
         <div className="form-actions">
           <button className="button button--secondary" type="button" onClick={() => setHighRiskApprovalDialog(null)} disabled={busy}>Cancel</button>
           <button className="button" type="button" disabled={busy} onClick={() => void confirmHighRiskApproval()}>Confirm approval</button>
+        </div>
+      </section>
+    </div>;
+  }
+
+  if (mergeContinueDialog) {
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">Merge conflict resolution</p><h1>Confirm the staged merge resolution</h1><p>Git reports no unresolved entries. Continuing will create a merge commit from the currently staged resolution in the original checkout. ChatOMS will stop if that staged result changes before the commit.</p></div></header>
+      <section className="content-card" aria-labelledby="merge-continue-confirm-form"><h2 id="merge-continue-confirm-form">Confirm and continue</h2>
+        <label className="checkbox-row">
+          <input type="checkbox" checked={mergeContinueConfirmed} onChange={(event) => setMergeContinueConfirmed(event.target.checked)} disabled={busy} />
+          I reviewed the staged merge resolution and approve creating the merge commit.
+        </label>
+        <p className="muted">This confirmation is separate from the earlier task diff approval.</p>
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => { setMergeContinueDialog(null); setMergeContinueConfirmed(false); }} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy || !mergeContinueConfirmed} onClick={() => void confirmMergeContinue()}>Confirm and continue</button>
+        </div>
+      </section>
+    </div>;
+  }
+
+  if (mergeAbortDialog) {
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">Merge conflict resolution</p><h1>Abort the in-progress merge</h1><p>This discards the staged merge resolution in the original checkout and restores it to the base commit it had before the merge started. Your task branch and its commit are not deleted. The task is then cancelled and cannot be resumed.</p></div></header>
+      <section className="content-card" aria-labelledby="merge-abort-confirm-form"><h2 id="merge-abort-confirm-form">Confirm abort</h2>
+        <label className="checkbox-row">
+          <input type="checkbox" checked={mergeAbortConfirmed} onChange={(event) => setMergeAbortConfirmed(event.target.checked)} disabled={busy} />
+          I approve aborting the in-progress merge and cancelling this task.
+        </label>
+        <p className="muted">This approval is separate from the earlier task diff approval and from any staged-resolution confirmation.</p>
+        {mergeAbortNotice && <p className="muted">{mergeAbortNotice}</p>}
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => { setMergeAbortDialog(null); setMergeAbortConfirmed(false); setMergeAbortNotice(null); }} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy || !mergeAbortConfirmed} onClick={() => void confirmMergeAbort()}>Confirm abort</button>
         </div>
       </section>
     </div>;
@@ -855,13 +1011,27 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               <button className="button button--secondary" disabled={busy} onClick={() => setUserDiffReviewDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion })}>Review current diff</button>
             </div>}
             {isolation.taskState === "merging" && <p className="muted">The approved change is being committed and merged. This status updates automatically; merge cancellation is not available.</p>}
-            {isolation.taskState === "postMergeTesting" && <p className="muted">The merge completed. Post-merge validation is pending.</p>}
-            {isolation.taskState === "mergeConflict" && <p className="inline-notice">Git reported a merge conflict. ChatOMS did not resolve it automatically; user action is required.</p>}
-            {isolation.taskState === "completed" && <p className="muted">This task is completed. Its active task lease has been released.</p>}
-            {isolation.taskState === "recoveryRequired" && <p className="muted">The task result could not be confirmed. Review the repository safely before proceeding.</p>}
+            {isolation.taskState === "postMergeTesting" && <>
+              <p className="muted">The merge completed. Post-merge validation is pending.</p>
+              <p className="muted">Execution status updates automatically while validation runs.</p>
+            </>}
+            {isolation.taskState === "mergeConflict" && renderMergeConflictInspection(
+              mergeConflictInspections[isolation.taskId],
+              () => { setMergeAbortDialog(null); setMergeContinueDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion }); },
+              () => { setMergeContinueDialog(null); setMergeAbortNotice(null); setMergeAbortDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion }); },
+              mergeAbortRuns[isolation.taskId] === true,
+            )}
+            {isolation.taskState === "completed" && <>
+              <p className="muted">This task is completed. Its active task lease has been released.</p>
+              {renderPostMergeValidationResults(postMergeValidationResults[isolation.taskId])}
+            </>}
+            {isolation.taskState === "recoveryRequired" && <>
+              <p className="muted">The task result could not be confirmed. Review the repository safely before proceeding.</p>
+              {renderPostMergeValidationResults(postMergeValidationResults[isolation.taskId])}
+            </>}
             {isolation.taskState === "failed" && <p className="inline-notice">Claude Planning failed. Review the task before retrying.</p>}
             {isolation.taskState === "cancelled" && <p className="muted">Claude Planning was cancelled.</p>}
-            <button className="button button--secondary" disabled={busy} onClick={() => void run(async () => { const next = await client.getTaskIsolation(isolation.taskId); setIsolations((current) => ({ ...current, [project.id]: next })); })}>Refresh isolation</button>
+            {isolation.taskState !== "mergeConflict" && <button className="button button--secondary" disabled={busy} onClick={() => void run(async () => { const next = await client.getTaskIsolation(isolation.taskId); setIsolations((current) => ({ ...current, [project.id]: next })); })}>Refresh isolation</button>}
           </section>}
         </li>;
       })}</ul>}
@@ -971,6 +1141,101 @@ function renderReviewResult(state: ReviewResultLoadState | undefined) {
   return <div className="review-text-panel" aria-label="Claude Review result">
     <pre className="review-text">{state.result.reviewText}</pre>
   </div>;
+}
+
+function renderPostMergeValidationResults(state: PostMergeValidationLoadState | undefined) {
+  if (state === undefined || state.kind === "loading") {
+    return <p className="muted">Loading post-merge validation results…</p>;
+  }
+  if (state.kind === "error") {
+    return <p className="inline-notice">Post-merge validation results could not be loaded. Refresh to try again.</p>;
+  }
+  if (state.results.length === 0) {
+    return <p className="muted">No post-merge validation results are available for this task.</p>;
+  }
+  return <section className="post-merge-validation-panel" aria-label="Post-merge validation results">
+    <h3>Post-merge validation results</h3>
+    <ul>
+      {state.results.map((result) => <li key={`${result.commandKind}-${result.attemptSequence}`}>
+        <strong>{result.commandKind === "test" ? "Test" : "Build"}</strong>
+        <span className="muted">Outcome: {result.outcome}</span>
+        <span>{result.safeSummary}</span>
+        {result.exitCode !== null && <span className="muted">Exit code: {result.exitCode}</span>}
+      </li>)}
+    </ul>
+  </section>;
+}
+
+const MERGE_CONFLICT_KIND_LABELS = [
+  ["bothModified", "Both modified"],
+  ["bothAdded", "Both added"],
+  ["bothDeleted", "Both deleted"],
+  ["addedByUs", "Added by us"],
+  ["addedByThem", "Added by them"],
+  ["deletedByUs", "Deleted by us"],
+  ["deletedByThem", "Deleted by them"],
+] as const;
+
+function renderMergeConflictInspection(
+  state: MergeConflictInspectionLoadState | undefined,
+  onConfirm: () => void,
+  onAbort: () => void,
+  abortInFlight: boolean,
+) {
+  if (state === undefined || state.kind === "loading") {
+    return <p className="muted">Checking the Git merge state safely…</p>;
+  }
+  if (state.kind === "error") {
+    return <p className="inline-notice">The merge conflict state could not be loaded safely.</p>;
+  }
+  if (state.result === null) {
+    return <p className="muted">No merge conflict inspection is available.</p>;
+  }
+  // Only these three outcomes offer an abort action at all (see
+  // `docs/PHASE_PLAN.md` Phase 5e-4); `inconsistent`/`unavailable` never do.
+  // While a prior abort attempt for this task is still in flight, both the
+  // continue and abort actions are replaced by a status message so the two
+  // writes can never appear simultaneously executable for the same task.
+  const abortAction = abortInFlight
+    ? <p className="muted">A merge abort is in progress for this task. This status updates automatically.</p>
+    : <button className="button button--secondary" onClick={onAbort}>Abort the in-progress merge</button>;
+  switch (state.result.outcome) {
+    case "confirmedUnresolved":
+      {
+        const { counts } = state.result;
+      return <div className="merge-conflict-panel">
+        <div className="inline-notice">
+          <p>Git reported merge conflicts. ChatOMS did not modify or resolve them.</p>
+          <ul>
+            <li>Total: {counts.total}</li>
+            {MERGE_CONFLICT_KIND_LABELS.filter(([key]) => counts[key] > 0).map(([key, label]) => <li key={key}>{label}: {counts[key]}</li>)}
+          </ul>
+        </div>
+        {abortAction}
+      </div>;
+      }
+    case "resolvedPendingConfirmation":
+      return <div className="merge-conflict-panel">
+        <p className="muted">Git no longer reports unmerged entries, but ChatOMS has not confirmed or completed the merge.</p>
+        {!abortInFlight && <button className="button" onClick={onConfirm}>Confirm the staged merge resolution</button>}
+        {abortAction}
+      </div>;
+    case "restoredPendingAbortConfirmation":
+      return <div className="merge-conflict-panel">
+        <p className="muted">Git reports no merge in progress, and the original checkout already matches the base state it had before the merge started. This task has not yet been confirmed cancelled.</p>
+        {abortAction}
+      </div>;
+    case "inconsistent":
+      return <p className="inline-notice">The saved task and current Git merge state do not match. No merge action was attempted.</p>;
+    case "unavailable":
+      return <p className="inline-notice">The merge conflict state could not be verified safely. No merge action was attempted.</p>;
+    default:
+      return assertNever(state.result.outcome);
+  }
+}
+
+function assertNever(_value: never): never {
+  throw new Error("Unexpected merge conflict inspection outcome.");
 }
 
 export function formatTimestamp(value: number): string {

@@ -36,7 +36,7 @@ fn run_registry(
 
 #[test]
 fn production_registry_and_checksum_policy_are_valid() {
-    assert_eq!(FOUNDATION_MIGRATION.len(), 20);
+    assert_eq!(FOUNDATION_MIGRATION.len(), 22);
     assert_eq!(FOUNDATION_MIGRATION[0].version, 1);
     assert_eq!(FOUNDATION_MIGRATION[0].name, "foundation");
     assert_eq!(FOUNDATION_MIGRATION[1].version, 2);
@@ -92,6 +92,13 @@ fn production_registry_and_checksum_policy_are_valid() {
         FOUNDATION_MIGRATION[19].name,
         "scoped_post_merge_validation"
     );
+    assert_eq!(FOUNDATION_MIGRATION[20].version, 21);
+    assert_eq!(
+        FOUNDATION_MIGRATION[20].name,
+        "manual_merge_resolution_confirmations"
+    );
+    assert_eq!(FOUNDATION_MIGRATION[21].version, 22);
+    assert_eq!(FOUNDATION_MIGRATION[21].name, "task_merge_abort_approvals");
     validate_registry(&FOUNDATION_MIGRATION).expect("production registry must be valid");
 
     for migration in FOUNDATION_MIGRATION {
@@ -595,8 +602,8 @@ fn registry_rejects_zero_non_one_start_duplicates_order_and_empty_fields() {
 fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     let database = TestDatabase::empty();
     let first = run_registry(&database, &FOUNDATION_MIGRATION).expect("first migration run");
-    assert_eq!(first.schema_version, 20);
-    assert_eq!(first.applied_count, 20);
+    assert_eq!(first.schema_version, 22);
+    assert_eq!(first.applied_count, 22);
 
     let connection = database.open_raw();
     let metadata: (i64, String, String, i64) = connection
@@ -622,7 +629,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
     drop(connection);
 
     let second = run_registry(&database, &FOUNDATION_MIGRATION).expect("second migration run");
-    assert_eq!(second.schema_version, 20);
+    assert_eq!(second.schema_version, 22);
     assert_eq!(second.applied_count, 0);
     let connection = database.open_raw();
     let schema_after: String = connection
@@ -634,7 +641,7 @@ fn empty_database_applies_foundation_and_reopen_is_a_no_op() {
         )
         .expect("read schema snapshot after reopen");
     assert_eq!(schema_after, schema_before);
-    assert_eq!(count_rows(&connection, "schema_migrations"), 20);
+    assert_eq!(count_rows(&connection, "schema_migrations"), 22);
     let metadata_after: (i64, String, String, i64) = connection
         .query_row(
             "SELECT version, name, checksum_sha256, applied_at_ms
@@ -1433,8 +1440,8 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let outcome = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("apply provider-neutral state migration");
-            assert_eq!(outcome.schema_version, 20);
-            assert_eq!(outcome.applied_count, 17);
+            assert_eq!(outcome.schema_version, 22);
+            assert_eq!(outcome.applied_count, 19);
 
             let connection = database.open_raw();
             assert_provider_state_fixture_migrated(
@@ -1449,7 +1456,7 @@ fn v4_migrates_provider_bound_states_and_preserves_task_lifecycle_data() {
 
             let rerun = run_registry(&database, &FOUNDATION_MIGRATION)
                 .expect("re-run provider-neutral state migration");
-            assert_eq!(rerun.schema_version, 20);
+            assert_eq!(rerun.schema_version, 22);
             assert_eq!(rerun.applied_count, 0);
         }
     }
@@ -1493,13 +1500,13 @@ fn v5_adds_task_briefs_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(&database.open_raw(), "task_briefs"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1557,13 +1564,13 @@ fn v6_adds_provider_consents_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(&database.open_raw(), "task_provider_consents"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -1667,13 +1674,13 @@ fn v7_adds_task_planning_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(&database.open_raw(), "task_planning_results"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2115,8 +2122,8 @@ fn v17_adds_context_package_manifests_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(
         &database.open_raw(),
         "context_package_manifests"
@@ -2124,7 +2131,7 @@ fn v17_adds_context_package_manifests_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2271,13 +2278,13 @@ fn v15_adds_task_review_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(&database.open_raw(), "task_review_results"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2388,8 +2395,8 @@ fn v9_adds_task_implementation_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(
         &database.open_raw(),
         "task_implementation_results"
@@ -2397,7 +2404,7 @@ fn v9_adds_task_implementation_results_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2494,8 +2501,8 @@ fn v10_adds_task_validation_command_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(
         &database.open_raw(),
         "task_validation_command_approvals"
@@ -2503,7 +2510,7 @@ fn v10_adds_task_validation_command_approvals_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2668,8 +2675,8 @@ fn v13_adds_task_validation_command_results_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(
         &database.open_raw(),
         "task_validation_command_results"
@@ -2677,7 +2684,7 @@ fn v13_adds_task_validation_command_results_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2686,8 +2693,8 @@ fn v18_adds_task_high_risk_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(
         &database.open_raw(),
         "task_high_risk_approvals"
@@ -2695,7 +2702,7 @@ fn v18_adds_task_high_risk_approvals_forward_only_and_idempotently() {
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2818,13 +2825,13 @@ fn v19_adds_task_diff_approvals_forward_only_and_idempotently() {
     let database = TestDatabase::empty();
     let outcome =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
-    assert_eq!(outcome.schema_version, 20);
-    assert_eq!(outcome.applied_count, 20);
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
     assert!(table_exists(&database.open_raw(), "task_diff_approvals"));
 
     let rerun =
         run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
-    assert_eq!(rerun.schema_version, 20);
+    assert_eq!(rerun.schema_version, 22);
     assert_eq!(rerun.applied_count, 0);
 }
 
@@ -2877,7 +2884,7 @@ fn v20_backfills_existing_validation_evidence_as_task_worktree_without_loss() {
         .expect("seed v19 result");
     drop(connection);
 
-    let outcome = run_registry(&database, &FOUNDATION_MIGRATION).expect("apply v20");
+    let outcome = run_registry(&database, &FOUNDATION_MIGRATION[..20]).expect("apply v20");
     assert_eq!(outcome.schema_version, 20);
     assert_eq!(outcome.applied_count, 1);
 
@@ -3049,6 +3056,381 @@ fn task_diff_approvals_reject_malformed_hash_duplicate_and_version_mismatch_and_
     assert!(index_exists, "task_id index must exist");
 
     assert_eq!(count_rows(&connection, "task_diff_approvals"), 3);
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn task_manual_merge_resolution_confirmations_enforce_state_binding_shape_and_immutability() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "conflict-task", "project");
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'MergeConflict' WHERE id = 'conflict-task'",
+            [],
+        )
+        .expect("move fixture task into MergeConflict");
+
+    let base_commit = "a".repeat(40);
+    let task_commit = "b".repeat(40);
+    let digest_a = "c".repeat(64);
+    let digest_b = "d".repeat(64);
+
+    connection
+        .execute(
+            "INSERT INTO task_manual_merge_resolution_confirmations (
+                task_id, merge_conflict_task_version, source_approval_task_version,
+                base_commit_hex, task_commit_hex, merge_head_hex,
+                resolution_digest_hex, confirmed_at_ms
+             ) VALUES ('conflict-task', 0, 0, ?1, ?2, ?2, ?3, 100)",
+            [&base_commit, &task_commit, &digest_a],
+        )
+        .expect("a well-formed confirmation for the exact MergeConflict version must insert");
+    connection
+        .execute(
+            "INSERT INTO task_manual_merge_resolution_confirmations (
+                task_id, merge_conflict_task_version, source_approval_task_version,
+                base_commit_hex, task_commit_hex, merge_head_hex,
+                resolution_digest_hex, confirmed_at_ms
+             ) VALUES ('conflict-task', 0, 0, ?1, ?2, ?2, ?3, 100)",
+            [&base_commit, &task_commit, &digest_b],
+        )
+        .expect("a distinct digest for the same task/version is its own row");
+    assert_eq!(
+        count_rows(&connection, "task_manual_merge_resolution_confirmations"),
+        2
+    );
+
+    let duplicate = connection.execute(
+        "INSERT INTO task_manual_merge_resolution_confirmations (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex,
+            resolution_digest_hex, confirmed_at_ms
+         ) VALUES ('conflict-task', 0, 0, ?1, ?2, ?2, ?3, 200)",
+        [&base_commit, &task_commit, &digest_a],
+    );
+    assert!(
+        duplicate.as_ref().is_err_and(is_constraint_error),
+        "duplicate (task_id, merge_conflict_task_version, resolution_digest_hex) must be rejected"
+    );
+
+    let wrong_state = connection.execute(
+        "INSERT INTO task_manual_merge_resolution_confirmations (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex,
+            resolution_digest_hex, confirmed_at_ms
+         ) VALUES ('project-only-no-such-task', 0, 0, ?1, ?2, ?2, ?3, 100)",
+        [&base_commit, &task_commit, &"e".repeat(64)],
+    );
+    assert!(
+        wrong_state.as_ref().is_err(),
+        "a confirmation for a nonexistent task must be rejected"
+    );
+
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'Merging', version = 1 WHERE id = 'conflict-task'",
+            [],
+        )
+        .expect("move fixture task out of MergeConflict");
+    let not_merge_conflict = connection.execute(
+        "INSERT INTO task_manual_merge_resolution_confirmations (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex,
+            resolution_digest_hex, confirmed_at_ms
+         ) VALUES ('conflict-task', 1, 0, ?1, ?2, ?2, ?3, 100)",
+        [&base_commit, &task_commit, &"f".repeat(64)],
+    );
+    assert!(
+        not_merge_conflict.as_ref().is_err_and(is_constraint_error),
+        "a confirmation bound to a version whose current state is not MergeConflict must be rejected"
+    );
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'MergeConflict' WHERE id = 'conflict-task'",
+            [],
+        )
+        .expect("restore fixture task to MergeConflict at version 1");
+    let stale_version = connection.execute(
+        "INSERT INTO task_manual_merge_resolution_confirmations (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex,
+            resolution_digest_hex, confirmed_at_ms
+         ) VALUES ('conflict-task', 0, 0, ?1, ?2, ?2, ?3, 100)",
+        [&base_commit, &task_commit, &"1".repeat(64)],
+    );
+    assert!(
+        stale_version.as_ref().is_err_and(is_constraint_error),
+        "a confirmation bound to a version other than the task's current version must be rejected"
+    );
+
+    let malformed_cases: Vec<(String, String, String, String, &str)> = vec![
+        (
+            base_commit.clone(),
+            task_commit.clone(),
+            "b".repeat(63),
+            digest_a.clone(),
+            "malformed merge_head length",
+        ),
+        (
+            base_commit.clone(),
+            task_commit.clone(),
+            task_commit.clone(),
+            "g".repeat(63),
+            "malformed digest length",
+        ),
+        (
+            base_commit.clone(),
+            task_commit.clone(),
+            "B".repeat(40),
+            digest_a.clone(),
+            "uppercase merge_head",
+        ),
+        (
+            task_commit.clone(),
+            task_commit.clone(),
+            task_commit.clone(),
+            "h".repeat(64),
+            "base_commit equal to task_commit",
+        ),
+        (
+            base_commit.clone(),
+            task_commit.clone(),
+            base_commit.clone(),
+            "i".repeat(64),
+            "task_commit not equal to merge_head",
+        ),
+    ];
+    for (base, task, merge_head, digest, label) in malformed_cases {
+        let rejected = connection.execute(
+            "INSERT INTO task_manual_merge_resolution_confirmations (
+                task_id, merge_conflict_task_version, source_approval_task_version,
+                base_commit_hex, task_commit_hex, merge_head_hex,
+                resolution_digest_hex, confirmed_at_ms
+             ) VALUES ('conflict-task', 1, 0, ?1, ?2, ?3, ?4, 100)",
+            [&base, &task, &merge_head, &digest],
+        );
+        assert!(
+            rejected.as_ref().is_err_and(is_constraint_error),
+            "{label} must be rejected"
+        );
+    }
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_manual_merge_resolution_confirmations SET confirmed_at_ms = 999
+             WHERE task_id = 'conflict-task' AND merge_conflict_task_version = 0",
+            [],
+        )
+        .expect_err("task_manual_merge_resolution_confirmations must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_manual_merge_resolution_confirmations
+             WHERE task_id = 'conflict-task' AND merge_conflict_task_version = 0",
+            [],
+        )
+        .expect_err("task_manual_merge_resolution_confirmations rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    let index_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type = 'index'
+                  AND name = 'task_manual_merge_resolution_confirmations_task_id_idx'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query index existence");
+    assert!(index_exists, "task_id index must exist");
+
+    assert_eq!(
+        count_rows(&connection, "task_manual_merge_resolution_confirmations"),
+        2
+    );
+    assert_eq!(foreign_key_violation_count(&connection), 0);
+}
+
+#[test]
+fn v22_adds_task_merge_abort_approvals_forward_only_and_idempotently() {
+    let database = TestDatabase::empty();
+    let outcome =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("apply full foundation registry");
+    assert_eq!(outcome.schema_version, 22);
+    assert_eq!(outcome.applied_count, 22);
+    assert!(table_exists(
+        &database.open_raw(),
+        "task_merge_abort_approvals"
+    ));
+
+    let rerun =
+        run_registry(&database, &FOUNDATION_MIGRATION).expect("re-run full foundation registry");
+    assert_eq!(rerun.schema_version, 22);
+    assert_eq!(rerun.applied_count, 0);
+}
+
+#[test]
+fn task_merge_abort_approvals_enforce_state_binding_pk_and_immutability() {
+    let database = TestDatabase::migrated();
+    let mut connection = database.open_raw();
+    insert_project(&connection, "project");
+    create_active_task(&mut connection, "conflict-task", "project");
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'MergeConflict' WHERE id = 'conflict-task'",
+            [],
+        )
+        .expect("move fixture task into MergeConflict");
+
+    let base_commit = "a".repeat(40);
+    let task_commit = "b".repeat(40);
+
+    connection
+        .execute(
+            "INSERT INTO task_merge_abort_approvals (
+                task_id, merge_conflict_task_version, source_approval_task_version,
+                base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+             ) VALUES ('conflict-task', 0, 0, ?1, ?2, ?2, 100)",
+            [&base_commit, &task_commit],
+        )
+        .expect("a well-formed approval for the exact MergeConflict version must insert");
+    assert_eq!(count_rows(&connection, "task_merge_abort_approvals"), 1);
+
+    let duplicate = connection.execute(
+        "INSERT INTO task_merge_abort_approvals (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+         ) VALUES ('conflict-task', 0, 0, ?1, ?2, ?2, 200)",
+        [&base_commit, &task_commit],
+    );
+    assert!(
+        duplicate.as_ref().is_err_and(is_constraint_error),
+        "duplicate (task_id, merge_conflict_task_version) must be rejected even with different values -- unlike task_manual_merge_resolution_confirmations, there is no digest to distinguish rows"
+    );
+
+    let wrong_task = connection.execute(
+        "INSERT INTO task_merge_abort_approvals (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+         ) VALUES ('no-such-task', 0, 0, ?1, ?2, ?2, 100)",
+        [&base_commit, &task_commit],
+    );
+    assert!(
+        wrong_task.as_ref().is_err(),
+        "an approval for a nonexistent task must be rejected"
+    );
+
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'Merging', version = 1 WHERE id = 'conflict-task'",
+            [],
+        )
+        .expect("move fixture task out of MergeConflict");
+    let not_merge_conflict = connection.execute(
+        "INSERT INTO task_merge_abort_approvals (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+         ) VALUES ('conflict-task', 1, 0, ?1, ?2, ?2, 100)",
+        [&base_commit, &task_commit],
+    );
+    assert!(
+        not_merge_conflict.as_ref().is_err_and(is_constraint_error),
+        "an approval bound to a version whose current state is not MergeConflict must be rejected"
+    );
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'MergeConflict' WHERE id = 'conflict-task'",
+            [],
+        )
+        .expect("restore fixture task to MergeConflict at version 1");
+    let stale_version = connection.execute(
+        "INSERT INTO task_merge_abort_approvals (
+            task_id, merge_conflict_task_version, source_approval_task_version,
+            base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+         ) VALUES ('conflict-task', 0, 0, ?1, ?2, ?2, 100)",
+        [&base_commit, &task_commit],
+    );
+    assert!(
+        stale_version.as_ref().is_err_and(is_constraint_error),
+        "an approval bound to a version other than the task's current version must be rejected"
+    );
+
+    let malformed_cases: Vec<(String, String, String, &str)> = vec![
+        (
+            base_commit.clone(),
+            task_commit.clone(),
+            "b".repeat(63),
+            "malformed merge_head length",
+        ),
+        (
+            base_commit.clone(),
+            task_commit.clone(),
+            "B".repeat(40),
+            "uppercase merge_head",
+        ),
+        (
+            task_commit.clone(),
+            task_commit.clone(),
+            task_commit.clone(),
+            "base_commit equal to task_commit",
+        ),
+        (
+            base_commit.clone(),
+            task_commit.clone(),
+            base_commit.clone(),
+            "task_commit not equal to merge_head",
+        ),
+    ];
+    for (base, task, merge_head, label) in malformed_cases {
+        let rejected = connection.execute(
+            "INSERT INTO task_merge_abort_approvals (
+                task_id, merge_conflict_task_version, source_approval_task_version,
+                base_commit_hex, task_commit_hex, merge_head_hex, approved_at_ms
+             ) VALUES ('conflict-task', 1, 0, ?1, ?2, ?3, 100)",
+            [&base, &task, &merge_head],
+        );
+        assert!(
+            rejected.as_ref().is_err_and(is_constraint_error),
+            "{label} must be rejected"
+        );
+    }
+
+    let update_error = connection
+        .execute(
+            "UPDATE task_merge_abort_approvals SET approved_at_ms = 999
+             WHERE task_id = 'conflict-task' AND merge_conflict_task_version = 0",
+            [],
+        )
+        .expect_err("task_merge_abort_approvals must be immutable");
+    assert!(is_constraint_error(&update_error));
+
+    let delete_error = connection
+        .execute(
+            "DELETE FROM task_merge_abort_approvals
+             WHERE task_id = 'conflict-task' AND merge_conflict_task_version = 0",
+            [],
+        )
+        .expect_err("task_merge_abort_approvals rows must not be deletable");
+    assert!(is_constraint_error(&delete_error));
+
+    let index_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type = 'index'
+                  AND name = 'task_merge_abort_approvals_task_id_idx'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query index existence");
+    assert!(index_exists, "task_id index must exist");
+
+    assert_eq!(count_rows(&connection, "task_merge_abort_approvals"), 1);
     assert_eq!(foreign_key_violation_count(&connection), 0);
 }
 

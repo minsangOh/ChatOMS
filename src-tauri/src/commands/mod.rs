@@ -2,8 +2,12 @@ pub mod context_package;
 pub mod git_isolation;
 pub mod high_risk_approval;
 pub mod implementation;
+pub mod merge_abort;
+pub mod merge_conflict_inspection;
+pub mod merge_continue;
 pub mod merge_execution;
 pub mod planning;
+pub mod post_merge_validation;
 pub mod projects;
 pub mod provider;
 pub mod provider_eligibility;
@@ -14,7 +18,7 @@ pub mod testing;
 pub mod user_diff_review;
 pub mod validation_commands;
 
-pub const REGISTERED_HANDLERS: [&str; 48] = [
+pub const REGISTERED_HANDLERS: [&str; 52] = [
     "get_version",
     "get_health",
     "get_system_status",
@@ -37,6 +41,8 @@ pub const REGISTERED_HANDLERS: [&str; 48] = [
     "start_claude_planning",
     "cancel_claude_planning",
     "get_planning_result",
+    "get_post_merge_validation_results",
+    "get_merge_conflict_inspection",
     "get_context_package_planning_readiness",
     "start_claude_planning_context_package",
     "start_claude_implementation",
@@ -63,6 +69,8 @@ pub const REGISTERED_HANDLERS: [&str; 48] = [
     "get_user_diff_for_review",
     "approve_user_diff",
     "approve_user_diff_and_start_merge",
+    "confirm_manual_resolution_and_start_merge_continue",
+    "confirm_merge_abort_and_start",
 ];
 
 #[cfg(test)]
