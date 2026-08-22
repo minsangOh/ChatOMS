@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use chatoms_app_lib::state::RepositoryHandle;
 use chatoms_domain::{
-    ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, Task, TaskId, TaskState,
-    TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind,
-    ValidationExecutionScope, WorkKind,
+    ActorKind, ContextDataScope, HighRiskCategory, OperationRiskKind, ProjectId, ReasonCode,
+    TargetIdentityDigest, Task, TaskId, TaskState, TaskStateTransition, TaskStateTransitionId,
+    TaskStateTransitionSnapshot, ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::bootstrap::{DatabaseBootstrapAdapter, SharedDatabase};
 use chatoms_ports::{
@@ -34,12 +34,12 @@ use chatoms_ports::{
         AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
         DiffApprovalRecord, FoundationRepository, GitIsolationStatus, HighRiskApprovalRecord,
         ImplementationResultOutcome, ManualMergeResolutionConfirmationRecord,
-        MergeAbortApprovalRecord, PlanningResultOutcome, PostMergeValidationResultAttempt,
-        PostMergeValidationResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord,
-        ProviderBindingRecord, ProviderConsent, ReviewResultOutcome, TaskGitIsolation,
-        TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
-        ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
-        ValidationCommandResultOutcome,
+        MergeAbortApprovalRecord, OperationRiskDeclarationRecord, PlanningResultOutcome,
+        PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
+        ProjectFilesystemIdentityRecord, ProjectRecord, ProviderBindingRecord, ProviderConsent,
+        ReviewResultOutcome, TaskGitIsolation, TaskImplementationResultRecord,
+        TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
+        ValidationCommandResultAttempt, ValidationCommandResultOutcome,
     },
 };
 
@@ -1253,6 +1253,45 @@ fn worktree_ready_task_with_real_isolation(
         .expect("worktree ready completion through both wrapper layers");
 
     task
+}
+
+#[test]
+fn operation_risk_declaration_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("operation-risk-declaration");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed owning project");
+    let mut task = worktree_ready_task_with_real_isolation(&mut repository, project_id);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    let declaration = OperationRiskDeclarationRecord {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        operation_kind: OperationRiskKind::ProviderImplementation,
+        target_identity_digest: TargetIdentityDigest::from_digest_bytes([12; 32]),
+        declared_at_ms: 200,
+    };
+
+    repository
+        .declare_operation_risk(&declaration, &[])
+        .expect("declaration must reach real repository");
+
+    let stored = repository
+        .get_operation_risk_declaration(
+            task.id(),
+            task.version(),
+            OperationRiskKind::ProviderImplementation,
+        )
+        .expect("lookup must reach real repository")
+        .expect("declaration exists");
+    assert_eq!(stored.record, declaration);
+    assert!(stored.risk_categories.is_empty());
 }
 
 #[test]

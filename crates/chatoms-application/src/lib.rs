@@ -14,6 +14,7 @@ pub mod merge_conflict_inspection;
 pub mod merge_continue;
 pub mod merge_execution;
 pub mod merge_provenance;
+pub mod operation_risk_declaration;
 pub mod planning_execution;
 pub mod post_merge_validation;
 pub mod post_merge_validation_execution;

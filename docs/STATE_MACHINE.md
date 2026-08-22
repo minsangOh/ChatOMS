@@ -23,8 +23,8 @@
 | `GitInitialized` | 승인된 Git 초기화와 초기 snapshot 완료 | `WorktreeCreating`, `Failed` | 완료된 승인 필요 | 가능 |
 | `WorktreeCreating` | 기준 commit을 고정하고 예약된 task branch를 실제 생성한 뒤 worktree 생성 중 | `WorktreeReady`, `RecoveryRequired`, `Failed`, `Cancelled` | 없음 | 조건부 |
 | `WorktreeReady` | 작업 전용 branch와 worktree 검증 완료 | `Planning`, `Paused`, `Cancelled` | 공급자 전송 동의 필요 | 가능 |
-| `Planning` | 사용자가 선택한 eligible provider가 요구사항·설계 분석 중 | `AwaitingDesignApproval`, `Implementing`, `Paused`, `Failed`, `RecoveryRequired`, `Cancelled` | 고위험 설계일 때만 필요 | 가능 |
-| `AwaitingDesignApproval` | 고위험 설계와 영향 설명이 준비됨 | `Implementing`, `Paused`, `Cancelled` | 구현 전 필요 | 가능 |
+| `Planning` | 사용자가 선택한 eligible provider가 요구사항·설계 분석 중 | `AwaitingDesignApproval`, `Implementing`, `Paused`, `Failed`, `RecoveryRequired`, `Cancelled` | Implementation 전 항상 필요 | 가능 |
+| `AwaitingDesignApproval` | Implementation 전 정책 확인과 고위험 영향 설명이 준비됨 | `Implementing`, `Paused`, `Cancelled` | 구현 전 필요 | 가능 |
 | `Implementing` | 사용자가 선택한 eligible provider가 승인 범위 안에서 worktree를 수정 중 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 범위 밖 동작은 별도 승인 | 가능 |
 | `Testing` | 선택된 format/lint/type/test/build 검증 실행 중 | `AutoFixing`, `Reviewing`, `Paused`, `Failed`, `RecoveryRequired` | 승인 대상 명령이면 필요 | 가능 |
 | `AutoFixing` | 서로 다른 가설로 테스트 실패 수정 중, 최대 2회 | `Testing`, `Paused`, `Failed`, `RecoveryRequired` | 금지 범위 변경은 자동 전이 불가 | 가능 |
@@ -103,7 +103,7 @@
 
 - `AwaitingGitInitApproval → GitInitialized`
 - `WorktreeReady → Planning`: 작업별 공급자 전송 1회 동의
-- `AwaitingDesignApproval → Implementing`
+- `AwaitingDesignApproval → Implementing`: 모든 Implementation 전 정책 확인
 - 승인 범위를 확대하는 구현·테스트·리뷰 수정
 - `AwaitingUserDiffApproval → Merging`
 - 의미 판단이 필요한 `MergeConflict → Merging`

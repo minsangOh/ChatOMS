@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
 use chatoms_domain::{
-    ActorKind, ContextDataScope, GitOperationId, HighRiskCategory, ProjectId, ReasonCode, Task,
-    TaskBranchIdentity, TaskId, TaskSnapshot, TaskState, TaskStateTransition,
-    TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind,
+    ActorKind, ContextDataScope, GitOperationId, HighRiskCategory, OperationRiskKind, ProjectId,
+    ReasonCode, TargetIdentityDigest, Task, TaskBranchIdentity, TaskId, TaskSnapshot, TaskState,
+    TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind,
     ValidationExecutionScope, WorkKind,
 };
 use chatoms_ports::diff::DiffContentHash;
@@ -15,13 +15,14 @@ use chatoms_ports::repository::{
     DiffApprovalRecord, FoundationRepository, GitInitApproval, GitIsolationStatus,
     GitOperationAttempt, GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt,
     GitOperationReceiptKind, HighRiskApprovalRecord, ImplementationResultOutcome,
-    ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord, PlanningResultOutcome,
-    PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
-    PostMergeValidationResultRecord, ProjectFilesystemIdentityRecord, ProjectRecord,
-    ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError, RepositoryErrorCode,
-    ReviewResultOutcome, TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
-    TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
-    ValidationCommandResultAttempt, ValidationCommandResultOutcome, ValidationCommandResultRecord,
+    ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord, OperationRiskDeclaration,
+    OperationRiskDeclarationRecord, PlanningResultOutcome, PostMergeValidationResultAttempt,
+    PostMergeValidationResultOutcome, PostMergeValidationResultRecord,
+    ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
+    ProviderConsent, RepositoryError, RepositoryErrorCode, ReviewResultOutcome, TaskBriefRecord,
+    TaskGitIsolation, TaskImplementationResultRecord, TaskPlanningResultRecord,
+    TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+    ValidationCommandResultOutcome, ValidationCommandResultRecord,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -947,6 +948,79 @@ impl FoundationRepository for SqliteFoundationRepository<'_> {
         };
         transaction.commit().map_err(operation_failed)?;
         Ok(approval)
+    }
+
+    fn declare_operation_risk(
+        &mut self,
+        declaration: &OperationRiskDeclarationRecord,
+        risk_categories: &[HighRiskCategory],
+    ) -> Result<(), RepositoryError> {
+        validate_operation_risk_declaration_shape(declaration, risk_categories)?;
+        let transaction = self
+            .database
+            .raw_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_unavailable)?;
+        let current = load_task(&transaction, declaration.task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != declaration.approved_task_version {
+            return Err(repository_error(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::AwaitingDesignApproval {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        if query_active_lease(&transaction)?.map(|lease| lease.task_id) != Some(declaration.task_id)
+        {
+            return Err(repository_error(RepositoryErrorCode::ActiveLeaseConflict));
+        }
+        let isolation = load_isolation(&transaction, declaration.task_id)?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.project_id != current.project_id()
+            || isolation.status != GitIsolationStatus::WorktreeReady
+            || !isolation.branch_created_by_app
+            || !isolation.worktree_created_by_app
+            || isolation.worktree_path.is_none()
+        {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+        let project_identity = load_project_identity(&transaction, current.project_id())?
+            .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        if !project_identity.confirmed {
+            return Err(repository_error(
+                RepositoryErrorCode::InvalidPersistenceState,
+            ));
+        }
+        for category in risk_categories {
+            if load_high_risk_approval(
+                &transaction,
+                declaration.task_id,
+                declaration.approved_task_version,
+                *category,
+            )?
+            .is_none()
+            {
+                return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+            }
+        }
+        insert_operation_risk_declaration(&transaction, declaration)?;
+        for category in risk_categories {
+            insert_operation_risk_category(&transaction, declaration, *category)?;
+        }
+        transaction.commit().map_err(operation_failed)
+    }
+
+    fn get_operation_risk_declaration(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        operation_kind: OperationRiskKind,
+    ) -> Result<Option<OperationRiskDeclaration>, RepositoryError> {
+        load_operation_risk_declaration(
+            self.database.raw_mut(),
+            task_id,
+            approved_task_version,
+            operation_kind,
+        )
     }
 
     fn save_diff_approval(&mut self, approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {
@@ -2825,6 +2899,155 @@ fn load_high_risk_approval(
         approved_task_version,
         risk_category,
         approved_at_ms,
+    }))
+}
+
+fn validate_operation_risk_declaration_shape(
+    declaration: &OperationRiskDeclarationRecord,
+    risk_categories: &[HighRiskCategory],
+) -> Result<(), RepositoryError> {
+    if declaration.declared_at_ms < 0 {
+        return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+    }
+    for (index, category) in risk_categories.iter().enumerate() {
+        if risk_categories[index + 1..].contains(category) {
+            return Err(repository_error(RepositoryErrorCode::InvalidAggregate));
+        }
+    }
+    Ok(())
+}
+
+fn insert_operation_risk_declaration(
+    connection: &Connection,
+    declaration: &OperationRiskDeclarationRecord,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_operation_risk_declarations (
+                task_id, approved_task_version, operation_kind,
+                target_identity_digest_hex, declared_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                declaration.task_id.to_string(),
+                to_sql_integer(declaration.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                declaration.operation_kind.persisted_text(),
+                declaration.target_identity_digest.to_hex(),
+                declaration.declared_at_ms,
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+fn insert_operation_risk_category(
+    connection: &Connection,
+    declaration: &OperationRiskDeclarationRecord,
+    risk_category: HighRiskCategory,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO task_operation_risk_categories (
+                task_id, approved_task_version, operation_kind, risk_category
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                declaration.task_id.to_string(),
+                to_sql_integer(declaration.approved_task_version)
+                    .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?,
+                declaration.operation_kind.persisted_text(),
+                risk_category.persisted_text(),
+            ],
+        )
+        .map_err(|source| {
+            RepositoryError::with_source(RepositoryErrorCode::InvalidAggregate, source)
+        })?;
+    Ok(())
+}
+
+fn load_operation_risk_declaration(
+    connection: &Connection,
+    task_id: TaskId,
+    approved_task_version: u64,
+    operation_kind: OperationRiskKind,
+) -> Result<Option<OperationRiskDeclaration>, RepositoryError> {
+    let version = to_sql_integer(approved_task_version)
+        .map_err(|_| repository_error(RepositoryErrorCode::VersionConflict))?;
+    let parent = connection
+        .query_row(
+            "SELECT target_identity_digest_hex, declared_at_ms
+             FROM task_operation_risk_declarations
+             WHERE task_id = ?1 AND approved_task_version = ?2 AND operation_kind = ?3",
+            params![
+                task_id.to_string(),
+                version,
+                operation_kind.persisted_text()
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(operation_failed)?;
+    let Some((persisted_digest, declared_at_ms)) = parent else {
+        let child_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_operation_risk_categories
+                 WHERE task_id = ?1 AND approved_task_version = ?2 AND operation_kind = ?3",
+                params![
+                    task_id.to_string(),
+                    version,
+                    operation_kind.persisted_text()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)?;
+        if child_count != 0 {
+            return Err(repository_error(
+                RepositoryErrorCode::InvalidPersistenceState,
+            ));
+        }
+        return Ok(None);
+    };
+    if declared_at_ms < 0 {
+        return Err(repository_error(
+            RepositoryErrorCode::InvalidPersistenceState,
+        ));
+    }
+    let target_identity_digest = TargetIdentityDigest::from_hex(&persisted_digest)
+        .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT risk_category FROM task_operation_risk_categories
+             WHERE task_id = ?1 AND approved_task_version = ?2 AND operation_kind = ?3
+             ORDER BY risk_category",
+        )
+        .map_err(operation_failed)?;
+    let rows = statement
+        .query_map(
+            params![
+                task_id.to_string(),
+                version,
+                operation_kind.persisted_text()
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(operation_failed)?;
+    let mut risk_categories = Vec::new();
+    for row in rows {
+        let persisted_category = row.map_err(operation_failed)?;
+        let category = HighRiskCategory::from_persisted_text(&persisted_category)
+            .ok_or_else(|| repository_error(RepositoryErrorCode::InvalidPersistenceState))?;
+        risk_categories.push(category);
+    }
+    Ok(Some(OperationRiskDeclaration {
+        record: OperationRiskDeclarationRecord {
+            task_id,
+            approved_task_version,
+            operation_kind,
+            target_identity_digest,
+            declared_at_ms,
+        },
+        risk_categories,
     }))
 }
 

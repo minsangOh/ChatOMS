@@ -6,9 +6,10 @@ use std::thread;
 use std::time::Duration;
 
 use chatoms_domain::{
-    ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, RecoveryValidation,
-    ResumeValidation, Task, TaskId, TaskState, TaskStateTransition, TaskStateTransitionId,
-    TaskStateTransitionSnapshot, ValidationCommandKind, ValidationExecutionScope, WorkKind,
+    ActorKind, ContextDataScope, HighRiskCategory, OperationRiskKind, ProjectId, ReasonCode,
+    RecoveryValidation, ResumeValidation, TargetIdentityDigest, Task, TaskId, TaskState,
+    TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind,
+    ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::database::{DatabaseConnection, SqliteFoundationRepository};
 use chatoms_ports::diff::DiffContentHash;
@@ -17,12 +18,12 @@ use chatoms_ports::provider::ProviderKind;
 use chatoms_ports::repository::{
     ContextPackageManifestRecord, DiffApprovalRecord, FoundationRepository, GitIsolationStatus,
     GitOperationReceiptKind, HighRiskApprovalRecord, ImplementationResultOutcome,
-    ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord, PlanningResultOutcome,
-    PostMergeValidationResultAttempt, PostMergeValidationResultOutcome, ProviderConsent,
-    RepositoryError, RepositoryErrorCode, ReviewResultOutcome, TaskBriefRecord, TaskGitIsolation,
-    TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
-    ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
-    ValidationCommandResultOutcome,
+    ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
+    OperationRiskDeclarationRecord, PlanningResultOutcome, PostMergeValidationResultAttempt,
+    PostMergeValidationResultOutcome, ProviderConsent, RepositoryError, RepositoryErrorCode,
+    ReviewResultOutcome, TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
+    TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
+    ValidationCommandResultAttempt, ValidationCommandResultOutcome,
 };
 use rusqlite::params;
 
@@ -5739,6 +5740,300 @@ fn worktree_ready_task_with_real_isolation(
         .expect("worktree ready completion");
 
     task
+}
+
+fn awaiting_design_approval_task_with_real_isolation(
+    repository: &mut impl FoundationRepository,
+    project_id: ProjectId,
+) -> Task {
+    let mut task = worktree_ready_task_with_real_isolation(repository, project_id);
+    advance(repository, &mut task, TaskState::Planning, 140);
+    advance(
+        repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    task
+}
+
+#[test]
+fn declare_operation_risk_persists_parent_only_empty_without_mutating_task_lifecycle() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let task =
+        awaiting_design_approval_task_with_real_isolation(&mut repository, fixture.project_id);
+    let history_before = repository
+        .list_task_transitions(task.id())
+        .expect("history before declaration");
+    let declaration = OperationRiskDeclarationRecord {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        operation_kind: OperationRiskKind::ProviderImplementation,
+        target_identity_digest: TargetIdentityDigest::from_digest_bytes([7; 32]),
+        declared_at_ms: 200,
+    };
+
+    assert_eq!(
+        repository
+            .get_operation_risk_declaration(
+                task.id(),
+                task.version(),
+                OperationRiskKind::ProviderImplementation,
+            )
+            .expect("read missing declaration"),
+        None
+    );
+    repository
+        .declare_operation_risk(&declaration, &[])
+        .expect("persist explicit empty declaration");
+
+    let stored = repository
+        .get_operation_risk_declaration(
+            task.id(),
+            task.version(),
+            OperationRiskKind::ProviderImplementation,
+        )
+        .expect("read explicit empty declaration")
+        .expect("parent row distinguishes empty from missing");
+    assert_eq!(stored.record, declaration);
+    assert!(stored.risk_categories.is_empty());
+    assert_eq!(
+        repository.get_task(task.id()).expect("task"),
+        Some(task.clone())
+    );
+    assert_eq!(
+        repository
+            .list_task_transitions(task.id())
+            .expect("history after declaration"),
+        history_before
+    );
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active lease")
+            .map(|lease| lease.task_id),
+        Some(task.id())
+    );
+}
+
+#[test]
+fn declare_operation_risk_persists_only_selected_approved_categories() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let task =
+        awaiting_design_approval_task_with_real_isolation(&mut repository, fixture.project_id);
+    for category in [
+        HighRiskCategory::ArchitectureChange,
+        HighRiskCategory::DataMigration,
+    ] {
+        repository
+            .save_high_risk_approval(&HighRiskApprovalRecord {
+                task_id: task.id(),
+                approved_task_version: task.version(),
+                risk_category: category,
+                approved_at_ms: 190,
+            })
+            .expect("save high-risk approval");
+    }
+    let declaration = OperationRiskDeclarationRecord {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        operation_kind: OperationRiskKind::ProviderImplementation,
+        target_identity_digest: TargetIdentityDigest::from_digest_bytes([8; 32]),
+        declared_at_ms: 200,
+    };
+
+    repository
+        .declare_operation_risk(&declaration, &[HighRiskCategory::ArchitectureChange])
+        .expect("persist selected category");
+
+    let stored = repository
+        .get_operation_risk_declaration(
+            task.id(),
+            task.version(),
+            OperationRiskKind::ProviderImplementation,
+        )
+        .expect("read declaration")
+        .expect("declaration exists");
+    assert_eq!(
+        stored.risk_categories,
+        vec![HighRiskCategory::ArchitectureChange]
+    );
+}
+
+#[test]
+fn declare_operation_risk_rejects_missing_approval_stale_version_and_duplicate_without_partial_rows()
+ {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let task =
+        awaiting_design_approval_task_with_real_isolation(&mut repository, fixture.project_id);
+    let declaration = OperationRiskDeclarationRecord {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        operation_kind: OperationRiskKind::ProviderImplementation,
+        target_identity_digest: TargetIdentityDigest::from_digest_bytes([9; 32]),
+        declared_at_ms: 200,
+    };
+
+    assert_code(
+        repository
+            .declare_operation_risk(&declaration, &[HighRiskCategory::SecurityPolicyChange])
+            .expect_err("missing high-risk approval must be rejected"),
+        RepositoryErrorCode::InvalidAggregate,
+    );
+    assert_eq!(
+        repository
+            .get_operation_risk_declaration(
+                task.id(),
+                task.version(),
+                OperationRiskKind::ProviderImplementation,
+            )
+            .expect("read after missing approval"),
+        None
+    );
+
+    let stale = OperationRiskDeclarationRecord {
+        approved_task_version: task.version() - 1,
+        ..declaration
+    };
+    assert_code(
+        repository
+            .declare_operation_risk(&stale, &[])
+            .expect_err("stale declaration must be rejected"),
+        RepositoryErrorCode::VersionConflict,
+    );
+
+    repository
+        .declare_operation_risk(&declaration, &[])
+        .expect("persist first declaration");
+    assert_code(
+        repository
+            .declare_operation_risk(&declaration, &[])
+            .expect_err("duplicate declaration must be rejected"),
+        RepositoryErrorCode::InvalidAggregate,
+    );
+}
+
+#[test]
+fn declare_operation_risk_rejects_foreign_task_without_rows() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    let declaration = OperationRiskDeclarationRecord {
+        task_id: TaskId::new(),
+        approved_task_version: 0,
+        operation_kind: OperationRiskKind::ProviderImplementation,
+        target_identity_digest: TargetIdentityDigest::from_digest_bytes([11; 32]),
+        declared_at_ms: 200,
+    };
+
+    assert_code(
+        repository
+            .declare_operation_risk(&declaration, &[])
+            .expect_err("foreign task must be rejected"),
+        RepositoryErrorCode::TaskNotFound,
+    );
+    assert_eq!(
+        count_rows(
+            &fixture.database.open_raw(),
+            "task_operation_risk_declarations"
+        ),
+        0
+    );
+}
+
+#[test]
+fn declare_operation_risk_rolls_back_parent_when_child_insert_fails() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let task = {
+        let mut repository = SqliteFoundationRepository::new(&mut connection);
+        let task =
+            awaiting_design_approval_task_with_real_isolation(&mut repository, fixture.project_id);
+        repository
+            .save_high_risk_approval(&HighRiskApprovalRecord {
+                task_id: task.id(),
+                approved_task_version: task.version(),
+                risk_category: HighRiskCategory::ArchitectureChange,
+                approved_at_ms: 190,
+            })
+            .expect("save high-risk approval");
+        task
+    };
+    fixture
+        .database
+        .open_raw()
+        .execute_batch(
+            "CREATE TRIGGER reject_operation_risk_child
+             BEFORE INSERT ON task_operation_risk_categories
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced child insert failure');
+             END;",
+        )
+        .expect("install failure trigger");
+    let declaration = OperationRiskDeclarationRecord {
+        task_id: task.id(),
+        approved_task_version: task.version(),
+        operation_kind: OperationRiskKind::ProviderImplementation,
+        target_identity_digest: TargetIdentityDigest::from_digest_bytes([10; 32]),
+        declared_at_ms: 200,
+    };
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+
+    assert_code(
+        repository
+            .declare_operation_risk(&declaration, &[HighRiskCategory::ArchitectureChange])
+            .expect_err("child insertion failure must roll back the transaction"),
+        RepositoryErrorCode::InvalidAggregate,
+    );
+    drop(repository);
+    let raw = fixture.database.open_raw();
+    assert_eq!(count_rows(&raw, "task_operation_risk_declarations"), 0);
+    assert_eq!(count_rows(&raw, "task_operation_risk_categories"), 0);
+}
+
+#[test]
+fn get_operation_risk_declaration_fails_closed_on_corrupted_digest() {
+    let fixture = Fixture::new();
+    let mut connection = fixture.open();
+    let task = {
+        let mut repository = SqliteFoundationRepository::new(&mut connection);
+        awaiting_design_approval_task_with_real_isolation(&mut repository, fixture.project_id)
+    };
+    drop(connection);
+    let raw = fixture.database.open_raw();
+    raw.execute_batch("PRAGMA ignore_check_constraints = 1;")
+        .expect("disable CHECK enforcement for this fixture connection only");
+    raw.execute(
+        "INSERT INTO task_operation_risk_declarations (
+            task_id, approved_task_version, operation_kind,
+            target_identity_digest_hex, declared_at_ms
+         ) VALUES (?1, ?2, 'ProviderImplementation', 'not-a-digest', 200)",
+        params![
+            task.id().to_string(),
+            i64::try_from(task.version()).expect("test version fits SQLite")
+        ],
+    )
+    .expect("insert a row the digest CHECK would normally reject");
+    drop(raw);
+
+    let mut connection = fixture.open();
+    let mut repository = SqliteFoundationRepository::new(&mut connection);
+    assert_code(
+        repository
+            .get_operation_risk_declaration(
+                task.id(),
+                task.version(),
+                OperationRiskKind::ProviderImplementation,
+            )
+            .expect_err("corrupted digest must fail closed"),
+        RepositoryErrorCode::InvalidPersistenceState,
+    );
 }
 
 #[test]

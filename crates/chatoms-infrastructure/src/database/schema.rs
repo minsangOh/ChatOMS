@@ -39,6 +39,8 @@ pub(crate) const MANUAL_MERGE_RESOLUTION_CONFIRMATIONS_SQL: &str =
     include_str!("../../migrations/0021_manual_merge_resolution_confirmations.sql");
 pub(crate) const TASK_MERGE_ABORT_APPROVALS_SQL: &str =
     include_str!("../../migrations/0022_task_merge_abort_approvals.sql");
+pub(crate) const TASK_OPERATION_RISK_DECLARATIONS_SQL: &str =
+    include_str!("../../migrations/0023_task_operation_risk_declarations.sql");
 
 pub(crate) const METADATA_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
