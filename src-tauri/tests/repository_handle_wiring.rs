@@ -17,6 +17,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use chatoms_app_lib::state::RepositoryHandle;
+use chatoms_application::{
+    operation_risk_declaration::{
+        DeclareProviderImplementationRiskRequest, OperationRiskDeclarationService,
+    },
+    policy_engine::{PolicyDecision, PolicyEngine, PolicyEvaluationRequest, PolicyOperation},
+};
 use chatoms_domain::{
     ActorKind, ContextDataScope, HighRiskCategory, OperationRiskKind, ProjectId, ReasonCode,
     TargetIdentityDigest, Task, TaskId, TaskState, TaskStateTransition, TaskStateTransitionId,
@@ -26,6 +32,8 @@ use chatoms_infrastructure::bootstrap::{DatabaseBootstrapAdapter, SharedDatabase
 use chatoms_ports::{
     DatabaseBootstrapPort, DatabaseBootstrapState,
     diff::DiffContentHash,
+    error::{FailureCategory, PortFailure},
+    filesystem::{DirectoryIdentity, DirectoryIdentityGuard, FilesystemIdentityPort},
     git::RepositoryKind,
     manual_merge_resolution::ManualResolutionDigest,
     path::ResolvedAppPaths,
@@ -42,6 +50,41 @@ use chatoms_ports::{
         ValidationCommandResultAttempt, ValidationCommandResultOutcome,
     },
 };
+
+struct PolicyFilesystem;
+
+impl FilesystemIdentityPort for PolicyFilesystem {
+    fn inspect_supported_directory(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<DirectoryIdentity, PortFailure> {
+        match path.to_string_lossy().replace('\\', "/").as_str() {
+            "C:/repo" => Ok(DirectoryIdentity {
+                canonical_path: path.to_path_buf(),
+                volume_serial_hex: "0000000000000001".to_owned(),
+                file_id_hex: "00000000000000000000000000000001".to_owned(),
+            }),
+            "C:/managed/project/task" => Ok(DirectoryIdentity {
+                canonical_path: path.to_path_buf(),
+                volume_serial_hex: "0000000000000002".to_owned(),
+                file_id_hex: "00000000000000000000000000000002".to_owned(),
+            }),
+            _ => Err(PortFailure::new(FailureCategory::NotFound)),
+        }
+    }
+
+    fn verify_local_tree(&mut self, _root: &std::path::Path) -> Result<(), PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+
+    fn acquire_guard(
+        &mut self,
+        _path: &std::path::Path,
+        _expected: &DirectoryIdentity,
+    ) -> Result<Box<dyn DirectoryIdentityGuard>, PortFailure> {
+        Err(PortFailure::new(FailureCategory::Unsupported))
+    }
+}
 
 /// A uniquely named directory under the OS temp root, cleaned up on drop.
 /// Avoids adding a `tempfile` dev-dependency to `src-tauri/Cargo.toml`
@@ -1292,6 +1335,62 @@ fn operation_risk_declaration_delegation_reaches_real_sqlite_through_both_wrappe
         .expect("declaration exists");
     assert_eq!(stored.record, declaration);
     assert!(stored.risk_categories.is_empty());
+}
+
+#[test]
+fn policy_engine_evaluates_real_sqlite_through_both_wrapper_layers_without_task_mutation() {
+    let (_dir, mut repository) = real_repository_handle("implementation-policy");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed owning project");
+    let mut task = worktree_ready_task_with_real_isolation(&mut repository, project_id);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    let history_before = repository
+        .list_task_transitions(task.id())
+        .expect("history before declaration");
+    let mut filesystem = PolicyFilesystem;
+    OperationRiskDeclarationService::new(&mut repository, &mut filesystem)
+        .declare_provider_implementation_risk(DeclareProviderImplementationRiskRequest {
+            task_id: task.id(),
+            expected_version: task.version(),
+            risk_categories: Vec::new(),
+            declared_at_ms: 200,
+        })
+        .expect("persist declaration through wrapper chain");
+
+    let decision = PolicyEngine::new(&mut repository, &mut filesystem)
+        .evaluate(PolicyEvaluationRequest {
+            task_id: task.id(),
+            expected_version: task.version(),
+            operation: PolicyOperation::ProviderImplementation,
+        })
+        .expect("evaluate policy through wrapper chain");
+
+    assert!(matches!(decision, PolicyDecision::Authorized(_)));
+    assert_eq!(
+        repository.get_task(task.id()).expect("task"),
+        Some(task.clone())
+    );
+    assert_eq!(
+        repository
+            .list_task_transitions(task.id())
+            .expect("history after evaluation"),
+        history_before
+    );
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active lease after evaluation")
+            .map(|lease| lease.task_id),
+        Some(task.id())
+    );
 }
 
 #[test]
