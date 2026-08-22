@@ -1,35 +1,62 @@
 import { invoke } from "@tauri-apps/api/core";
 import { FrontendError, isRecord, toFrontendError } from "./errors";
+import { isHighRiskApprovalDto, isHighRiskApprovalStatusDto } from "./high_risk_approval";
+import { isMergeAbortStartDto } from "./merge_abort";
+import { isMergeConflictWriteStatusDto } from "./merge_conflict_write_status";
 import { isNullablePlanningResultDto } from "./planning_result";
+import { isPostMergeValidationResultDtoArray } from "./post_merge_validation_result";
+import { isNullableMergeConflictInspectionDto } from "./merge_conflict_inspection";
 import { isProviderEligibilityDtoArray } from "./provider_eligibility";
 import { isCancelReviewDto, isNullableReviewResultDto } from "./review_result";
+import { isRawUserDiffForReviewDto, isUserDiffApprovalDto } from "./user_diff_review";
 import {
   isApproveValidationCommandResultDto,
   isCancelTestingDto,
+  isProjectRootValidationApprovalStatusDto,
   isValidationCommandApprovalStatusDto,
   isValidationCommandCandidateDtoArray,
 } from "./validation_command";
+import {
+  isContextPackageImplementationReadinessDto,
+  isContextPackagePlanningReadinessDto,
+  isContextPackagePreparationDto,
+  isContextPackageReviewReadinessDto,
+} from "./types";
 import type {
   ActiveTaskDto,
   ActiveTaskStatusDto,
   ApproveValidationCommandInput,
   ApproveValidationCommandResultDto,
+  ApproveProjectRootValidationInput,
   BootstrapStatusDto,
   CancelImplementationDto,
   CancelPlanningDto,
   CancelReviewDto,
   CancelTestingDto,
   CapabilityDto,
+  ContextPackageImplementationReadinessDto,
+  ContextPackagePlanningReadinessDto,
+  ContextPackagePreparationDto,
+  ContextPackageReviewReadinessDto,
   DatabaseStatus,
   HealthDto,
   HealthState,
+  HighRiskApprovalDto,
+  HighRiskApprovalStatusDto,
+  HighRiskCategory,
   LoggingStatus,
   LegacyMigrationDiagnosticDto,
+  MergeAbortStartDto,
+  MergeConflictWriteStatusDto,
   PlanningResultDto,
+  PostMergeValidationResultDto,
+  MergeConflictInspectionDto,
   ProjectDto,
+  ProjectRootValidationApprovalStatusDto,
   ProviderEligibilityDto,
   ProjectCandidateDto,
   ProjectStatusDto,
+  RawUserDiffForReviewDto,
   RefreshClaudeCapabilityDto,
   RefreshOutcome,
   ReviewResultDto,
@@ -42,6 +69,7 @@ import type {
   TaskDto,
   TaskState,
   TaskTransitionDto,
+  UserDiffApprovalDto,
   ValidationCommandApprovalStatusDto,
   ValidationCommandCandidateDto,
   VersionDto,
@@ -70,16 +98,37 @@ export const IPC_COMMANDS = {
   startClaudePlanning: "start_claude_planning",
   cancelClaudePlanning: "cancel_claude_planning",
   getPlanningResult: "get_planning_result",
+  getPostMergeValidationResults: "get_post_merge_validation_results",
+  getMergeConflictInspection: "get_merge_conflict_inspection",
+  getContextPackagePlanningReadiness: "get_context_package_planning_readiness",
+  startClaudePlanningContextPackage: "start_claude_planning_context_package",
   startClaudeImplementation: "start_claude_implementation",
   cancelClaudeImplementation: "cancel_claude_implementation",
+  getContextPackageImplementationReadiness: "get_context_package_implementation_readiness",
+  startClaudeImplementationContextPackage: "start_claude_implementation_context_package",
   startValidationTesting: "start_validation_testing",
   cancelValidationTesting: "cancel_validation_testing",
   getValidationCommandCandidates: "get_validation_command_candidates",
   getValidationCommandApprovalStatus: "get_validation_command_approval_status",
   approveValidationCommand: "approve_validation_command",
+  getProjectRootValidationApprovalStatus: "get_project_root_validation_approval_status",
+  approveProjectRootValidation: "approve_project_root_validation",
   startClaudeReview: "start_claude_review",
   cancelClaudeReview: "cancel_claude_review",
   getReviewResult: "get_review_result",
+  preparePlanningContextPackage: "prepare_planning_context_package",
+  prepareImplementationContextPackage: "prepare_implementation_context_package",
+  prepareReviewContextPackage: "prepare_review_context_package",
+  getContextPackageReviewReadiness: "get_context_package_review_readiness",
+  startClaudeReviewContextPackage: "start_claude_review_context_package",
+  getHighRiskApprovalStatus: "get_high_risk_approval_status",
+  approveHighRiskOperation: "approve_high_risk_operation",
+  getUserDiffForReview: "get_user_diff_for_review",
+  approveUserDiff: "approve_user_diff",
+  approveUserDiffAndStartMerge: "approve_user_diff_and_start_merge",
+  confirmManualResolutionAndStartMergeContinue: "confirm_manual_resolution_and_start_merge_continue",
+  confirmMergeAbortAndStart: "confirm_merge_abort_and_start",
+  getMergeConflictWriteStatus: "get_merge_conflict_write_status",
 } as const;
 
 export type InvokeTransport = (
@@ -110,8 +159,20 @@ export interface IpcClient {
   startClaudePlanning(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudePlanning(taskId: string): Promise<CancelPlanningDto>;
   getPlanningResult(taskId: string): Promise<PlanningResultDto | null>;
+  getPostMergeValidationResults(taskId: string): Promise<readonly PostMergeValidationResultDto[]>;
+  getMergeConflictInspection(taskId: string): Promise<MergeConflictInspectionDto | null>;
+  getContextPackagePlanningReadiness(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePlanningReadinessDto>;
+  startClaudePlanningContextPackage(taskId: string, expectedVersion: number): Promise<TaskDto>;
   startClaudeImplementation(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudeImplementation(taskId: string): Promise<CancelImplementationDto>;
+  getContextPackageImplementationReadiness(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackageImplementationReadinessDto>;
+  startClaudeImplementationContextPackage(taskId: string, expectedVersion: number): Promise<TaskDto>;
   getValidationCommandCandidates(taskId: string): Promise<readonly ValidationCommandCandidateDto[]>;
   getValidationCommandApprovalStatus(taskId: string): Promise<ValidationCommandApprovalStatusDto>;
   approveValidationCommand(
@@ -119,11 +180,61 @@ export interface IpcClient {
     expectedVersion: number,
     input: ApproveValidationCommandInput,
   ): Promise<ApproveValidationCommandResultDto>;
+  getProjectRootValidationApprovalStatus(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ProjectRootValidationApprovalStatusDto>;
+  approveProjectRootValidation(
+    taskId: string,
+    expectedVersion: number,
+    input: ApproveProjectRootValidationInput,
+  ): Promise<ProjectRootValidationApprovalStatusDto>;
   startValidationTesting(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelValidationTesting(taskId: string): Promise<CancelTestingDto>;
   startClaudeReview(taskId: string, expectedVersion: number): Promise<TaskDto>;
   cancelClaudeReview(taskId: string): Promise<CancelReviewDto>;
   getReviewResult(taskId: string): Promise<ReviewResultDto | null>;
+  preparePlanningContextPackage(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePreparationDto>;
+  prepareImplementationContextPackage(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePreparationDto>;
+  prepareReviewContextPackage(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackagePreparationDto>;
+  getContextPackageReviewReadiness(
+    taskId: string,
+    expectedVersion: number,
+  ): Promise<ContextPackageReviewReadinessDto>;
+  startClaudeReviewContextPackage(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  getHighRiskApprovalStatus(
+    taskId: string,
+    expectedVersion: number,
+    riskCategory: HighRiskCategory,
+  ): Promise<HighRiskApprovalStatusDto>;
+  approveHighRiskOperation(
+    taskId: string,
+    expectedVersion: number,
+    riskCategory: HighRiskCategory,
+  ): Promise<HighRiskApprovalDto>;
+  getUserDiffForReview(taskId: string, expectedVersion: number): Promise<RawUserDiffForReviewDto>;
+  approveUserDiff(
+    taskId: string,
+    expectedVersion: number,
+    expectedDiffContentHash: string,
+  ): Promise<UserDiffApprovalDto>;
+  approveUserDiffAndStartMerge(
+    taskId: string,
+    expectedVersion: number,
+    expectedDiffContentHash: string,
+  ): Promise<TaskDto>;
+  confirmManualResolutionAndStartMergeContinue(taskId: string, expectedVersion: number): Promise<TaskDto>;
+  confirmMergeAbortAndStart(taskId: string, expectedVersion: number): Promise<MergeAbortStartDto>;
+  getMergeConflictWriteStatus(taskId: string): Promise<MergeConflictWriteStatusDto>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -186,10 +297,36 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
       request(IPC_COMMANDS.cancelClaudePlanning, isCancelPlanningDto, { taskId }),
     getPlanningResult: (taskId) =>
       request(IPC_COMMANDS.getPlanningResult, isNullablePlanningResultDto, { taskId }),
+    getPostMergeValidationResults: (taskId) =>
+      request(IPC_COMMANDS.getPostMergeValidationResults, isPostMergeValidationResultDtoArray, { taskId }),
+    getMergeConflictInspection: (taskId) =>
+      request(IPC_COMMANDS.getMergeConflictInspection, isNullableMergeConflictInspectionDto, { taskId }),
+    getContextPackagePlanningReadiness: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.getContextPackagePlanningReadiness,
+        isContextPackagePlanningReadinessDto,
+        { taskId, expectedVersion },
+      ),
+    startClaudePlanningContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudePlanningContextPackage, isTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
     startClaudeImplementation: (taskId, expectedVersion) =>
       request(IPC_COMMANDS.startClaudeImplementation, isTaskDto, { taskId, expectedVersion }),
     cancelClaudeImplementation: (taskId) =>
       request(IPC_COMMANDS.cancelClaudeImplementation, isCancelImplementationDto, { taskId }),
+    getContextPackageImplementationReadiness: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.getContextPackageImplementationReadiness,
+        isContextPackageImplementationReadinessDto,
+        { taskId, expectedVersion },
+      ),
+    startClaudeImplementationContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudeImplementationContextPackage, isTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
     getValidationCommandCandidates: (taskId) =>
       request(IPC_COMMANDS.getValidationCommandCandidates, isValidationCommandCandidateDtoArray, {
         taskId,
@@ -206,6 +343,18 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
         expectedVersion,
         input,
       }),
+    getProjectRootValidationApprovalStatus: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.getProjectRootValidationApprovalStatus,
+        isProjectRootValidationApprovalStatusDto,
+        { taskId, expectedVersion },
+      ),
+    approveProjectRootValidation: (taskId, expectedVersion, input) =>
+      request(
+        IPC_COMMANDS.approveProjectRootValidation,
+        isProjectRootValidationApprovalStatusDto,
+        { taskId, expectedVersion, input },
+      ),
     startValidationTesting: (taskId, expectedVersion) =>
       request(IPC_COMMANDS.startValidationTesting, isTaskDto, { taskId, expectedVersion }),
     cancelValidationTesting: (taskId) =>
@@ -216,6 +365,73 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
       request(IPC_COMMANDS.cancelClaudeReview, isCancelReviewDto, { taskId }),
     getReviewResult: (taskId) =>
       request(IPC_COMMANDS.getReviewResult, isNullableReviewResultDto, { taskId }),
+    preparePlanningContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.preparePlanningContextPackage, isContextPackagePreparationDto, {
+        taskId,
+        expectedVersion,
+      }),
+    prepareImplementationContextPackage: (taskId, expectedVersion) =>
+      request(
+        IPC_COMMANDS.prepareImplementationContextPackage,
+        isContextPackagePreparationDto,
+        { taskId, expectedVersion },
+      ),
+    prepareReviewContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.prepareReviewContextPackage, isContextPackagePreparationDto, {
+        taskId,
+        expectedVersion,
+      }),
+    getContextPackageReviewReadiness: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.getContextPackageReviewReadiness, isContextPackageReviewReadinessDto, {
+        taskId,
+        expectedVersion,
+      }),
+    startClaudeReviewContextPackage: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.startClaudeReviewContextPackage, isTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
+    getHighRiskApprovalStatus: (taskId, expectedVersion, riskCategory) =>
+      request(IPC_COMMANDS.getHighRiskApprovalStatus, isHighRiskApprovalStatusDto, {
+        taskId,
+        expectedVersion,
+        riskCategory,
+      }),
+    approveHighRiskOperation: (taskId, expectedVersion, riskCategory) =>
+      request(IPC_COMMANDS.approveHighRiskOperation, isHighRiskApprovalDto, {
+        taskId,
+        expectedVersion,
+        riskCategory,
+      }),
+    getUserDiffForReview: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.getUserDiffForReview, isRawUserDiffForReviewDto, {
+        taskId,
+        expectedVersion,
+      }),
+    approveUserDiff: (taskId, expectedVersion, expectedDiffContentHash) =>
+      request(IPC_COMMANDS.approveUserDiff, isUserDiffApprovalDto, {
+        taskId,
+        expectedVersion,
+        expectedDiffContentHash,
+      }),
+    approveUserDiffAndStartMerge: (taskId, expectedVersion, expectedDiffContentHash) =>
+      request(IPC_COMMANDS.approveUserDiffAndStartMerge, isTaskDto, {
+        taskId,
+        expectedVersion,
+        expectedDiffContentHash,
+      }),
+    confirmManualResolutionAndStartMergeContinue: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.confirmManualResolutionAndStartMergeContinue, isExactTaskDto, {
+        taskId,
+        expectedVersion,
+      }),
+    confirmMergeAbortAndStart: (taskId, expectedVersion) =>
+      request(IPC_COMMANDS.confirmMergeAbortAndStart, isMergeAbortStartDto, {
+        taskId,
+        expectedVersion,
+      }),
+    getMergeConflictWriteStatus: (taskId) =>
+      request(IPC_COMMANDS.getMergeConflictWriteStatus, isMergeConflictWriteStatusDto, { taskId }),
   };
 }
 
@@ -397,6 +613,36 @@ function isTaskDto(value: unknown): value is TaskDto {
     isNullableNumber(value.terminalAtMs) &&
     (value.brief === null || isTaskBriefDto(value.brief))
   );
+}
+
+const TASK_DTO_KEYS = [
+  "id",
+  "projectId",
+  "state",
+  "version",
+  "branchIdentity",
+  "resumeTargetState",
+  "createdAtMs",
+  "updatedAtMs",
+  "terminalAtMs",
+  "brief",
+] as const;
+
+function hasExactTaskDtoKeys(value: Record<string, unknown>): boolean {
+  const keys = Object.keys(value);
+  const allowed: readonly string[] = TASK_DTO_KEYS;
+  return keys.length === allowed.length && keys.every((key) => allowed.includes(key));
+}
+
+// Stricter than `isTaskDto`: also rejects any key beyond backend `TaskDto`'s
+// exact serialized key set (e.g. a resolution digest, raw path, or Git
+// stdout/stderr accidentally attached to a future response). Used only for
+// `confirmManualResolutionAndStartMergeContinue`, whose merge-continue write
+// must never let such content reach this response even if the backend
+// changes later -- `isTaskDto` itself stays loose for every other command
+// that already relies on it.
+function isExactTaskDto(value: unknown): value is TaskDto {
+  return isRecord(value) && hasExactTaskDtoKeys(value) && isTaskDto(value);
 }
 
 function isTaskTransitionDto(value: unknown): value is TaskTransitionDto {

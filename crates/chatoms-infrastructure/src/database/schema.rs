@@ -25,6 +25,20 @@ pub(crate) const REVIEW_CONSENTS_SQL: &str =
     include_str!("../../migrations/0014_review_consents.sql");
 pub(crate) const TASK_REVIEW_RESULTS_SQL: &str =
     include_str!("../../migrations/0015_task_review_results.sql");
+pub(crate) const PROVIDER_CONSENT_DATA_SCOPE_SQL: &str =
+    include_str!("../../migrations/0016_provider_consent_data_scope.sql");
+pub(crate) const CONTEXT_PACKAGE_MANIFESTS_SQL: &str =
+    include_str!("../../migrations/0017_context_package_manifests.sql");
+pub(crate) const TASK_HIGH_RISK_APPROVALS_SQL: &str =
+    include_str!("../../migrations/0018_task_high_risk_approvals.sql");
+pub(crate) const TASK_DIFF_APPROVALS_SQL: &str =
+    include_str!("../../migrations/0019_task_diff_approvals.sql");
+pub(crate) const SCOPED_POST_MERGE_VALIDATION_SQL: &str =
+    include_str!("../../migrations/0020_scoped_post_merge_validation.sql");
+pub(crate) const MANUAL_MERGE_RESOLUTION_CONFIRMATIONS_SQL: &str =
+    include_str!("../../migrations/0021_manual_merge_resolution_confirmations.sql");
+pub(crate) const TASK_MERGE_ABORT_APPROVALS_SQL: &str =
+    include_str!("../../migrations/0022_task_merge_abort_approvals.sql");
 
 pub(crate) const METADATA_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (

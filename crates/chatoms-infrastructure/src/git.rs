@@ -1,9 +1,10 @@
+use sha2::{Digest, Sha256};
 use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         Arc,
@@ -18,7 +19,10 @@ use chatoms_platform::git_runtime::TrustedGitRuntime;
 use chatoms_platform::{ensure_supported_directory, supported_directory_identity};
 
 use chatoms_ports::{
-    diff::{WorktreeDiff, WorktreeDiffOutcome, WorktreeDiffPort},
+    diff::{
+        CommitCandidate, CommitCandidateOutcome, CommitCandidatePort, DiffContentHash,
+        WorktreeDiff, WorktreeDiffOutcome, WorktreeDiffPort,
+    },
     error::{FailureCategory, PortFailure},
     filesystem::DirectoryIdentity,
     git::{
@@ -86,6 +90,27 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(20);
 /// Poll interval while waiting for the diff process to exit or the deadline
 /// to pass.
 const DIFF_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const GIT_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitWriteCommand {
+    Stage,
+    Commit,
+    Merge,
+    MergeAbort,
+}
+
+pub trait GitWriteCommandObserver: Send + Sync {
+    fn before_command(&self, command: GitWriteCommand);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitWriteCommandOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Uncertain,
+}
 
 #[derive(Clone, Debug)]
 struct GitControlPaths {
@@ -96,12 +121,13 @@ struct GitControlPaths {
     global_attributes: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitCliAdapter {
     runtime: TrustedGitRuntime,
     control: GitControlPaths,
     control_identity: Option<Vec<(PathBuf, String)>>,
     control_directory_identity: Option<Vec<DirectoryIdentity>>,
+    write_observer: Option<Arc<dyn GitWriteCommandObserver>>,
 }
 
 impl GitCliAdapter {
@@ -126,6 +152,7 @@ impl GitCliAdapter {
             control,
             control_identity: None,
             control_directory_identity: None,
+            write_observer: None,
         };
         if prepare_now {
             adapter.ensure_control_paths()?;
@@ -286,6 +313,165 @@ impl GitCliAdapter {
         self.output_with_input(args, Some(input))
     }
 
+    pub(crate) fn run_command<const N: usize>(
+        &mut self,
+        root: &Path,
+        arguments: [&str; N],
+    ) -> Result<Output, PortFailure> {
+        self.at_str(root, arguments)
+    }
+
+    pub(crate) fn capture_read_only(
+        &mut self,
+        root: &Path,
+        arguments: &[&str],
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> Result<BoundedCaptureOutcome, PortFailure> {
+        if !root.is_absolute() {
+            return Err(PortFailure::new(FailureCategory::InvalidInput));
+        }
+        self.ensure_control_paths()?;
+        self.validate_runtime()?;
+        self.validate_control_paths()?;
+        let mut command = Command::new(self.runtime.executable());
+        command
+            .env_clear()
+            .current_dir(&self.control.home)
+            .args(self.common_arguments())
+            .arg("-C")
+            .arg(root)
+            .args(arguments);
+        configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        capture_bounded_stdout(command, max_bytes, timeout)
+    }
+
+    pub fn set_write_command_observer(
+        &mut self,
+        observer: Option<Arc<dyn GitWriteCommandObserver>>,
+    ) {
+        self.write_observer = observer;
+    }
+
+    pub(crate) fn run_write_command<const N: usize>(
+        &mut self,
+        root: &Path,
+        command_kind: GitWriteCommand,
+        arguments: [&str; N],
+    ) -> GitWriteCommandOutcome {
+        self.run_write_command_with_env(root, command_kind, arguments, &[])
+    }
+
+    /// Identical to [`Self::run_write_command`], but adds `extra_env`
+    /// key/value pairs to the child process's environment on top of the
+    /// shared controlled environment — never logged or persisted by this
+    /// method. Used only where a write must not depend on ambient Git
+    /// config for author identity (e.g. `merge --continue`).
+    pub(crate) fn run_write_command_with_env<const N: usize>(
+        &mut self,
+        root: &Path,
+        command_kind: GitWriteCommand,
+        arguments: [&str; N],
+        extra_env: &[(&str, &OsStr)],
+    ) -> GitWriteCommandOutcome {
+        let mut args = vec![OsString::from("-C"), root.as_os_str().to_owned()];
+        args.extend(arguments.into_iter().map(OsString::from));
+        let deadline = Instant::now() + GIT_WRITE_TIMEOUT;
+        let result = self.bounded_write_output(args, command_kind, deadline, extra_env);
+        match result {
+            Ok(BoundedCaptureOutcome::Success(_)) => GitWriteCommandOutcome::Succeeded,
+            Ok(BoundedCaptureOutcome::ExitFailure) => GitWriteCommandOutcome::Failed,
+            Ok(BoundedCaptureOutcome::TimedOut) => GitWriteCommandOutcome::TimedOut,
+            Ok(BoundedCaptureOutcome::TooLarge | BoundedCaptureOutcome::Uncertain) | Err(_) => {
+                GitWriteCommandOutcome::Uncertain
+            }
+        }
+    }
+
+    fn bounded_write_output(
+        &mut self,
+        arguments: Vec<OsString>,
+        command_kind: GitWriteCommand,
+        deadline: Instant,
+        extra_env: &[(&str, &OsStr)],
+    ) -> Result<BoundedCaptureOutcome, PortFailure> {
+        self.ensure_control_paths()?;
+        self.validate_runtime()?;
+        self.validate_control_paths()?;
+        if let Some(observer) = &self.write_observer {
+            observer.before_command(command_kind);
+        }
+        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(BoundedCaptureOutcome::TimedOut);
+        };
+        let mut command = Command::new(self.runtime.executable());
+        command
+            .env_clear()
+            .current_dir(&self.control.home)
+            .args(self.common_arguments())
+            .args(arguments);
+        configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        capture_bounded_stdout(command, DIFF_MAX_BYTES, timeout)
+    }
+
+    /// Resolves the commit author/committer identity (`user.name`,
+    /// `user.email`) the same way Git itself would for `root` — local
+    /// config first, falling back to global — without ever logging or
+    /// persisting the resolved values. Returns `None` if either value is
+    /// missing or empty at both scopes, mirroring [`Self::has_commit_author`]'s
+    /// precedence exactly.
+    pub(crate) fn commit_author_identity(
+        &mut self,
+        root: &Path,
+    ) -> Result<Option<(String, String)>, PortFailure> {
+        let name = self.resolved_config_value(root, "user.name")?;
+        let email = self.resolved_config_value(root, "user.email")?;
+        Ok(match (name, email) {
+            (Some(name), Some(email)) => Some((name, email)),
+            _ => None,
+        })
+    }
+
+    fn resolved_config_value(
+        &mut self,
+        root: &Path,
+        key: &str,
+    ) -> Result<Option<String>, PortFailure> {
+        let local = self.author_output(root, key, true)?;
+        if local.status.success() {
+            let value = trimmed_utf8(&local.stdout)?;
+            if !value.is_empty() {
+                return Ok(Some(value.to_owned()));
+            }
+        }
+        let global = self.author_output(root, key, false)?;
+        if global.status.success() {
+            let value = trimmed_utf8(&global.stdout)?;
+            if !value.is_empty() {
+                return Ok(Some(value.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn output_text(output: &Output) -> Result<&str, PortFailure> {
+        trimmed_utf8(&output.stdout)
+    }
+
+    pub(crate) fn validate_write_configuration(
+        &mut self,
+        root: &Path,
+        worktree: &Path,
+        base_commit: &str,
+    ) -> Result<(), PortFailure> {
+        self.validate_repository_source(root, base_commit)?;
+        reject_active_info_attributes(root)?;
+        self.check_worktree_filter_attributes(worktree)
+    }
+
     fn validate_control_paths(&self) -> Result<(), PortFailure> {
         let control_identity = self
             .control_identity
@@ -421,6 +607,18 @@ impl GitCliAdapter {
     }
 }
 
+/// Fixed argv for the shared read-only repository-status observation.
+///
+/// `--no-optional-locks` is a *global* Git option, so it must precede the
+/// subcommand — that ordering is the whole point of pinning this array down
+/// as a named constant with a regression test.
+pub(crate) const READ_ONLY_STATUS_ARGUMENTS: [&str; 4] = [
+    "--no-optional-locks",
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+];
+
 impl GitService for GitCliAdapter {
     fn is_available(&mut self) -> Result<bool, PortFailure> {
         Ok(self
@@ -489,7 +687,27 @@ impl GitService for GitCliAdapter {
     }
 
     fn repository_status(&mut self, root: &Path) -> Result<RepositoryStatus, PortFailure> {
-        let status = self.at_str(root, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+        // `--no-optional-locks` (a global option, so it must precede the
+        // subcommand) stops `git status` from opportunistically refreshing
+        // and rewriting the index, which is the only reason this read-only
+        // observation would ever take `.git/index.lock`.
+        //
+        // This matters because `MergeConflictInspectionService` reaches this
+        // helper on a 2-second UI poll while the task sits in
+        // `MergeConflict` — and `commands::merge_abort` performs its
+        // `git merge --abort` write against that same original checkout for
+        // the whole of that window. Without this flag the two contend for
+        // the index lock, and a merge abort that should have succeeded can
+        // come back as `PostWriteUncertain`.
+        //
+        // Applied here rather than at the single merge-conflict call site
+        // because every caller of this helper is a read-only observer
+        // (project inspection, merge execution/continue/abort pre- and
+        // post-write verification): none of them wants an index refresh as
+        // a side effect. Mutation commands are untouched — they legitimately
+        // take the index lock. Still a fixed argv array, still no shell
+        // string.
+        let status = self.at_str(root, READ_ONLY_STATUS_ARGUMENTS)?;
         ensure_success(&status)?;
         let branch = self.at_str(root, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
         let current_branch = branch
@@ -709,6 +927,71 @@ impl GitService for GitCliAdapter {
     }
 }
 
+impl GitCliAdapter {
+    pub(crate) fn verify_task_worktree_with_changes(
+        &mut self,
+        root: &Path,
+        branch: &str,
+        base_commit: &str,
+        worktree: &Path,
+    ) -> Result<bool, PortFailure> {
+        if !worktree.is_dir() || branch_commit(self, root, branch)?.as_deref() != Some(base_commit)
+        {
+            return Ok(false);
+        }
+        let head = self.at_str(worktree, ["rev-parse", "--verify", "HEAD"])?;
+        let actual_branch =
+            self.at_str(worktree, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let reported_root = self.at_str(worktree, ["rev-parse", "--show-toplevel"])?;
+        let common = self.at_str(
+            worktree,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let git_dir = self.at_str(
+            worktree,
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+        )?;
+        if !head.status.success()
+            || !actual_branch.status.success()
+            || !reported_root.status.success()
+            || !common.status.success()
+            || !git_dir.status.success()
+            || trimmed_utf8(&head.stdout)? != base_commit
+            || trimmed_utf8(&actual_branch.stdout)? != branch
+        {
+            return Ok(false);
+        }
+        let actual_root =
+            canonical_local_directory(Path::new(trimmed_utf8(&reported_root.stdout)?))?;
+        let expected_root = canonical_local_directory(worktree)?;
+        let actual_common = canonical_local_directory(Path::new(trimmed_utf8(&common.stdout)?))?;
+        let expected_common = canonical_local_directory(&root.join(".git"))?;
+        let actual_git_dir = canonical_local_directory(Path::new(trimmed_utf8(&git_dir.stdout)?))?;
+        Ok(
+            canonical_key(&actual_root)? == canonical_key(&expected_root)?
+                && canonical_key(&actual_common)? == canonical_key(&expected_common)?
+                && actual_git_dir.starts_with(expected_common.join("worktrees")),
+        )
+    }
+
+    fn capture_candidate_git(
+        &mut self,
+        arguments: Vec<OsString>,
+    ) -> Result<BoundedCaptureOutcome, PortFailure> {
+        self.ensure_control_paths()?;
+        self.validate_runtime()?;
+        self.validate_control_paths()?;
+        let mut command = Command::new(self.runtime.executable());
+        command
+            .env_clear()
+            .current_dir(&self.control.home)
+            .args(self.common_arguments())
+            .args(arguments);
+        configure_controlled_environment(&mut command, &self.runtime, &self.control)?;
+        capture_bounded_stdout(command, DIFF_MAX_BYTES, DIFF_TIMEOUT)
+    }
+}
+
 /// Reads the current worktree diff via the same trusted Git runtime and
 /// `env_clear`'d control-path machinery every other `GitCliAdapter` command
 /// uses (see `common_arguments`/`configure_controlled_environment`), but
@@ -737,6 +1020,148 @@ impl WorktreeDiffPort for GitCliAdapter {
             DIFF_TIMEOUT,
         )?)
     }
+}
+
+/// Read-only approval candidate. Its verifier intentionally permits task
+/// worktree changes, while preserving the clean-only GitService verifier for
+/// planning and review flows.
+impl CommitCandidatePort for GitCliAdapter {
+    fn current_commit_candidate(
+        &mut self,
+        root: &Path,
+        base_branch: &str,
+        task_branch: &str,
+        base_commit: &str,
+        worktree: &Path,
+    ) -> Result<CommitCandidateOutcome, PortFailure> {
+        validate_base_branch(base_branch)?;
+        validate_branch(task_branch)?;
+        validate_object_id(base_commit)?;
+        if !root.is_absolute() || !worktree.is_absolute() {
+            return Err(PortFailure::new(FailureCategory::InvalidInput));
+        }
+        let source = self.repository_status(root)?;
+        if !source.clean
+            || source.current_branch.as_deref() != Some(base_branch)
+            || source.head_commit.as_deref() != Some(base_commit)
+            || !self.verify_task_worktree_with_changes(root, task_branch, base_commit, worktree)?
+        {
+            return Err(PortFailure::new(FailureCategory::Conflict));
+        }
+        let tracked = match self.capture_candidate_git(diff_arguments(worktree))? {
+            BoundedCaptureOutcome::Success(bytes) => String::from_utf8(bytes)
+                .map_err(|_| PortFailure::new(FailureCategory::InvalidInput))?,
+            BoundedCaptureOutcome::ExitFailure => {
+                return Err(PortFailure::new(FailureCategory::Conflict));
+            }
+            BoundedCaptureOutcome::TooLarge => {
+                return Ok(CommitCandidateOutcome::CandidateTooLarge);
+            }
+            BoundedCaptureOutcome::TimedOut => return Ok(CommitCandidateOutcome::TimedOut),
+            BoundedCaptureOutcome::Uncertain => return Ok(CommitCandidateOutcome::Uncertain),
+        };
+        let listed = match self.capture_candidate_git(untracked_arguments(worktree))? {
+            BoundedCaptureOutcome::Success(bytes) => bytes,
+            BoundedCaptureOutcome::ExitFailure => {
+                return Err(PortFailure::new(FailureCategory::Conflict));
+            }
+            BoundedCaptureOutcome::TooLarge => {
+                return Ok(CommitCandidateOutcome::CandidateTooLarge);
+            }
+            BoundedCaptureOutcome::TimedOut => return Ok(CommitCandidateOutcome::TimedOut),
+            BoundedCaptureOutcome::Uncertain => return Ok(CommitCandidateOutcome::Uncertain),
+        };
+        let paths = canonical_untracked_paths(&listed)?;
+        if tracked.is_empty() && paths.is_empty() {
+            return Ok(CommitCandidateOutcome::NoChanges);
+        }
+        let worktree = canonical_local_directory(worktree)?;
+        let mut canonical = String::from("--- ChatOMS tracked diff ---\n");
+        append_candidate(&mut canonical, &tracked)?;
+        for relative in paths {
+            let candidate = checked_untracked_file(&worktree, &relative)?;
+            let bytes = fs::read(candidate).map_err(map_io_error)?;
+            let content = std::str::from_utf8(&bytes)
+                .map_err(|_| PortFailure::new(FailureCategory::InvalidInput))?;
+            append_candidate(&mut canonical, "\n--- ChatOMS untracked file: ")?;
+            append_candidate(&mut canonical, &relative)?;
+            append_candidate(&mut canonical, "\n")?;
+            append_candidate(&mut canonical, content)?;
+            append_candidate(&mut canonical, "\n--- End ChatOMS untracked file ---\n")?;
+        }
+        let digest = Sha256::digest(canonical.as_bytes());
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&digest);
+        Ok(CommitCandidateOutcome::Candidate(CommitCandidate::new(
+            canonical,
+            DiffContentHash::from_digest_bytes(hash),
+        )))
+    }
+}
+
+fn untracked_arguments(worktree: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("-C"),
+        worktree.as_os_str().to_owned(),
+        OsString::from("ls-files"),
+        OsString::from("--others"),
+        OsString::from("--exclude-standard"),
+        OsString::from("-z"),
+        OsString::from("--"),
+        OsString::from("."),
+    ]
+}
+
+fn canonical_untracked_paths(listed: &[u8]) -> Result<Vec<String>, PortFailure> {
+    let mut paths = Vec::new();
+    for raw in listed
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let path = std::str::from_utf8(raw)
+            .map_err(|_| PortFailure::new(FailureCategory::InvalidInput))?;
+        let relative = Path::new(path);
+        if path.is_empty()
+            || path.contains(['\n', '\r'])
+            || relative.is_absolute()
+            || relative.components().any(
+                |part| !matches!(part, Component::Normal(value) if !value.to_string_lossy().eq_ignore_ascii_case(".git")),
+            )
+        {
+            return Err(PortFailure::new(FailureCategory::InvalidInput));
+        }
+        paths.push(path.to_owned());
+    }
+    paths.sort_unstable();
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    Ok(paths)
+}
+
+fn checked_untracked_file(worktree: &Path, relative: &str) -> Result<PathBuf, PortFailure> {
+    let path = worktree.join(relative);
+    let metadata = fs::symlink_metadata(&path).map_err(map_io_error)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    let canonical = fs::canonicalize(&path).map_err(map_io_error)?;
+    if !canonical.starts_with(worktree) {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    Ok(canonical)
+}
+
+fn append_candidate(target: &mut String, segment: &str) -> Result<(), PortFailure> {
+    if target
+        .len()
+        .checked_add(segment.len())
+        .is_none_or(|size| size > DIFF_MAX_BYTES)
+    {
+        return Err(PortFailure::new(FailureCategory::InvalidInput));
+    }
+    target.push_str(segment);
+    Ok(())
 }
 
 /// Fixed, non-caller-influenced argv for a bounded current-worktree diff:
@@ -770,7 +1195,7 @@ fn diff_arguments(worktree: &Path) -> Vec<OsString> {
 /// mechanics (spawn, drain stdout/stderr, enforce a byte cap and a
 /// deadline) can be unit-tested against an arbitrary fixture process,
 /// independent of the trusted Git runtime.
-enum BoundedCaptureOutcome {
+pub(crate) enum BoundedCaptureOutcome {
     Success(Vec<u8>),
     ExitFailure,
     TooLarge,
@@ -1233,6 +1658,25 @@ fn validate_branch(branch: &str) -> Result<(), PortFailure> {
     }
 }
 
+fn validate_base_branch(branch: &str) -> Result<(), PortFailure> {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+    {
+        Err(PortFailure::new(FailureCategory::InvalidInput))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_object_id(value: &str) -> Result<(), PortFailure> {
     if matches!(value.len(), 40 | 64)
         && value
@@ -1277,6 +1721,50 @@ fn map_io_error(error: std::io::Error) -> PortFailure {
 mod tests {
     use super::*;
     use chatoms_ports::error::CategorizedFailure;
+
+    /// `--no-optional-locks` only takes effect as a global option, i.e.
+    /// before the subcommand. If it ever drifts after `status`, Git silently
+    /// treats it as an unknown `status` flag and the read-only observation
+    /// starts taking `.git/index.lock` again, contending with the
+    /// merge-conflict writes that run against the same checkout.
+    #[test]
+    fn read_only_status_argv_passes_no_optional_locks_before_the_subcommand() {
+        assert_eq!(
+            READ_ONLY_STATUS_ARGUMENTS,
+            [
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ]
+        );
+        let flag = READ_ONLY_STATUS_ARGUMENTS
+            .iter()
+            .position(|argument| *argument == "--no-optional-locks")
+            .expect("the read-only status argv must carry --no-optional-locks");
+        let subcommand = READ_ONLY_STATUS_ARGUMENTS
+            .iter()
+            .position(|argument| *argument == "status")
+            .expect("the read-only status argv must invoke `status`");
+        assert!(
+            flag < subcommand,
+            "--no-optional-locks is a global option and must precede the subcommand"
+        );
+    }
+
+    /// Every element is a separate argv entry: no element may smuggle in a
+    /// space-separated pair, which is how a fixed argv array degrades into
+    /// something shell-like.
+    #[test]
+    fn read_only_status_argv_has_no_combined_or_empty_arguments() {
+        for argument in READ_ONLY_STATUS_ARGUMENTS {
+            assert!(!argument.is_empty());
+            assert!(
+                !argument.contains(char::is_whitespace),
+                "argv entries must stay separate"
+            );
+        }
+    }
 
     // These tests exercise `capture_bounded_stdout`/`classify_capture`
     // against fixture `cmd.exe` processes, never a real (or even fake) Git
@@ -1421,6 +1909,38 @@ mod tests {
         let error = classify_capture(BoundedCaptureOutcome::Success(vec![0xFF, 0xFE]))
             .expect_err("non-UTF-8 bytes err");
         assert_eq!(error.category(), FailureCategory::InvalidInput);
+    }
+
+    #[test]
+    fn untracked_paths_are_sorted_and_reject_git_or_non_utf8_entries() {
+        assert_eq!(
+            canonical_untracked_paths(b"z.txt\0a.txt\0").expect("valid paths"),
+            vec!["a.txt", "z.txt"]
+        );
+        for invalid in [
+            b".git/config\0".as_slice(),
+            b".GIT/config\0".as_slice(),
+            b"../escape\0".as_slice(),
+            &[0xff, 0][..],
+        ] {
+            assert_eq!(
+                canonical_untracked_paths(invalid)
+                    .expect_err("unsafe path must fail closed")
+                    .category(),
+                FailureCategory::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_append_enforces_the_shared_diff_bound() {
+        let mut candidate = "x".repeat(DIFF_MAX_BYTES);
+        assert_eq!(
+            append_candidate(&mut candidate, "y")
+                .expect_err("combined candidate exceeds bound")
+                .category(),
+            FailureCategory::InvalidInput
+        );
     }
 
     #[test]

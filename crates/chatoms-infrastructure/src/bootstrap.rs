@@ -2,23 +2,30 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chatoms_domain::{
-    ProjectId, Task, TaskId, TaskStateTransition, ValidationCommandKind, WorkKind,
+    ContextDataScope, HighRiskCategory, ProjectId, Task, TaskId, TaskStateTransition,
+    ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_ports::{
     DatabaseBootstrapPort, DatabaseBootstrapState, LoggingBootstrapPort, LoggingBootstrapState,
+    diff::DiffContentHash,
     error::{CategorizedFailure, FailureCategory, PortFailure},
     filesystem::FilesystemIdentityPort,
     git::{GitService, RepositoryKind},
+    manual_merge_resolution::ManualResolutionDigest,
     path::ResolvedAppPaths,
     permissions::PermissionStatus,
     provider::ProviderKind,
     repository::{
-        ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
-        GitOperationReceipt, GitOperationReceiptKind, ProjectFilesystemIdentityRecord,
-        ProjectRecord, ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError,
-        RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
-        TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
-        ValidationCommandResultAttempt, ValidationCommandResultRecord,
+        ActiveLease, AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
+        DiffApprovalRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        GitOperationReceipt, GitOperationReceiptKind, HighRiskApprovalRecord,
+        ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
+        PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
+        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
+        ProviderConsent, RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
+        TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
+        ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+        ValidationCommandResultRecord,
     },
 };
 
@@ -499,9 +506,16 @@ impl FoundationRepository for SharedFoundationRepository {
         provider: ProviderKind,
         work_kind: WorkKind,
         approved_task_version: u64,
+        data_scope: ContextDataScope,
     ) -> Result<Option<ProviderConsent>, RepositoryError> {
         self.with_repository(|repository| {
-            repository.get_provider_consent(task_id, provider, work_kind, approved_task_version)
+            repository.get_provider_consent(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            )
         })
     }
 
@@ -533,10 +547,279 @@ impl FoundationRepository for SharedFoundationRepository {
         &mut self,
         expected_version: u64,
         task_id: TaskId,
+        data_scope: ContextDataScope,
         consented_at_ms: i64,
     ) -> Result<ProviderConsent, RepositoryError> {
         self.with_repository(|repository| {
-            repository.save_review_consent(expected_version, task_id, consented_at_ms)
+            repository.save_review_consent(expected_version, task_id, data_scope, consented_at_ms)
+        })
+    }
+
+    fn save_context_package_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_context_package_planning_transition(expected_version, task, transition)
+        })
+    }
+
+    fn save_context_package_implementation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_context_package_implementation_transition(
+                expected_version,
+                task,
+                transition,
+            )
+        })
+    }
+
+    fn prepare_planning_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.prepare_planning_context_package(expected_version, task_id, prepared_at_ms)
+        })
+    }
+
+    fn prepare_implementation_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.prepare_implementation_context_package(
+                expected_version,
+                task_id,
+                prepared_at_ms,
+            )
+        })
+    }
+
+    fn prepare_review_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.prepare_review_context_package(expected_version, task_id, prepared_at_ms)
+        })
+    }
+
+    fn save_context_package_manifest(
+        &mut self,
+        record: &ContextPackageManifestRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| repository.save_context_package_manifest(record))
+    }
+
+    fn get_context_package_manifest(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+        data_scope: ContextDataScope,
+    ) -> Result<Option<ContextPackageManifestRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_context_package_manifest(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            )
+        })
+    }
+
+    fn save_high_risk_approval(
+        &mut self,
+        approval: &HighRiskApprovalRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| repository.save_high_risk_approval(approval))
+    }
+
+    fn get_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        risk_category: HighRiskCategory,
+    ) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_high_risk_approval(task_id, approved_task_version, risk_category)
+        })
+    }
+
+    fn ensure_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+        approved_at_ms: i64,
+    ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.ensure_high_risk_approval(
+                task_id,
+                expected_version,
+                risk_category,
+                approved_at_ms,
+            )
+        })
+    }
+
+    fn save_diff_approval(&mut self, approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| repository.save_diff_approval(approval))
+    }
+
+    fn get_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        diff_content_hash: DiffContentHash,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_diff_approval(task_id, approved_task_version, diff_content_hash)
+        })
+    }
+
+    fn get_diff_approval_for_task_version(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_diff_approval_for_task_version(task_id, approved_task_version)
+        })
+    }
+
+    fn ensure_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        diff_content_hash: DiffContentHash,
+        approved_at_ms: i64,
+    ) -> Result<DiffApprovalRecord, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.ensure_diff_approval(
+                task_id,
+                expected_version,
+                diff_content_hash,
+                approved_at_ms,
+            )
+        })
+    }
+
+    fn get_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_manual_merge_resolution_confirmation(
+                task_id,
+                merge_conflict_task_version,
+                resolution_digest,
+            )
+        })
+    }
+
+    fn ensure_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Result<ManualMergeResolutionConfirmationRecord, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.ensure_manual_merge_resolution_confirmation(
+                task_id,
+                merge_conflict_task_version,
+                source_approval_task_version,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                resolution_digest,
+                confirmed_at_ms,
+            )
+        })
+    }
+
+    fn save_manual_merge_resolution_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_manual_merge_resolution_transition(
+                expected_version,
+                task,
+                transition,
+                resolution_digest,
+            )
+        })
+    }
+
+    fn get_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+    ) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.get_merge_abort_approval(task_id, merge_conflict_task_version)
+        })
+    }
+
+    fn ensure_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        approved_at_ms: i64,
+    ) -> Result<MergeAbortApprovalRecord, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.ensure_merge_abort_approval(
+                task_id,
+                merge_conflict_task_version,
+                source_approval_task_version,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                approved_at_ms,
+            )
+        })
+    }
+
+    fn save_merge_abort_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.save_merge_abort_transition(expected_version, task, transition, terminal)
         })
     }
 
@@ -595,6 +878,21 @@ impl FoundationRepository for SharedFoundationRepository {
         })
     }
 
+    fn list_validation_command_approvals_for_scope(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        execution_scope: ValidationExecutionScope,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.list_validation_command_approvals_for_scope(
+                task_id,
+                approved_task_version,
+                execution_scope,
+            )
+        })
+    }
+
     fn append_validation_command_result(
         &mut self,
         attempt: &ValidationCommandResultAttempt,
@@ -622,6 +920,47 @@ impl FoundationRepository for SharedFoundationRepository {
     ) -> Result<(), RepositoryError> {
         self.with_repository(|repository| {
             repository.finalize_validation_command_batch(
+                expected_version,
+                task,
+                transition,
+                attempt,
+            )
+        })
+    }
+
+    fn append_post_merge_validation_result(
+        &mut self,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<PostMergeValidationResultRecord, RepositoryError> {
+        self.with_repository(|repository| repository.append_post_merge_validation_result(attempt))
+    }
+
+    fn list_post_merge_validation_results(
+        &mut self,
+        task_id: TaskId,
+        approval_task_version: u64,
+        post_merge_task_version: u64,
+        kind: ValidationCommandKind,
+    ) -> Result<Vec<PostMergeValidationResultRecord>, RepositoryError> {
+        self.with_repository(|repository| {
+            repository.list_post_merge_validation_results(
+                task_id,
+                approval_task_version,
+                post_merge_task_version,
+                kind,
+            )
+        })
+    }
+
+    fn finalize_post_merge_validation_batch(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        self.with_repository(|repository| {
+            repository.finalize_post_merge_validation_batch(
                 expected_version,
                 task,
                 transition,

@@ -79,6 +79,28 @@ pub struct ValidationCommandApprovalStatusDto {
     pub approved_kinds: Vec<ValidationCommandKindDto>,
 }
 
+/// Content-free status for the two fixed ProjectRoot commands required
+/// before merge. It deliberately carries no project root, executable, tool,
+/// environment, diff, or process information.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRootValidationApprovalStatusDto {
+    pub test_approved: bool,
+    pub build_approved: bool,
+}
+
+/// One-shot user-supplied binding input for the fixed ProjectRoot Cargo Test
+/// and Build approvals. The backend never echoes any field of this input in
+/// a response; the browser keeps it only in modal-local state until the
+/// approval attempt completes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveProjectRootValidationInputDto {
+    pub executable_path: String,
+    pub cargo_home_path: Option<String>,
+    pub rustup_home_path: Option<String>,
+}
+
 /// Frontend-supplied approval input. `kinds` carries only which categories
 /// the user selected — never an executable name or argv; the backend
 /// re-derives those from the current Cargo candidates discovery proposes
@@ -141,6 +163,26 @@ mod tests {
             panic!("expected JSON response");
         };
         assert_eq!(json, "{\"approvedKinds\":[\"format\",\"test\"]}");
+    }
+
+    #[test]
+    fn project_root_approval_status_serializes_only_two_readiness_flags() {
+        let dto = ProjectRootValidationApprovalStatusDto {
+            test_approved: true,
+            build_approved: false,
+        };
+        let InvokeResponseBody::Json(json) = dto.body().expect("serialize ProjectRoot status DTO")
+        else {
+            panic!("expected JSON response");
+        };
+        assert_eq!(json, "{\"testApproved\":true,\"buildApproved\":false}");
+        assert!(
+            !json.contains("path")
+                && !json.contains("executable")
+                && !json.contains("environment")
+                && !json.contains("diff"),
+            "ProjectRoot approval status must remain content-free"
+        );
     }
 
     #[test]

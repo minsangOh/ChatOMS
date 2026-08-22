@@ -1,17 +1,25 @@
 use std::str::FromStr;
 
 use chatoms_domain::{
-    ActorKind, DomainError, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId, TaskState,
-    TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind,
-    WorkKind,
+    ActorKind, ContextDataScope, DomainError, HighRiskCategory, ProjectId, ReasonCode, Task,
+    TaskBranchIdentity, TaskId, TaskState, TaskStateTransition, TaskStateTransitionId,
+    TaskStateTransitionSnapshot, ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_ports::{
     TimeProvider,
+    diff::DiffContentHash,
     error::FailureCategory,
+    manual_merge_resolution::ManualResolutionDigest,
+    merge_abort::MergeAbortOutcome,
+    merge_continue::MergeContinueOutcome,
+    merge_execution::MergeExecutionOutcome,
     provider::ProviderKind,
     repository::{
-        ActiveLease, FoundationRepository, GitIsolationStatus, ImplementationResultOutcome,
-        PlanningResultOutcome, ProviderConsent, ReviewResultOutcome, TaskBriefRecord,
+        ActiveLease, ContextPackagePreparation, DiffApprovalRecord, FoundationRepository,
+        GitIsolationStatus, HighRiskApprovalRecord, ImplementationResultOutcome,
+        ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord, PlanningResultOutcome,
+        PostMergeValidationResultAttempt, PostMergeValidationResultOutcome,
+        PostMergeValidationResultRecord, ProviderConsent, ReviewResultOutcome, TaskBriefRecord,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
         ValidationCommandResultAttempt, ValidationCommandResultOutcome,
     },
@@ -151,7 +159,317 @@ pub struct StartReviewRequest {
     expected_version: u64,
 }
 
+pub struct StartMergeRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl StartMergeRequest {
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
 impl StartReviewRequest {
+    #[must_use]
+    pub const fn new(task_id: TaskId, expected_version: u64) -> Self {
+        Self {
+            task_id,
+            expected_version,
+        }
+    }
+}
+
+/// Starts a Context Package v1 Claude Planning activation from
+/// `WorktreeReady`: unlike [`StartPlanningRequest`], this never creates a
+/// new provider-transmission consent — the exact `(task_id, Claude,
+/// Planning, expected_version, ContextPackageV1)` consent and its FK-bound
+/// manifest must already exist (see [`PreparePlanningContextPackageRequest`])
+/// — so this request carries no `actor_kind`/`reason_code` for a consent
+/// grant, only for the resulting transition history entry.
+pub struct StartContextPackagePlanningRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl StartContextPackagePlanningRequest {
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+/// Whether an exact `(task_id, Claude, Planning, expected_version,
+/// ContextPackageV1)` consent and its FK-bound manifest have already been
+/// prepared (see [`TaskService::prepare_planning_context_package`]), without
+/// creating, reusing, or mutating anything. `ready` is `true` only when both
+/// exist; `false` when neither does — the ordinary "not prepared yet" case.
+/// A partial pair (exactly one present) is not representable here: see
+/// [`TaskService::get_context_package_planning_readiness`], which returns an
+/// error instead of a misleading `false` in that case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextPackagePlanningReadiness {
+    pub ready: bool,
+}
+
+/// Starts a Context Package v1 Claude Implementation activation from
+/// `AwaitingDesignApproval`: unlike [`StartImplementationRequest`], this
+/// never creates a new provider-transmission consent — the exact `(task_id,
+/// Claude, Implementation, expected_version, ContextPackageV1)` consent and
+/// its FK-bound manifest must already exist (see
+/// [`PrepareImplementationContextPackageRequest`]) — so this request carries
+/// no `actor_kind`/`reason_code` for a consent grant, only for the resulting
+/// transition history entry.
+pub struct StartContextPackageImplementationRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl StartContextPackageImplementationRequest {
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+/// Whether an exact `(task_id, Claude, Implementation, expected_version,
+/// ContextPackageV1)` consent and its FK-bound manifest have already been
+/// prepared (see [`TaskService::prepare_implementation_context_package`]),
+/// without creating, reusing, or mutating anything. `ready` is `true` only
+/// when both exist; `false` when neither does — the ordinary "not prepared
+/// yet" case. A partial pair (exactly one present) is not representable
+/// here: see [`TaskService::get_context_package_implementation_readiness`],
+/// which returns an error instead of a misleading `false` in that case. This
+/// deliberately says nothing about whether a completed stored Claude
+/// Planning result exists — that is a separate structural precondition
+/// [`TaskService::start_context_package_implementation`] checks on its own,
+/// not part of what "Context Package v1 prepared" means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextPackageImplementationReadiness {
+    pub ready: bool,
+}
+
+/// Whether an exact `(task_id, Claude, Review, expected_version,
+/// ContextPackageV1)` consent and its FK-bound manifest have already been
+/// prepared. See [`ContextPackageImplementationReadiness`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextPackageReviewReadiness {
+    pub ready: bool,
+}
+
+/// Whether an exact `(task_id, expected_version, risk_category)`
+/// [`HighRiskCategory`] approval already exists, without creating, reusing,
+/// or mutating it. Unlike [`ContextPackageReviewReadiness`] and its
+/// siblings, this is not a consent+manifest pair — a single
+/// [`HighRiskApprovalRecord`] either exists or it does not, so there is no
+/// partial-pair case to represent as an error. Provider/work-kind/data-scope
+/// independent — see [`chatoms_domain::HighRiskCategory`]. Never touches
+/// task state, version, transition history, or the `ActiveTaskLease`. This
+/// is a dormant use case: no Tauri command, UI, or execution starter calls
+/// it yet, and no Policy Engine decides which category applies to which
+/// operation — that classification is a future Unit's responsibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HighRiskApprovalStatus {
+    pub approved: bool,
+}
+
+/// Read-only view of an immutable [`HighRiskApprovalRecord`]. Content-free
+/// like the record it mirrors — no free-text description of what was
+/// approved, only the closed [`chatoms_domain::HighRiskCategory`]
+/// vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HighRiskApprovalView {
+    pub task_id: TaskId,
+    pub approved_task_version: u64,
+    pub risk_category: HighRiskCategory,
+    pub approved_at_ms: i64,
+}
+
+impl From<HighRiskApprovalRecord> for HighRiskApprovalView {
+    fn from(value: HighRiskApprovalRecord) -> Self {
+        Self {
+            task_id: value.task_id,
+            approved_task_version: value.approved_task_version,
+            risk_category: value.risk_category,
+            approved_at_ms: value.approved_at_ms,
+        }
+    }
+}
+
+/// Requests an atomic create-or-reuse [`HighRiskCategory`] approval for the
+/// exact `(task_id, expected_version, risk_category)` identity. Carries the
+/// approval timestamp explicitly (unlike [`StartReviewRequest`], which
+/// derives its timestamp from `TimeProvider`) because this use case has no
+/// other side effect from which to infer "now" and no state transition to
+/// timestamp instead. This request never carries a free-text description of
+/// what is being approved — only the closed `risk_category` vocabulary — and
+/// approving it never classifies, infers, or expands which category an
+/// operation needs; that remains a future Policy Engine's responsibility.
+pub struct ApproveHighRiskOperationRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    risk_category: HighRiskCategory,
+    approved_at_ms: i64,
+}
+
+impl ApproveHighRiskOperationRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+        approved_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            risk_category,
+            approved_at_ms,
+        }
+    }
+}
+
+/// Read-only view of an immutable [`DiffApprovalRecord`]. Content-free like
+/// the record it mirrors — never the raw diff text, only the content-free
+/// [`DiffContentHash`] it was approved against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiffApprovalView {
+    pub task_id: TaskId,
+    pub approved_task_version: u64,
+    pub diff_content_hash: DiffContentHash,
+    pub approved_at_ms: i64,
+}
+
+impl From<DiffApprovalRecord> for DiffApprovalView {
+    fn from(value: DiffApprovalRecord) -> Self {
+        Self {
+            task_id: value.task_id,
+            approved_task_version: value.approved_task_version,
+            diff_content_hash: value.diff_content_hash,
+            approved_at_ms: value.approved_at_ms,
+        }
+    }
+}
+
+/// Requests an atomic create-or-reuse [`DiffContentHash`]-bound approval for
+/// the exact `(task_id, expected_version, diff_content_hash)` identity.
+/// Callers (see `chatoms_application::user_diff_approval`) are responsible
+/// for recomputing `diff_content_hash` from the task's current worktree
+/// diff and verifying it matches whatever hash the user was shown before
+/// constructing this request — this request itself carries no diff text
+/// and this use case does not read or re-verify any diff.
+pub struct RecordDiffApprovalRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    diff_content_hash: DiffContentHash,
+    approved_at_ms: i64,
+}
+
+impl RecordDiffApprovalRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        diff_content_hash: DiffContentHash,
+        approved_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            diff_content_hash,
+            approved_at_ms,
+        }
+    }
+}
+
+/// Prepares (creates or reuses) the exact `ContextPackageV1` consent and its
+/// FK-bound manifest for a future Claude Planning attempt, without driving
+/// any state transition — `task.state()` must already be `WorktreeReady`
+/// and is left there unchanged. This is a distinct, currently-uncalled use
+/// case alongside [`StartPlanningRequest`]/[`TaskService::start_planning`],
+/// which continues to record and reuse only
+/// [`chatoms_domain::ContextDataScope::LegacyPhase4`] and is not modified by
+/// this type or [`TaskService::prepare_planning_context_package`].
+pub struct PreparePlanningContextPackageRequest {
+    task_id: TaskId,
+    expected_version: u64,
+}
+
+impl PreparePlanningContextPackageRequest {
+    #[must_use]
+    pub const fn new(task_id: TaskId, expected_version: u64) -> Self {
+        Self {
+            task_id,
+            expected_version,
+        }
+    }
+}
+
+/// See [`PreparePlanningContextPackageRequest`]; requires `task.state() ==
+/// AwaitingDesignApproval` instead. `TaskService::start_implementation`
+/// remains unmodified and continues to use only `LegacyPhase4`.
+pub struct PrepareImplementationContextPackageRequest {
+    task_id: TaskId,
+    expected_version: u64,
+}
+
+impl PrepareImplementationContextPackageRequest {
+    #[must_use]
+    pub const fn new(task_id: TaskId, expected_version: u64) -> Self {
+        Self {
+            task_id,
+            expected_version,
+        }
+    }
+}
+
+/// See [`PreparePlanningContextPackageRequest`]; requires `task.state() ==
+/// Reviewing` instead, matching [`StartReviewRequest`]'s existing
+/// no-transition shape. `TaskService::start_review` remains unmodified and
+/// continues to use only `LegacyPhase4`.
+pub struct PrepareReviewContextPackageRequest {
+    task_id: TaskId,
+    expected_version: u64,
+}
+
+impl PrepareReviewContextPackageRequest {
     #[must_use]
     pub const fn new(task_id: TaskId, expected_version: u64) -> Self {
         Self {
@@ -275,6 +593,252 @@ pub struct RecordReviewResultRequest {
     reason_code: String,
 }
 
+pub struct RecordMergeResultRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: MergeExecutionOutcome,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl RecordMergeResultRequest {
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        outcome: MergeExecutionOutcome,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            outcome,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+/// Records (creates or reuses) an immutable manual-resolution confirmation
+/// for one task's `MergeConflict`. Carries every content-free field a
+/// confirmation row needs — never touches task state, version, transition
+/// history, or the `ActiveTaskLease`.
+pub struct RecordManualMergeResolutionConfirmationRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    source_approval_task_version: u64,
+    base_commit: String,
+    task_commit: String,
+    merge_head_commit: String,
+    resolution_digest: ManualResolutionDigest,
+    confirmed_at_ms: i64,
+}
+
+impl RecordManualMergeResolutionConfirmationRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        source_approval_task_version: u64,
+        base_commit: String,
+        task_commit: String,
+        merge_head_commit: String,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            source_approval_task_version,
+            base_commit,
+            task_commit,
+            merge_head_commit,
+            resolution_digest,
+            confirmed_at_ms,
+        }
+    }
+}
+
+/// Read-only view of an immutable [`ManualMergeResolutionConfirmationRecord`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualMergeResolutionConfirmationView {
+    pub task_id: TaskId,
+    pub merge_conflict_task_version: u64,
+    pub source_approval_task_version: u64,
+    pub base_commit: String,
+    pub task_commit: String,
+    pub merge_head_commit: String,
+    pub resolution_digest: ManualResolutionDigest,
+    pub confirmed_at_ms: i64,
+}
+
+impl From<ManualMergeResolutionConfirmationRecord> for ManualMergeResolutionConfirmationView {
+    fn from(value: ManualMergeResolutionConfirmationRecord) -> Self {
+        Self {
+            task_id: value.task_id,
+            merge_conflict_task_version: value.merge_conflict_task_version,
+            source_approval_task_version: value.source_approval_task_version,
+            base_commit: value.base_commit,
+            task_commit: value.task_commit,
+            merge_head_commit: value.merge_head_commit,
+            resolution_digest: value.resolution_digest,
+            confirmed_at_ms: value.confirmed_at_ms,
+        }
+    }
+}
+
+/// Requests an atomic create-or-reuse merge-abort approval for the exact
+/// `(task_id, expected_version)` identity. Unlike
+/// [`RecordManualMergeResolutionConfirmationRequest`], this never binds to a
+/// resolution digest — see [`chatoms_ports::repository::MergeAbortApprovalRecord`].
+/// Carries the approval timestamp explicitly, like
+/// [`ApproveHighRiskOperationRequest`], because this use case has no state
+/// transition to derive "now" from.
+pub struct RecordMergeAbortApprovalRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    source_approval_task_version: u64,
+    base_commit: String,
+    task_commit: String,
+    merge_head_commit: String,
+    approved_at_ms: i64,
+}
+
+impl RecordMergeAbortApprovalRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        source_approval_task_version: u64,
+        base_commit: String,
+        task_commit: String,
+        merge_head_commit: String,
+        approved_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            source_approval_task_version,
+            base_commit,
+            task_commit,
+            merge_head_commit,
+            approved_at_ms,
+        }
+    }
+}
+
+/// Read-only view of an immutable [`MergeAbortApprovalRecord`]. Content-free
+/// like the record it mirrors — never a raw path, Git stdout/stderr, or any
+/// resolution digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeAbortApprovalView {
+    pub task_id: TaskId,
+    pub merge_conflict_task_version: u64,
+    pub source_approval_task_version: u64,
+    pub base_commit: String,
+    pub task_commit: String,
+    pub merge_head_commit: String,
+    pub approved_at_ms: i64,
+}
+
+impl From<MergeAbortApprovalRecord> for MergeAbortApprovalView {
+    fn from(value: MergeAbortApprovalRecord) -> Self {
+        Self {
+            task_id: value.task_id,
+            merge_conflict_task_version: value.merge_conflict_task_version,
+            source_approval_task_version: value.source_approval_task_version,
+            base_commit: value.base_commit,
+            task_commit: value.task_commit,
+            merge_head_commit: value.merge_head_commit,
+            approved_at_ms: value.approved_at_ms,
+        }
+    }
+}
+
+pub struct RecordMergeAbortResultRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: MergeAbortOutcome,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl RecordMergeAbortResultRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        outcome: MergeAbortOutcome,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            outcome,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+pub struct StartMergeContinueRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    resolution_digest: ManualResolutionDigest,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl StartMergeContinueRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        resolution_digest: ManualResolutionDigest,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            resolution_digest,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
+pub struct RecordMergeContinueResultRequest {
+    task_id: TaskId,
+    expected_version: u64,
+    outcome: MergeContinueOutcome,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl RecordMergeContinueResultRequest {
+    #[must_use]
+    pub const fn new(
+        task_id: TaskId,
+        expected_version: u64,
+        outcome: MergeContinueOutcome,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_version,
+            outcome,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
 impl RecordReviewResultRequest {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -355,6 +919,86 @@ impl FinalizeValidationCommandBatchRequest {
     }
 }
 
+pub struct AppendPostMergeValidationResultRequest {
+    task_id: TaskId,
+    approval_task_version: u64,
+    post_merge_task_version: u64,
+    kind: ValidationCommandKind,
+    exit_code: Option<i32>,
+    safe_summary: String,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+}
+
+impl AppendPostMergeValidationResultRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        task_id: TaskId,
+        approval_task_version: u64,
+        post_merge_task_version: u64,
+        kind: ValidationCommandKind,
+        exit_code: Option<i32>,
+        safe_summary: String,
+        started_at_ms: i64,
+        completed_at_ms: i64,
+    ) -> Self {
+        Self {
+            task_id,
+            approval_task_version,
+            post_merge_task_version,
+            kind,
+            exit_code,
+            safe_summary,
+            started_at_ms,
+            completed_at_ms,
+        }
+    }
+}
+
+pub struct FinalizePostMergeValidationBatchRequest {
+    task_id: TaskId,
+    approval_task_version: u64,
+    expected_version: u64,
+    kind: ValidationCommandKind,
+    outcome: PostMergeValidationResultOutcome,
+    exit_code: Option<i32>,
+    safe_summary: String,
+    started_at_ms: i64,
+    actor_kind: String,
+    reason_code: String,
+}
+
+impl FinalizePostMergeValidationBatchRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        task_id: TaskId,
+        approval_task_version: u64,
+        expected_version: u64,
+        kind: ValidationCommandKind,
+        outcome: PostMergeValidationResultOutcome,
+        exit_code: Option<i32>,
+        safe_summary: String,
+        started_at_ms: i64,
+        actor_kind: String,
+        reason_code: String,
+    ) -> Self {
+        Self {
+            task_id,
+            approval_task_version,
+            expected_version,
+            kind,
+            outcome,
+            exit_code,
+            safe_summary,
+            started_at_ms,
+            actor_kind,
+            reason_code,
+        }
+    }
+}
+
 /// Read-only view of an already-safe, immutable Claude Planning result
 /// (see [`TaskPlanningResultRecord`] for the masking/size-bound guarantees
 /// this is a direct passthrough of). Never carries raw provider output.
@@ -404,6 +1048,34 @@ impl From<TaskReviewResultRecord> for ReviewResultView {
             started_at_ms: value.started_at_ms,
             completed_at_ms: value.completed_at_ms,
             review_text: value.review_text,
+        }
+    }
+}
+
+/// Read-only view of an immutable ProjectRoot post-merge validation result.
+/// This is a direct passthrough of the bounded `safe_summary` persisted by
+/// the validation recorder and never carries raw process output or paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostMergeValidationResultView {
+    pub kind: ValidationCommandKind,
+    pub attempt_sequence: u32,
+    pub outcome: PostMergeValidationResultOutcome,
+    pub exit_code: Option<i32>,
+    pub safe_summary: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+}
+
+impl From<PostMergeValidationResultRecord> for PostMergeValidationResultView {
+    fn from(value: PostMergeValidationResultRecord) -> Self {
+        Self {
+            kind: value.kind,
+            attempt_sequence: value.attempt_sequence,
+            outcome: value.outcome,
+            exit_code: value.exit_code,
+            safe_summary: value.safe_summary,
+            started_at_ms: value.started_at_ms,
+            completed_at_ms: value.completed_at_ms,
         }
     }
 }
@@ -585,6 +1257,44 @@ where
             .map_err(|error| ApplicationError::from_categorized(&error))
     }
 
+    /// Reads the immutable ProjectRoot post-merge result rows for the one
+    /// merge chain associated with `task_id`. The approval and post-merge
+    /// versions come from transition history; no current-version arithmetic
+    /// or latest-approval fallback is used. Results are deterministic: all
+    /// Test attempts precede all Build attempts, with each command's stored
+    /// `attempt_sequence` order preserved by the repository.
+    pub fn get_post_merge_validation_results(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Vec<PostMergeValidationResultView>, ApplicationError> {
+        let transitions = self
+            .repository
+            .list_task_transitions(task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        let Some((approval_task_version, post_merge_task_version)) =
+            post_merge_version_pair(&transitions)
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut results = Vec::new();
+        for kind in [ValidationCommandKind::Test, ValidationCommandKind::Build] {
+            results.extend(
+                self.repository
+                    .list_post_merge_validation_results(
+                        task_id,
+                        approval_task_version,
+                        post_merge_task_version,
+                        kind,
+                    )
+                    .map_err(|error| ApplicationError::from_categorized(&error))?
+                    .into_iter()
+                    .map(PostMergeValidationResultView::from),
+            );
+        }
+        Ok(results)
+    }
+
     pub fn task_history(
         &mut self,
         task_id: TaskId,
@@ -620,7 +1330,10 @@ where
     /// verified-ready isolation record, reuses a valid same-version consent
     /// if one already exists (otherwise records a new one), and commits the
     /// consent (when new), the `Planning` state update, and the transition
-    /// history entry in a single repository transaction.
+    /// history entry in a single repository transaction. The consent is
+    /// always recorded and looked up under [`ContextDataScope::LegacyPhase4`]
+    /// — the fixed data shape every current Phase 4 Planning call transmits;
+    /// no path in this Unit ever selects [`ContextDataScope::ContextPackageV1`].
     pub fn start_planning(
         &mut self,
         request: StartPlanningRequest,
@@ -646,6 +1359,7 @@ where
                 ProviderKind::Claude,
                 WorkKind::Planning,
                 request.expected_version,
+                ContextDataScope::LegacyPhase4,
             )
             .map_err(|error| ApplicationError::from_categorized(&error))?;
         let occurred_at_ms = self.now_ms()?;
@@ -654,6 +1368,7 @@ where
             provider: ProviderKind::Claude,
             work_kind: WorkKind::Planning,
             approved_task_version: request.expected_version,
+            data_scope: ContextDataScope::LegacyPhase4,
             consented_at_ms: occurred_at_ms,
         });
         let from_state = task.state();
@@ -671,11 +1386,104 @@ where
         Ok(TaskView::from(&task))
     }
 
+    /// Read-only: reports whether an exact `(task_id, Claude, Planning,
+    /// expected_version, ContextPackageV1)` consent and its FK-bound
+    /// manifest already exist, without creating, reusing, or mutating
+    /// either. Never touches task state, version, transition history, or
+    /// the `ActiveTaskLease`. A partial pair (exactly one present — an
+    /// already-corrupted invariant [`Self::prepare_planning_context_package`]
+    /// itself guards against) is reported as an error, never as a
+    /// misleading `ready: false`; a genuine repository failure is likewise
+    /// propagated as an error, never silently converted to `false`.
+    pub fn get_context_package_planning_readiness(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+    ) -> Result<ContextPackagePlanningReadiness, ApplicationError> {
+        let consent = self
+            .repository
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Planning,
+                expected_version,
+                ContextDataScope::ContextPackageV1,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        let manifest = self
+            .repository
+            .get_context_package_manifest(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Planning,
+                expected_version,
+                ContextDataScope::ContextPackageV1,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        match (consent, manifest) {
+            (Some(_), Some(_)) => Ok(ContextPackagePlanningReadiness { ready: true }),
+            (None, None) => Ok(ContextPackagePlanningReadiness { ready: false }),
+            (Some(_), None) | (None, Some(_)) => {
+                Err(category_error(FailureCategory::InvariantViolation))
+            }
+        }
+    }
+
+    /// Starts a Context Package v1 Claude Planning activation: verifies the
+    /// task is `WorktreeReady` with a verified-ready isolation record (same
+    /// preconditions as [`Self::start_planning`]), then verifies — read-only,
+    /// via [`Self::get_context_package_planning_readiness`] — that the exact
+    /// `(task_id, Claude, Planning, expected_version, ContextPackageV1)`
+    /// consent and its FK-bound manifest already exist. If preparation is
+    /// missing or the readiness check itself errors, this returns a
+    /// fail-closed error and leaves the task exactly `WorktreeReady` —
+    /// nothing is written. Only once every precondition passes does this
+    /// commit the `WorktreeReady -> Planning` transition and its history
+    /// entry via `FoundationRepository::save_context_package_planning_transition`,
+    /// which never creates or reuses a consent of its own (unlike
+    /// [`Self::start_planning`]) and re-verifies the same consent/manifest
+    /// pair again inside its own transaction as defense-in-depth.
+    pub fn start_context_package_planning(
+        &mut self,
+        request: StartContextPackagePlanningRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::WorktreeReady {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let isolation = self
+            .repository
+            .get_task_isolation(request.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let readiness =
+            self.get_context_package_planning_readiness(request.task_id, request.expected_version)?;
+        if !readiness.ready {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let occurred_at_ms = self.now_ms()?;
+        task.transition_to(TaskState::Planning, occurred_at_ms)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_context_package_planning_transition(request.expected_version, &task, &transition)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
     /// Starts Claude Implementation: verifies the task is
     /// `AwaitingDesignApproval`, reuses a valid same-version Implementation
     /// consent if one already exists (otherwise records a new one), and
     /// commits the consent (when new), the `Implementing` state update, and
-    /// the transition history entry in a single repository transaction.
+    /// the transition history entry in a single repository transaction. The
+    /// consent is always recorded and looked up under
+    /// [`ContextDataScope::LegacyPhase4`] — see [`Self::start_planning`].
     pub fn start_implementation(
         &mut self,
         request: StartImplementationRequest,
@@ -693,6 +1501,7 @@ where
                 ProviderKind::Claude,
                 WorkKind::Implementation,
                 request.expected_version,
+                ContextDataScope::LegacyPhase4,
             )
             .map_err(|error| ApplicationError::from_categorized(&error))?;
         let occurred_at_ms = self.now_ms()?;
@@ -701,6 +1510,7 @@ where
             provider: ProviderKind::Claude,
             work_kind: WorkKind::Implementation,
             approved_task_version: request.expected_version,
+            data_scope: ContextDataScope::LegacyPhase4,
             consented_at_ms: occurred_at_ms,
         });
         let from_state = task.state();
@@ -718,6 +1528,136 @@ where
         Ok(TaskView::from(&task))
     }
 
+    /// Read-only: reports whether an exact `(task_id, Claude, Implementation,
+    /// expected_version, ContextPackageV1)` consent and its FK-bound
+    /// manifest already exist, without creating, reusing, or mutating
+    /// either. Never touches task state, version, transition history, or
+    /// the `ActiveTaskLease`. A partial pair (exactly one present — an
+    /// already-corrupted invariant
+    /// [`Self::prepare_implementation_context_package`] itself guards
+    /// against) is reported as an error, never as a misleading `ready:
+    /// false`; a genuine repository failure is likewise propagated as an
+    /// error, never silently converted to `false`.
+    pub fn get_context_package_implementation_readiness(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+    ) -> Result<ContextPackageImplementationReadiness, ApplicationError> {
+        let consent = self
+            .repository
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Implementation,
+                expected_version,
+                ContextDataScope::ContextPackageV1,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        let manifest = self
+            .repository
+            .get_context_package_manifest(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Implementation,
+                expected_version,
+                ContextDataScope::ContextPackageV1,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        match (consent, manifest) {
+            (Some(_), Some(_)) => Ok(ContextPackageImplementationReadiness { ready: true }),
+            (None, None) => Ok(ContextPackageImplementationReadiness { ready: false }),
+            (Some(_), None) | (None, Some(_)) => {
+                Err(category_error(FailureCategory::InvariantViolation))
+            }
+        }
+    }
+
+    /// Starts a Context Package v1 Claude Implementation activation:
+    /// verifies, read-only and in this fixed order, that the task is
+    /// `AwaitingDesignApproval` at `expected_version`; that its isolation is
+    /// a verified-ready `WorktreeReady` record; that a `Completed` Claude
+    /// Planning result with non-empty `plan_text` is already stored (the
+    /// same evidence
+    /// [`crate::implementation_execution::ImplementationExecutionStarter::begin`]'s
+    /// `load_execution_evidence` requires for the legacy path); that a
+    /// `TaskBrief` exists; and finally — via
+    /// [`Self::get_context_package_implementation_readiness`] — that the
+    /// exact `(task_id, Claude, Implementation, expected_version,
+    /// ContextPackageV1)` consent and its FK-bound manifest already exist.
+    /// The first four are structural invariants a real
+    /// `AwaitingDesignApproval` task must already satisfy, so their absence
+    /// is reported the same way `load_execution_evidence` reports it
+    /// (`NotFound`/`InvariantViolation`); only the last (context package not
+    /// yet prepared) is the ordinary "not ready yet" case, reported as
+    /// `InvalidState`. If any check fails, this returns a fail-closed error
+    /// and leaves the task exactly `AwaitingDesignApproval` — nothing is
+    /// written. Only once every precondition passes does this commit the
+    /// `AwaitingDesignApproval -> Implementing` transition and its history
+    /// entry via
+    /// `FoundationRepository::save_context_package_implementation_transition`,
+    /// which never creates or reuses a consent of its own (unlike
+    /// [`Self::start_implementation`]) and re-verifies the same
+    /// consent/manifest/planning-result evidence again inside its own
+    /// transaction as defense-in-depth.
+    pub fn start_context_package_implementation(
+        &mut self,
+        request: StartContextPackageImplementationRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::AwaitingDesignApproval {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let isolation = self
+            .repository
+            .get_task_isolation(request.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(category_error(FailureCategory::InvariantViolation));
+        }
+        let planning_result = self
+            .repository
+            .get_task_planning_result(request.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        if planning_result.outcome != PlanningResultOutcome::Completed {
+            return Err(category_error(FailureCategory::InvariantViolation));
+        }
+        if !planning_result
+            .plan_text
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            return Err(category_error(FailureCategory::InvariantViolation));
+        }
+        self.repository
+            .get_task_brief(request.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::InvariantViolation))?;
+        let readiness = self.get_context_package_implementation_readiness(
+            request.task_id,
+            request.expected_version,
+        )?;
+        if !readiness.ready {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let occurred_at_ms = self.now_ms()?;
+        task.transition_to(TaskState::Implementing, occurred_at_ms)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_context_package_implementation_transition(
+                request.expected_version,
+                &task,
+                &transition,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
     /// Starts Claude Review: verifies the task is `Reviewing` at the expected
     /// version, then records or reuses a same-version Claude/Review consent.
     /// Unlike [`Self::start_planning`]/[`Self::start_implementation`], there
@@ -727,7 +1667,8 @@ where
     /// `FoundationRepository::save_review_consent`, which re-verifies the
     /// task's version and `Reviewing` state inside its own transaction and
     /// never touches task state, version, transition history, or the
-    /// `ActiveTaskLease`.
+    /// `ActiveTaskLease`. The consent is always recorded and looked up under
+    /// [`ContextDataScope::LegacyPhase4`] — see [`Self::start_planning`].
     pub fn start_review(
         &mut self,
         request: StartReviewRequest,
@@ -738,9 +1679,330 @@ where
         }
         let occurred_at_ms = self.now_ms()?;
         self.repository
-            .save_review_consent(request.expected_version, request.task_id, occurred_at_ms)
+            .save_review_consent(
+                request.expected_version,
+                request.task_id,
+                ContextDataScope::LegacyPhase4,
+                occurred_at_ms,
+            )
             .map_err(|error| ApplicationError::from_categorized(&error))?;
         Ok(TaskView::from(&task))
+    }
+
+    pub fn start_merge(
+        &mut self,
+        request: StartMergeRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::AwaitingUserDiffApproval {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        task.transition_to(TaskState::Merging, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_transition(request.expected_version, &task, &transition)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
+    /// Commits `MergeConflict -> Merging` for a manual-resolution
+    /// continuation, requiring — and re-verifying inside the same
+    /// repository transaction — that an exact `(task_id, expected_version,
+    /// resolution_digest)` manual-resolution confirmation already exists
+    /// (see
+    /// `chatoms_ports::repository::FoundationRepository::save_manual_merge_resolution_transition`).
+    /// Never creates a confirmation row of its own.
+    pub fn start_merge_continue(
+        &mut self,
+        request: StartMergeContinueRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::MergeConflict {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        task.transition_to(TaskState::Merging, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_manual_merge_resolution_transition(
+                request.expected_version,
+                &task,
+                &transition,
+                request.resolution_digest,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
+    /// Read-only: reports whether an exact `(task_id, Claude, Review,
+    /// expected_version, ContextPackageV1)` consent and its FK-bound
+    /// manifest already exist, without creating, reusing, or mutating
+    /// either. Never touches task state, version, transition history, or the
+    /// `ActiveTaskLease`. A partial pair (exactly one present — an
+    /// already-corrupted invariant [`Self::prepare_review_context_package`]
+    /// itself guards against) is reported as an error, never as a
+    /// misleading `ready: false`; a genuine repository failure is likewise
+    /// propagated as an error, never silently converted to `false`. Mirrors
+    /// [`Self::get_context_package_implementation_readiness`] exactly.
+    pub fn get_context_package_review_readiness(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+    ) -> Result<ContextPackageReviewReadiness, ApplicationError> {
+        let consent = self
+            .repository
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                expected_version,
+                ContextDataScope::ContextPackageV1,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        let manifest = self
+            .repository
+            .get_context_package_manifest(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Review,
+                expected_version,
+                ContextDataScope::ContextPackageV1,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        match (consent, manifest) {
+            (Some(_), Some(_)) => Ok(ContextPackageReviewReadiness { ready: true }),
+            (None, None) => Ok(ContextPackageReviewReadiness { ready: false }),
+            (Some(_), None) | (None, Some(_)) => {
+                Err(category_error(FailureCategory::InvariantViolation))
+            }
+        }
+    }
+
+    /// Read-only: reports whether an exact `(task_id, expected_version,
+    /// risk_category)` [`HighRiskCategory`] approval already exists, without
+    /// creating, reusing, or mutating it. Verifies the task exists and is at
+    /// `expected_version` first; a version mismatch or a genuine repository
+    /// failure (including a corrupted persisted category — see
+    /// [`chatoms_ports::repository::FoundationRepository::get_high_risk_approval`])
+    /// is propagated as an error, never silently converted to `approved:
+    /// false`. Never touches task state, version, transition history, or the
+    /// `ActiveTaskLease`. Dormant: no Tauri command, UI, or execution
+    /// starter calls this yet.
+    pub fn get_high_risk_approval_status(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+    ) -> Result<HighRiskApprovalStatus, ApplicationError> {
+        self.load_expected_task(task_id, expected_version)?;
+        let approval = self
+            .repository
+            .get_high_risk_approval(task_id, expected_version, risk_category)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(HighRiskApprovalStatus {
+            approved: approval.is_some(),
+        })
+    }
+
+    /// Atomically creates-or-reuses the exact `(task_id, expected_version,
+    /// risk_category)` [`HighRiskCategory`] approval: verifies the task
+    /// exists and is at `expected_version`, then delegates the entire
+    /// read-existing-or-insert-new decision to
+    /// [`chatoms_ports::repository::FoundationRepository::ensure_high_risk_approval`],
+    /// which re-verifies the version and performs the create-or-reuse
+    /// atomically inside its own transaction. The returned view never
+    /// distinguishes "just created" from "already existed" — both are the
+    /// same successful outcome — and this method never infers, classifies,
+    /// or expands `risk_category` from anything other than the caller's
+    /// explicit request. Never touches task state, transition history, or
+    /// the `ActiveTaskLease`, and calls no provider consent, manifest, or
+    /// validation-approval use case. Dormant: no Tauri command, UI, or
+    /// execution starter calls this yet, and no Policy Engine decides when
+    /// it should be called.
+    pub fn approve_high_risk_operation(
+        &mut self,
+        request: ApproveHighRiskOperationRequest,
+    ) -> Result<HighRiskApprovalView, ApplicationError> {
+        self.load_expected_task(request.task_id, request.expected_version)?;
+        let approval = self
+            .repository
+            .ensure_high_risk_approval(
+                request.task_id,
+                request.expected_version,
+                request.risk_category,
+                request.approved_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(HighRiskApprovalView::from(approval))
+    }
+
+    /// Atomically creates-or-reuses the exact `(task_id, expected_version,
+    /// diff_content_hash)` approval: verifies the task exists and is at
+    /// `expected_version`, then delegates the entire
+    /// read-existing-or-insert-new decision to
+    /// [`chatoms_ports::repository::FoundationRepository::ensure_diff_approval`],
+    /// which re-verifies the version and performs the create-or-reuse
+    /// atomically inside its own transaction. This method does not read or
+    /// re-verify the worktree diff itself — callers (see
+    /// `chatoms_application::user_diff_approval::UserDiffApprovalService`)
+    /// must have already recomputed the current diff's hash and confirmed
+    /// it matches before calling this. Never touches task state, transition
+    /// history, or the `ActiveTaskLease`, and calls no provider consent,
+    /// manifest, high-risk-approval, or Merging use case.
+    pub fn record_diff_approval(
+        &mut self,
+        request: RecordDiffApprovalRequest,
+    ) -> Result<DiffApprovalView, ApplicationError> {
+        self.load_expected_task(request.task_id, request.expected_version)?;
+        let approval = self
+            .repository
+            .ensure_diff_approval(
+                request.task_id,
+                request.expected_version,
+                request.diff_content_hash,
+                request.approved_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(DiffApprovalView::from(approval))
+    }
+
+    /// Records (creates or reuses) an immutable manual-resolution
+    /// confirmation for the exact `(task_id, expected_version,
+    /// resolution_digest)` identity. Callers (see
+    /// `chatoms_application::manual_merge_resolution::ManualMergeResolutionConfirmationService`)
+    /// are responsible for having already verified every precondition and
+    /// read the live candidate digest — this method itself does not
+    /// re-verify the candidate. Never touches task state, transition
+    /// history, or the `ActiveTaskLease`.
+    pub fn record_manual_merge_resolution_confirmation(
+        &mut self,
+        request: RecordManualMergeResolutionConfirmationRequest,
+    ) -> Result<ManualMergeResolutionConfirmationView, ApplicationError> {
+        self.load_expected_task(request.task_id, request.expected_version)?;
+        let confirmation = self
+            .repository
+            .ensure_manual_merge_resolution_confirmation(
+                request.task_id,
+                request.expected_version,
+                request.source_approval_task_version,
+                &request.base_commit,
+                &request.task_commit,
+                &request.merge_head_commit,
+                request.resolution_digest,
+                request.confirmed_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(ManualMergeResolutionConfirmationView::from(confirmation))
+    }
+
+    /// Atomically creates-or-reuses the exact `(task_id, expected_version)`
+    /// merge-abort approval: verifies the task exists and is at
+    /// `expected_version`, then delegates the entire
+    /// read-existing-or-insert-new decision to
+    /// [`chatoms_ports::repository::FoundationRepository::ensure_merge_abort_approval`],
+    /// which re-verifies the version and current `MergeConflict` state and
+    /// performs the create-or-reuse atomically inside its own transaction.
+    /// This method does not itself re-verify live Git state — callers (see
+    /// `chatoms_application::merge_abort::MergeAbortApprovalService`) must
+    /// run the read-only preflight first.
+    pub fn record_merge_abort_approval(
+        &mut self,
+        request: RecordMergeAbortApprovalRequest,
+    ) -> Result<MergeAbortApprovalView, ApplicationError> {
+        self.load_expected_task(request.task_id, request.expected_version)?;
+        let approval = self
+            .repository
+            .ensure_merge_abort_approval(
+                request.task_id,
+                request.expected_version,
+                request.source_approval_task_version,
+                &request.base_commit,
+                &request.task_commit,
+                &request.merge_head_commit,
+                request.approved_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(MergeAbortApprovalView::from(approval))
+    }
+
+    /// Prepares (creates or reuses) the exact `(task_id, Claude, Planning,
+    /// expected_version, ContextPackageV1)` consent together with its
+    /// FK-bound manifest, atomically, via
+    /// `FoundationRepository::prepare_planning_context_package`. Never
+    /// drives a state transition, never touches transition history or the
+    /// `ActiveTaskLease`, and never creates, reuses, or otherwise touches a
+    /// [`ContextDataScope::LegacyPhase4`] consent — this is a thin wrapper
+    /// around a repository method that is itself the sole owner of the
+    /// create-or-reuse-or-fail-closed decision (see that method's contract
+    /// for the partial-state fail-closed rule). This use case is not called
+    /// by any Tauri command, adapter, or execution starter yet.
+    pub fn prepare_planning_context_package(
+        &mut self,
+        request: PreparePlanningContextPackageRequest,
+    ) -> Result<ContextPackagePreparation, ApplicationError> {
+        let task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::WorktreeReady {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let prepared_at_ms = self.now_ms()?;
+        self.repository
+            .prepare_planning_context_package(
+                request.expected_version,
+                request.task_id,
+                prepared_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))
+    }
+
+    /// See [`Self::prepare_planning_context_package`]; requires
+    /// `task.state() == AwaitingDesignApproval` and delegates to
+    /// `FoundationRepository::prepare_implementation_context_package`.
+    /// `TaskService::start_implementation` remains unmodified.
+    pub fn prepare_implementation_context_package(
+        &mut self,
+        request: PrepareImplementationContextPackageRequest,
+    ) -> Result<ContextPackagePreparation, ApplicationError> {
+        let task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::AwaitingDesignApproval {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let prepared_at_ms = self.now_ms()?;
+        self.repository
+            .prepare_implementation_context_package(
+                request.expected_version,
+                request.task_id,
+                prepared_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))
+    }
+
+    /// See [`Self::prepare_planning_context_package`]; requires
+    /// `task.state() == Reviewing` and delegates to
+    /// `FoundationRepository::prepare_review_context_package`.
+    /// `TaskService::start_review` remains unmodified.
+    pub fn prepare_review_context_package(
+        &mut self,
+        request: PrepareReviewContextPackageRequest,
+    ) -> Result<ContextPackagePreparation, ApplicationError> {
+        let task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::Reviewing {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let prepared_at_ms = self.now_ms()?;
+        self.repository
+            .prepare_review_context_package(
+                request.expected_version,
+                request.task_id,
+                prepared_at_ms,
+            )
+            .map_err(|error| ApplicationError::from_categorized(&error))
     }
 
     /// Records a Claude Planning attempt's already-safe outcome and, in the
@@ -1036,6 +2298,206 @@ where
         }
     }
 
+    pub fn record_merge_result(
+        &mut self,
+        request: RecordMergeResultRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::Merging {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let target = match request.outcome {
+            MergeExecutionOutcome::Merged => TaskState::PostMergeTesting,
+            MergeExecutionOutcome::ConfirmedMergeConflict => TaskState::MergeConflict,
+            MergeExecutionOutcome::PreWriteRejected(_)
+            | MergeExecutionOutcome::StageWriteUncertain
+            | MergeExecutionOutcome::CommitNotCreated
+            | MergeExecutionOutcome::CommitSucceededMergeFailed
+            | MergeExecutionOutcome::MergeConflictResidue
+            | MergeExecutionOutcome::PostWriteUncertain => TaskState::RecoveryRequired,
+        };
+        task.transition_to(target, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition =
+            self.next_transition(&task, from_state, actor_kind.clone(), reason_code.clone())?;
+        match self
+            .repository
+            .save_transition(request.expected_version, &task, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&task)),
+            Err(error) => self.recover_after_merge_persistence_failure(
+                request.task_id,
+                error,
+                actor_kind,
+                reason_code,
+            ),
+        }
+    }
+
+    fn recover_after_merge_persistence_failure(
+        &mut self,
+        task_id: TaskId,
+        original: chatoms_ports::repository::RepositoryError,
+        actor_kind: ActorKind,
+        reason_code: ReasonCode,
+    ) -> Result<TaskView, ApplicationError> {
+        let Ok(Some(mut persisted)) = self.repository.get_task(task_id) else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted.state() != TaskState::Merging {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let expected_version = persisted.version();
+        let from_state = persisted.state();
+        let Ok(now) = self.now_ms() else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted
+            .transition_to(TaskState::RecoveryRequired, now)
+            .is_err()
+        {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let Ok(transition) = self.next_transition(&persisted, from_state, actor_kind, reason_code)
+        else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        match self
+            .repository
+            .save_transition(expected_version, &persisted, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&persisted)),
+            Err(_) => Err(ApplicationError::from_categorized(&original)),
+        }
+    }
+
+    /// Records a `git merge --continue` attempt's outcome and, in the same
+    /// transaction, drives the resulting state transition: `Continued ->
+    /// PostMergeTesting`, confirmed `ConfirmationStale`/`ConfirmedMergePending`
+    /// -> `MergeConflict`, and every other outcome (`PreWriteRejected`,
+    /// `PostWriteUncertain`) -> `RecoveryRequired`.
+    pub fn record_merge_continue_result(
+        &mut self,
+        request: RecordMergeContinueResultRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::Merging {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let target = match request.outcome {
+            MergeContinueOutcome::Continued => TaskState::PostMergeTesting,
+            MergeContinueOutcome::ConfirmationStale
+            | MergeContinueOutcome::ConfirmedMergePending => TaskState::MergeConflict,
+            MergeContinueOutcome::PreWriteRejected | MergeContinueOutcome::PostWriteUncertain => {
+                TaskState::RecoveryRequired
+            }
+        };
+        task.transition_to(target, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition =
+            self.next_transition(&task, from_state, actor_kind.clone(), reason_code.clone())?;
+        match self
+            .repository
+            .save_transition(request.expected_version, &task, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&task)),
+            Err(error) => self.recover_after_merge_continue_persistence_failure(
+                request.task_id,
+                error,
+                actor_kind,
+                reason_code,
+            ),
+        }
+    }
+
+    fn recover_after_merge_continue_persistence_failure(
+        &mut self,
+        task_id: TaskId,
+        original: chatoms_ports::repository::RepositoryError,
+        actor_kind: ActorKind,
+        reason_code: ReasonCode,
+    ) -> Result<TaskView, ApplicationError> {
+        let Ok(Some(mut persisted)) = self.repository.get_task(task_id) else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted.state() != TaskState::Merging {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let expected_version = persisted.version();
+        let from_state = persisted.state();
+        let Ok(now) = self.now_ms() else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted
+            .transition_to(TaskState::RecoveryRequired, now)
+            .is_err()
+        {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let Ok(transition) = self.next_transition(&persisted, from_state, actor_kind, reason_code)
+        else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        match self
+            .repository
+            .save_transition(expected_version, &persisted, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&persisted)),
+            Err(_) => Err(ApplicationError::from_categorized(&original)),
+        }
+    }
+
+    /// Records the outcome of one `git merge --abort` attempt. Unlike every
+    /// other `record_*_result` method in this module, a fail-closed outcome
+    /// (`PreWriteRejected`/`PostWriteUncertain`) does **not** drive any
+    /// state transition — `MergeConflict -> RecoveryRequired` is
+    /// deliberately not an edge this Unit adds (see `docs/DECISIONS.md`'s
+    /// "Merge-abort write contract"), so the task simply remains
+    /// `MergeConflict` and this returns a typed error instead. The
+    /// immutable approval row (see [`Self::record_merge_abort_approval`])
+    /// is never touched by this method and remains valid for a retry. Only
+    /// `Aborted` and `ConfirmedNotInMerge` commit `MergeConflict ->
+    /// Cancelled`, releasing the `ActiveTaskLease` in the same repository
+    /// transaction as the state update, transition history, and the
+    /// approval re-verification (see
+    /// [`chatoms_ports::repository::FoundationRepository::save_merge_abort_transition`]).
+    /// If that atomic write itself fails, the error is propagated as-is —
+    /// never masked as success, and never a `RecoveryRequired` fallback,
+    /// since none exists for this edge: the task remains `MergeConflict`
+    /// and a subsequent abort attempt can recover via the same
+    /// `ConfirmedNotInMerge` path.
+    pub fn record_merge_abort_result(
+        &mut self,
+        request: RecordMergeAbortResultRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::MergeConflict {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        match request.outcome {
+            MergeAbortOutcome::Aborted | MergeAbortOutcome::ConfirmedNotInMerge => {}
+            MergeAbortOutcome::PreWriteRejected(_) | MergeAbortOutcome::PostWriteUncertain => {
+                return Err(category_error(FailureCategory::Conflict));
+            }
+        }
+        let from_state = task.state();
+        task.transition_to(TaskState::Cancelled, self.now_ms()?)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition = self.next_transition(&task, from_state, actor_kind, reason_code)?;
+        self.repository
+            .save_merge_abort_transition(request.expected_version, &task, &transition, true)
+            .map_err(|error| ApplicationError::from_categorized(&error))?;
+        Ok(TaskView::from(&task))
+    }
+
     /// Finalizes one Testing batch attempt: appends the batch's final
     /// validation command result and, in the same repository transaction,
     /// drives the resulting state transition (`Success -> Reviewing`,
@@ -1062,6 +2524,7 @@ where
         let attempt = ValidationCommandResultAttempt {
             task_id: request.task_id,
             approved_task_version: request.expected_version,
+            execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
             kind: request.kind,
             outcome: request.outcome,
             exit_code: request.exit_code,
@@ -1101,6 +2564,116 @@ where
             return Err(ApplicationError::from_categorized(&original));
         };
         if persisted.state() != TaskState::Testing {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let expected_version = persisted.version();
+        let from_state = persisted.state();
+        let Ok(now) = self.now_ms() else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted
+            .transition_to(TaskState::RecoveryRequired, now)
+            .is_err()
+        {
+            return Err(ApplicationError::from_categorized(&original));
+        }
+        let Ok(transition) = self.next_transition(&persisted, from_state, actor_kind, reason_code)
+        else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        match self
+            .repository
+            .save_transition(expected_version, &persisted, &transition)
+        {
+            Ok(()) => Ok(TaskView::from(&persisted)),
+            Err(_) => Err(ApplicationError::from_categorized(&original)),
+        }
+    }
+
+    pub fn append_post_merge_validation_result(
+        &mut self,
+        request: AppendPostMergeValidationResultRequest,
+    ) -> Result<PostMergeValidationResultRecord, ApplicationError> {
+        let task = self.load_expected_task(request.task_id, request.post_merge_task_version)?;
+        if task.state() != TaskState::PostMergeTesting {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        self.repository
+            .append_post_merge_validation_result(&PostMergeValidationResultAttempt {
+                task_id: request.task_id,
+                approval_task_version: request.approval_task_version,
+                post_merge_task_version: request.post_merge_task_version,
+                execution_scope: ValidationExecutionScope::ProjectRoot,
+                kind: request.kind,
+                outcome: PostMergeValidationResultOutcome::Success,
+                exit_code: request.exit_code,
+                safe_summary: request.safe_summary,
+                started_at_ms: request.started_at_ms,
+                completed_at_ms: request.completed_at_ms,
+            })
+            .map_err(|error| ApplicationError::from_categorized(&error))
+    }
+
+    pub fn finalize_post_merge_validation_batch(
+        &mut self,
+        request: FinalizePostMergeValidationBatchRequest,
+    ) -> Result<TaskView, ApplicationError> {
+        let actor_kind = parse_actor(&request.actor_kind)?;
+        let reason_code = parse_reason(&request.reason_code)?;
+        let mut task = self.load_expected_task(request.task_id, request.expected_version)?;
+        if task.state() != TaskState::PostMergeTesting {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let from_state = task.state();
+        let target = if request.outcome == PostMergeValidationResultOutcome::Success {
+            TaskState::Completed
+        } else {
+            TaskState::RecoveryRequired
+        };
+        let occurred_at_ms = self.now_ms()?;
+        task.transition_to(target, occurred_at_ms)
+            .map_err(|error| ApplicationError::from_domain(&error))?;
+        let transition =
+            self.next_transition(&task, from_state, actor_kind.clone(), reason_code.clone())?;
+        let attempt = PostMergeValidationResultAttempt {
+            task_id: request.task_id,
+            approval_task_version: request.approval_task_version,
+            post_merge_task_version: request.expected_version,
+            execution_scope: ValidationExecutionScope::ProjectRoot,
+            kind: request.kind,
+            outcome: request.outcome,
+            exit_code: request.exit_code,
+            safe_summary: request.safe_summary,
+            started_at_ms: request.started_at_ms,
+            completed_at_ms: occurred_at_ms,
+        };
+        match self.repository.finalize_post_merge_validation_batch(
+            request.expected_version,
+            &task,
+            &transition,
+            &attempt,
+        ) {
+            Ok(()) => Ok(TaskView::from(&task)),
+            Err(error) => self.recover_after_post_merge_validation_persistence_failure(
+                request.task_id,
+                error,
+                actor_kind,
+                reason_code,
+            ),
+        }
+    }
+
+    fn recover_after_post_merge_validation_persistence_failure(
+        &mut self,
+        task_id: TaskId,
+        original: chatoms_ports::repository::RepositoryError,
+        actor_kind: ActorKind,
+        reason_code: ReasonCode,
+    ) -> Result<TaskView, ApplicationError> {
+        let Ok(Some(mut persisted)) = self.repository.get_task(task_id) else {
+            return Err(ApplicationError::from_categorized(&original));
+        };
+        if persisted.state() != TaskState::PostMergeTesting {
             return Err(ApplicationError::from_categorized(&original));
         }
         let expected_version = persisted.version();
@@ -1301,6 +2874,34 @@ where
         .map(Some)
     }
 
+    pub fn reconcile_startup_merge(&mut self) -> Result<Option<TaskView>, ApplicationError> {
+        let Some(lease) = self
+            .repository
+            .active_lease()
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+        else {
+            return Ok(None);
+        };
+        let task = self
+            .repository
+            .get_task(lease.task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::InvariantViolation))?;
+        if !matches!(
+            task.state(),
+            TaskState::Merging | TaskState::PostMergeTesting
+        ) {
+            return Ok(None);
+        }
+        self.mark_recovery_required(TaskActionRequest::new(
+            task.id(),
+            task.version(),
+            "application".to_owned(),
+            "merge.startup.recovery-required".to_owned(),
+        ))
+        .map(Some)
+    }
+
     pub fn complete_task(
         &mut self,
         request: TaskActionRequest,
@@ -1431,6 +3032,17 @@ where
             .now_ms()
             .map_err(|error| ApplicationError::from_categorized(&error))
     }
+}
+
+fn post_merge_version_pair(transitions: &[TaskStateTransition]) -> Option<(u64, u64)> {
+    transitions.windows(3).find_map(|chain| {
+        (chain[0].to_state() == TaskState::AwaitingUserDiffApproval
+            && chain[1].from_state() == Some(TaskState::AwaitingUserDiffApproval)
+            && chain[1].to_state() == TaskState::Merging
+            && chain[2].from_state() == Some(TaskState::Merging)
+            && chain[2].to_state() == TaskState::PostMergeTesting)
+            .then_some((chain[0].task_version(), chain[2].task_version()))
+    })
 }
 
 fn parse_actor(value: &str) -> Result<ActorKind, ApplicationError> {

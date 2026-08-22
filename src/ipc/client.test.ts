@@ -30,7 +30,7 @@ describe("typed IPC client", () => {
       ["get_task", { taskId: "task-id" }],
       ["list_task_history", { taskId: "task-id" }],
     ]);
-    expect(Object.values(IPC_COMMANDS)).toHaveLength(32);
+    expect(Object.values(IPC_COMMANDS)).toHaveLength(53);
   });
 
   it("returns a validated result and rejects malformed success data safely", async () => {
@@ -101,6 +101,56 @@ describe("typed IPC client", () => {
     ]);
   });
 
+  it("uses the read-only post-merge validation result command", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.getPostMergeValidationResults("task-id");
+    expect(transport.mock.calls).toEqual([
+      ["get_post_merge_validation_results", { taskId: "task-id" }],
+    ]);
+  });
+
+  it("uses the read-only merge-conflict inspection command and rejects content-bearing fields", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await expect(client.getMergeConflictInspection("task-id")).resolves.toEqual(
+      responses.get_merge_conflict_inspection,
+    );
+    expect(transport.mock.calls).toEqual([
+      ["get_merge_conflict_inspection", { taskId: "task-id" }],
+    ]);
+
+    const unsafe = createIpcClient(async () => ({
+      ...(responses.get_merge_conflict_inspection as Record<string, unknown>),
+      path: "tracked.txt",
+    }));
+    await expect(unsafe.getMergeConflictInspection("task-id")).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+
+    const none = createIpcClient(async () => null);
+    await expect(none.getMergeConflictInspection("task-id")).resolves.toBeNull();
+  });
+
+  it("rejects post-merge results that contain unsafe or partial fields", async () => {
+    const valid = createIpcClient(async () => responses.get_post_merge_validation_results);
+    await expect(valid.getPostMergeValidationResults("task-id")).resolves.toHaveLength(2);
+
+    const malformed = createIpcClient(async () => [{
+      commandKind: "test",
+      attemptSequence: 1,
+      outcome: "success",
+      exitCode: 0,
+      safeSummary: "ok",
+      startedAtMs: 1,
+      completedAtMs: 2,
+      projectRootPath: "C:\\\\private",
+    }]);
+    await expect(malformed.getPostMergeValidationResults("task-id")).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+  });
+
   it("uses versioned task-scoped payloads for Claude Implementation start and cancel", async () => {
     const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
     const client = createIpcClient(transport);
@@ -149,6 +199,12 @@ describe("typed IPC client", () => {
       cargoHomePath: null,
       rustupHomePath: null,
     });
+    await client.getProjectRootValidationApprovalStatus("task-id", 6);
+    await client.approveProjectRootValidation("task-id", 6, {
+      executablePath: "C:\\tools\\cargo\\bin\\cargo.exe",
+      cargoHomePath: null,
+      rustupHomePath: null,
+    });
     expect(transport.mock.calls).toEqual([
       ["start_validation_testing", { taskId: "task-id", expectedVersion: 6 }],
       ["cancel_validation_testing", { taskId: "task-id" }],
@@ -161,6 +217,19 @@ describe("typed IPC client", () => {
           expectedVersion: 6,
           input: {
             kinds: ["test"],
+            executablePath: "C:\\tools\\cargo\\bin\\cargo.exe",
+            cargoHomePath: null,
+            rustupHomePath: null,
+          },
+        },
+      ],
+      ["get_project_root_validation_approval_status", { taskId: "task-id", expectedVersion: 6 }],
+      [
+        "approve_project_root_validation",
+        {
+          taskId: "task-id",
+          expectedVersion: 6,
+          input: {
             executablePath: "C:\\tools\\cargo\\bin\\cargo.exe",
             cargoHomePath: null,
             rustupHomePath: null,
@@ -263,6 +332,20 @@ describe("typed IPC client", () => {
         rustupHomePath: null,
       }),
     ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const malformedProjectRootStatus = createIpcClient(async () => ({ testApproved: true, buildApproved: "yes" }));
+    await expect(
+      malformedProjectRootStatus.getProjectRootValidationApprovalStatus("task-id", 6),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const leakedProjectRootStatus = createIpcClient(async () => ({ testApproved: true, buildApproved: true, executablePath: "leaked" }));
+    await expect(
+      leakedProjectRootStatus.approveProjectRootValidation("task-id", 6, {
+        executablePath: "x",
+        cargoHomePath: null,
+        rustupHomePath: null,
+      }),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
   });
 
   it("returns a read-only planning result only for a recognized safe shape, and null for none", async () => {
@@ -343,6 +426,257 @@ describe("typed IPC client", () => {
         code: "IPC_INVALID_RESPONSE",
       });
     }
+  });
+
+  it("uses versioned task-scoped payloads for high-risk approval status and approve", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.getHighRiskApprovalStatus("task-id", 3, "dataMigration");
+    await client.approveHighRiskOperation("task-id", 3, "dataMigration");
+    expect(transport.mock.calls).toEqual([
+      [
+        "get_high_risk_approval_status",
+        { taskId: "task-id", expectedVersion: 3, riskCategory: "dataMigration" },
+      ],
+      [
+        "approve_high_risk_operation",
+        { taskId: "task-id", expectedVersion: 3, riskCategory: "dataMigration" },
+      ],
+    ]);
+  });
+
+  it("validates high-risk approval response shapes and rejects malformed data", async () => {
+    const valid = createIpcClient(async () => responses.get_high_risk_approval_status);
+    await expect(valid.getHighRiskApprovalStatus("task-id", 3, "dataMigration")).resolves.toEqual({
+      approved: false,
+    });
+
+    const validApproval = createIpcClient(async () => responses.approve_high_risk_operation);
+    await expect(
+      validApproval.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).resolves.toEqual({ riskCategory: "dataMigration", approvedAtMs: 100 });
+
+    const malformedStatus = createIpcClient(async () => ({ approved: "yes" }));
+    await expect(
+      malformedStatus.getHighRiskApprovalStatus("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const extraFieldStatus = createIpcClient(async () => ({ approved: true, extra: "leaked" }));
+    await expect(
+      extraFieldStatus.getHighRiskApprovalStatus("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const unknownCategory = createIpcClient(async () => ({
+      riskCategory: "notACategory",
+      approvedAtMs: 1,
+    }));
+    await expect(
+      unknownCategory.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const malformedTimestamp = createIpcClient(async () => ({
+      riskCategory: "dataMigration",
+      approvedAtMs: "not-a-number",
+    }));
+    await expect(
+      malformedTimestamp.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const extraFieldApproval = createIpcClient(async () => ({
+      riskCategory: "dataMigration",
+      approvedAtMs: 1,
+      path: "C:\\leaked",
+    }));
+    await expect(
+      extraFieldApproval.approveHighRiskOperation("task-id", 3, "dataMigration"),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+  });
+
+  it("uses versioned task-scoped payloads for user diff review approval and merge start", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.getUserDiffForReview("task-id", 3);
+    await client.approveUserDiff("task-id", 3, "a".repeat(64));
+    await client.approveUserDiffAndStartMerge("task-id", 3, "a".repeat(64));
+    await client.confirmManualResolutionAndStartMergeContinue("task-id", 5);
+    expect(transport.mock.calls).toEqual([
+      ["get_user_diff_for_review", { taskId: "task-id", expectedVersion: 3 }],
+      [
+        "approve_user_diff",
+        { taskId: "task-id", expectedVersion: 3, expectedDiffContentHash: "a".repeat(64) },
+      ],
+      [
+        "approve_user_diff_and_start_merge",
+        { taskId: "task-id", expectedVersion: 3, expectedDiffContentHash: "a".repeat(64) },
+      ],
+      [
+        "confirm_manual_resolution_and_start_merge_continue",
+        { taskId: "task-id", expectedVersion: 5 },
+      ],
+    ]);
+  });
+
+  it("validates user diff review/approval response shapes and rejects malformed data", async () => {
+    const validDiff = createIpcClient(async () => responses.get_user_diff_for_review);
+    await expect(validDiff.getUserDiffForReview("task-id", 3)).resolves.toEqual(
+      responses.get_user_diff_for_review,
+    );
+
+    const validApproval = createIpcClient(async () => responses.approve_user_diff);
+    await expect(
+      validApproval.approveUserDiff("task-id", 3, "a".repeat(64)),
+    ).resolves.toEqual({ approvedAtMs: 100 });
+
+    const validMerge = createIpcClient(async () => responses.approve_user_diff_and_start_merge);
+    await expect(
+      validMerge.approveUserDiffAndStartMerge("task-id", 3, "a".repeat(64)),
+    ).resolves.toEqual(responses.approve_user_diff_and_start_merge);
+
+    const validMergeContinue = createIpcClient(
+      async () => responses.confirm_manual_resolution_and_start_merge_continue,
+    );
+    await expect(
+      validMergeContinue.confirmManualResolutionAndStartMergeContinue("task-id", 5),
+    ).resolves.toEqual(responses.confirm_manual_resolution_and_start_merge_continue);
+
+    // This command uses a dedicated exact-shape guard (`isExactTaskDto`), not
+    // the general, deliberately loose `isTaskDto` every other command uses:
+    // the response must carry exactly backend `TaskDto`'s serialized keys,
+    // so a resolution digest, raw path, or Git stdout/stderr accidentally
+    // attached to a future response is rejected rather than silently passed
+    // through, and a response missing a required TaskDto field still fails
+    // closed like any other task state read.
+    const mergeContinueBase = responses
+      .confirm_manual_resolution_and_start_merge_continue as Record<string, unknown>;
+
+    const incompleteMergeContinue = createIpcClient(async () => {
+      const { version: _version, ...rest } = mergeContinueBase;
+      return rest;
+    });
+    await expect(
+      incompleteMergeContinue.confirmManualResolutionAndStartMergeContinue("task-id", 5),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const wrongTypeMergeContinue = createIpcClient(async () => ({
+      ...mergeContinueBase,
+      version: "6",
+    }));
+    await expect(
+      wrongTypeMergeContinue.confirmManualResolutionAndStartMergeContinue("task-id", 5),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const rawPathMergeContinue = createIpcClient(async () => ({
+      ...mergeContinueBase,
+      rootPath: "C:\\private\\project",
+    }));
+    await expect(
+      rawPathMergeContinue.confirmManualResolutionAndStartMergeContinue("task-id", 5),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const digestMergeContinue = createIpcClient(async () => ({
+      ...mergeContinueBase,
+      resolutionDigest: "a".repeat(64),
+    }));
+    await expect(
+      digestMergeContinue.confirmManualResolutionAndStartMergeContinue("task-id", 5),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const rawOutputMergeContinue = createIpcClient(async () => ({
+      ...mergeContinueBase,
+      stdout: "fatal: not a git repository",
+    }));
+    await expect(
+      rawOutputMergeContinue.confirmManualResolutionAndStartMergeContinue("task-id", 5),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    // The general `isTaskDto` guard every other command relies on stays
+    // deliberately loose: the same extra field that the exact guard above
+    // rejects is still accepted here, confirming this new guard is scoped
+    // to `confirmManualResolutionAndStartMergeContinue` only.
+    const looseGuardStillAcceptsExtraFields = createIpcClient(async () => ({
+      ...(responses.approve_user_diff_and_start_merge as Record<string, unknown>),
+      resolutionDigest: "a".repeat(64),
+    }));
+    await expect(
+      looseGuardStillAcceptsExtraFields.approveUserDiffAndStartMerge("task-id", 3, "a".repeat(64)),
+    ).resolves.toMatchObject({ id: "task-id", state: "merging" });
+
+    const malformedHash = createIpcClient(async () => ({
+      diffText: "x",
+      diffContentHash: "not-hex",
+    }));
+    await expect(malformedHash.getUserDiffForReview("task-id", 3)).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+
+    const nonStringDiff = createIpcClient(async () => ({
+      diffText: 1,
+      diffContentHash: "a".repeat(64),
+    }));
+    await expect(nonStringDiff.getUserDiffForReview("task-id", 3)).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+
+    const malformedTimestamp = createIpcClient(async () => ({ approvedAtMs: "not-a-number" }));
+    await expect(
+      malformedTimestamp.approveUserDiff("task-id", 3, "a".repeat(64)),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+
+    const approvalWithRawDiff = createIpcClient(async () => ({
+      approvedAtMs: 100,
+      diffText: "leaked diff content",
+    }));
+    await expect(
+      approvalWithRawDiff.approveUserDiff("task-id", 3, "a".repeat(64)),
+    ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+  });
+
+  it("uses a content-free command for confirming a merge abort and rejects extra fields", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await expect(client.confirmMergeAbortAndStart("task-id", 5)).resolves.toEqual({
+      started: true,
+    });
+    expect(transport.mock.calls).toEqual([
+      ["confirm_merge_abort_and_start", { taskId: "task-id", expectedVersion: 5 }],
+    ]);
+
+    const startedFalse = createIpcClient(async () => ({ started: false }));
+    await expect(startedFalse.confirmMergeAbortAndStart("task-id", 5)).resolves.toEqual({
+      started: false,
+    });
+
+    const wrongType = createIpcClient(async () => ({ started: "true" }));
+    await expect(wrongType.confirmMergeAbortAndStart("task-id", 5)).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+
+    const extraField = createIpcClient(async () => ({
+      started: true,
+      taskState: "cancelled",
+    }));
+    await expect(extraField.confirmMergeAbortAndStart("task-id", 5)).rejects.toMatchObject({
+      code: "IPC_INVALID_RESPONSE",
+    });
+  });
+
+  it("accepts the restoredPendingAbortConfirmation merge-conflict inspection outcome", async () => {
+    const client = createIpcClient(async () => ({
+      outcome: "restoredPendingAbortConfirmation",
+      counts: {
+        total: 0,
+        bothModified: 0,
+        bothAdded: 0,
+        bothDeleted: 0,
+        addedByUs: 0,
+        addedByThem: 0,
+        deletedByUs: 0,
+        deletedByThem: 0,
+      },
+    }));
+    await expect(client.getMergeConflictInspection("task-id")).resolves.toMatchObject({
+      outcome: "restoredPendingAbortConfirmation",
+    });
   });
 
   it("keeps only approved IPC error fields and masks string or unknown failures", async () => {
@@ -430,6 +764,39 @@ const responses: Record<string, unknown> = {
     completedAtMs: 2,
     planText: "Add a CSV export button.",
   },
+  get_post_merge_validation_results: [
+    {
+      commandKind: "test",
+      attemptSequence: 1,
+      outcome: "success",
+      exitCode: 0,
+      safeSummary: "post-merge validation completed successfully",
+      startedAtMs: 3,
+      completedAtMs: 4,
+    },
+    {
+      commandKind: "build",
+      attemptSequence: 1,
+      outcome: "success",
+      exitCode: 0,
+      safeSummary: "post-merge validation completed successfully",
+      startedAtMs: 5,
+      completedAtMs: 6,
+    },
+  ],
+  get_merge_conflict_inspection: {
+    outcome: "confirmedUnresolved",
+    counts: {
+      total: 2,
+      bothModified: 1,
+      bothAdded: 0,
+      bothDeleted: 0,
+      addedByUs: 0,
+      addedByThem: 1,
+      deletedByUs: 0,
+      deletedByThem: 0,
+    },
+  },
   start_claude_implementation: {
     id: "task-id",
     projectId: "project-id",
@@ -459,6 +826,8 @@ const responses: Record<string, unknown> = {
   get_validation_command_candidates: [{ kind: "test", label: "Test (cargo test)" }],
   get_validation_command_approval_status: { approvedKinds: ["test"] },
   approve_validation_command: { approvedKinds: ["test"] },
+  get_project_root_validation_approval_status: { testApproved: true, buildApproved: true },
+  approve_project_root_validation: { testApproved: true, buildApproved: true },
   start_claude_review: {
     id: "task-id",
     projectId: "project-id",
@@ -480,4 +849,36 @@ const responses: Record<string, unknown> = {
     completedAtMs: 2,
     reviewText: "The change matches the requirements.",
   },
+  get_high_risk_approval_status: { approved: false },
+  approve_high_risk_operation: { riskCategory: "dataMigration", approvedAtMs: 100 },
+  get_user_diff_for_review: {
+    diffText: "diff --git a/x b/x\n+line\n",
+    diffContentHash: "a".repeat(64),
+  },
+  approve_user_diff: { approvedAtMs: 100 },
+  approve_user_diff_and_start_merge: {
+    id: "task-id",
+    projectId: "project-id",
+    state: "merging",
+    version: 4,
+    branchIdentity: "ai-task/task-id",
+    resumeTargetState: null,
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    terminalAtMs: null,
+    brief: null,
+  },
+  confirm_manual_resolution_and_start_merge_continue: {
+    id: "task-id",
+    projectId: "project-id",
+    state: "merging",
+    version: 6,
+    branchIdentity: "ai-task/task-id",
+    resumeTargetState: null,
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    terminalAtMs: null,
+    brief: null,
+  },
+  confirm_merge_abort_and_start: { started: true },
 };

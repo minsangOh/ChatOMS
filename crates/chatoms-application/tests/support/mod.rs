@@ -6,16 +6,22 @@ use std::{
 };
 
 use chatoms_domain::{
-    ActorKind, ProjectId, ReasonCode, Task, TaskBranchIdentity, TaskId, TaskSnapshot, TaskState,
-    TaskStateTransition, TaskStateTransitionId, ValidationCommandKind, WorkKind,
+    ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, Task, TaskBranchIdentity,
+    TaskId, TaskSnapshot, TaskState, TaskStateTransition, TaskStateTransitionId,
+    ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_ports::{
     TimeProvider,
+    diff::DiffContentHash,
     error::{FailureCategory, PortFailure},
+    manual_merge_resolution::ManualResolutionDigest,
     provider::ProviderKind,
     repository::{
-        ActiveLease, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        ActiveLease, ContextPackageManifestRecord, ContextPackagePreparation, DiffApprovalRecord,
+        FoundationRepository, GitInitApproval, GitIsolationStatus, GitOperationAttempt,
         GitOperationAttemptStatus, GitOperationKind, GitOperationReceipt, GitOperationReceiptKind,
+        HighRiskApprovalRecord, ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
+        PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
         ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderConsent,
         RepositoryError, RepositoryErrorCode, TaskBriefRecord, TaskGitIsolation,
         TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
@@ -33,13 +39,25 @@ pub struct FakeRepository {
     pub transitions: HashMap<TaskId, Vec<TaskStateTransition>>,
     pub isolations: HashMap<TaskId, TaskGitIsolation>,
     pub briefs: HashMap<TaskId, TaskBriefRecord>,
-    pub consents: HashMap<(TaskId, ProviderKind, WorkKind, u64), ProviderConsent>,
+    pub consents: HashMap<(TaskId, ProviderKind, WorkKind, u64, ContextDataScope), ProviderConsent>,
+    pub context_package_manifests: HashMap<
+        (TaskId, ProviderKind, WorkKind, u64, ContextDataScope),
+        ContextPackageManifestRecord,
+    >,
     pub planning_results: HashMap<TaskId, TaskPlanningResultRecord>,
     pub implementation_results: HashMap<TaskId, TaskImplementationResultRecord>,
     pub review_results: HashMap<TaskId, TaskReviewResultRecord>,
     pub validation_command_approvals:
         HashMap<(TaskId, u64, ValidationCommandKind), ValidationCommandApprovalRecord>,
+    pub project_root_validation_approvals:
+        HashMap<(TaskId, u64, ValidationCommandKind), ValidationCommandApprovalRecord>,
     pub validation_command_results: Vec<ValidationCommandResultRecord>,
+    pub post_merge_validation_results: Vec<PostMergeValidationResultRecord>,
+    pub high_risk_approvals: HashMap<(TaskId, u64, HighRiskCategory), HighRiskApprovalRecord>,
+    pub diff_approvals: HashMap<(TaskId, u64, DiffContentHash), DiffApprovalRecord>,
+    pub manual_merge_resolution_confirmations:
+        HashMap<(TaskId, u64, ManualResolutionDigest), ManualMergeResolutionConfirmationRecord>,
+    pub merge_abort_approvals: HashMap<(TaskId, u64), MergeAbortApprovalRecord>,
     pub approvals: Vec<GitInitApproval>,
     pub attempts: HashMap<chatoms_domain::GitOperationId, GitOperationAttempt>,
     pub receipts: Vec<GitOperationReceipt>,
@@ -91,6 +109,57 @@ impl FakeRepository {
         self.calls.push(operation);
         if let Some(calls) = &self.shared_calls {
             calls.lock().expect("call log lock").push(operation);
+        }
+    }
+
+    /// Shared core of the three `prepare_*_context_package` fakes, mirroring
+    /// `SqliteFoundationRepository`'s `prepare_context_package` helper:
+    /// looks up the exact `(task_id, Claude, work_kind, expected_version,
+    /// ContextPackageV1)` consent and manifest together, and either reuses
+    /// both unchanged, inserts both fresh, or fails closed as
+    /// `InvalidPersistenceState` if exactly one of the pair exists.
+    fn fake_prepare_context_package(
+        &mut self,
+        task_id: TaskId,
+        work_kind: WorkKind,
+        expected_version: u64,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        let key = (
+            task_id,
+            ProviderKind::Claude,
+            work_kind,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        );
+        let existing_consent = self.consents.get(&key).copied();
+        let existing_manifest = self.context_package_manifests.get(&key).copied();
+        match (existing_consent, existing_manifest) {
+            (Some(consent), Some(manifest)) => Ok(ContextPackagePreparation { consent, manifest }),
+            (None, None) => {
+                let consent = ProviderConsent {
+                    task_id,
+                    provider: ProviderKind::Claude,
+                    work_kind,
+                    approved_task_version: expected_version,
+                    data_scope: ContextDataScope::ContextPackageV1,
+                    consented_at_ms: prepared_at_ms,
+                };
+                self.consents.insert(key, consent);
+                let manifest = ContextPackageManifestRecord {
+                    task_id,
+                    provider: ProviderKind::Claude,
+                    work_kind,
+                    approved_task_version: expected_version,
+                    data_scope: ContextDataScope::ContextPackageV1,
+                    created_at_ms: prepared_at_ms,
+                };
+                self.context_package_manifests.insert(key, manifest);
+                Ok(ContextPackagePreparation { consent, manifest })
+            }
+            (Some(_), None) | (None, Some(_)) => Err(RepositoryError::new(
+                RepositoryErrorCode::InvalidPersistenceState,
+            )),
         }
     }
 }
@@ -330,13 +399,341 @@ impl FoundationRepository for FakeRepository {
         provider: ProviderKind,
         work_kind: WorkKind,
         approved_task_version: u64,
+        data_scope: ContextDataScope,
     ) -> Result<Option<ProviderConsent>, RepositoryError> {
         self.record("get_provider_consent");
         self.maybe_fail("get_provider_consent")?;
         Ok(self
             .consents
-            .get(&(task_id, provider, work_kind, approved_task_version))
+            .get(&(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            ))
             .copied())
+    }
+
+    fn get_context_package_manifest(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+        data_scope: ContextDataScope,
+    ) -> Result<Option<ContextPackageManifestRecord>, RepositoryError> {
+        self.record("get_context_package_manifest");
+        self.maybe_fail("get_context_package_manifest")?;
+        Ok(self
+            .context_package_manifests
+            .get(&(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            ))
+            .copied())
+    }
+
+    fn get_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        risk_category: HighRiskCategory,
+    ) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+        self.record("get_high_risk_approval");
+        self.maybe_fail("get_high_risk_approval")?;
+        Ok(self
+            .high_risk_approvals
+            .get(&(task_id, approved_task_version, risk_category))
+            .copied())
+    }
+
+    fn ensure_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+        approved_at_ms: i64,
+    ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        self.record("ensure_high_risk_approval");
+        self.maybe_fail("ensure_high_risk_approval")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        let key = (task_id, expected_version, risk_category);
+        if let Some(existing) = self.high_risk_approvals.get(&key) {
+            return Ok(*existing);
+        }
+        let approval = HighRiskApprovalRecord {
+            task_id,
+            approved_task_version: expected_version,
+            risk_category,
+            approved_at_ms,
+        };
+        self.high_risk_approvals.insert(key, approval);
+        Ok(approval)
+    }
+
+    fn save_diff_approval(&mut self, approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {
+        self.record("save_diff_approval");
+        self.maybe_fail("save_diff_approval")?;
+        let key = (
+            approval.task_id,
+            approval.approved_task_version,
+            approval.diff_content_hash,
+        );
+        if self.diff_approvals.contains_key(&key) {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.diff_approvals.insert(key, *approval);
+        Ok(())
+    }
+
+    fn get_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        diff_content_hash: DiffContentHash,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.record("get_diff_approval");
+        self.maybe_fail("get_diff_approval")?;
+        Ok(self
+            .diff_approvals
+            .get(&(task_id, approved_task_version, diff_content_hash))
+            .copied())
+    }
+
+    fn get_diff_approval_for_task_version(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.record("get_diff_approval_for_task_version");
+        self.maybe_fail("get_diff_approval_for_task_version")?;
+        Ok(self
+            .diff_approvals
+            .values()
+            .find(|approval| {
+                approval.task_id == task_id
+                    && approval.approved_task_version == approved_task_version
+            })
+            .copied())
+    }
+
+    fn ensure_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        diff_content_hash: DiffContentHash,
+        approved_at_ms: i64,
+    ) -> Result<DiffApprovalRecord, RepositoryError> {
+        self.record("ensure_diff_approval");
+        self.maybe_fail("ensure_diff_approval")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        let key = (task_id, expected_version, diff_content_hash);
+        if let Some(existing) = self.diff_approvals.get(&key) {
+            return Ok(*existing);
+        }
+        let approval = DiffApprovalRecord {
+            task_id,
+            approved_task_version: expected_version,
+            diff_content_hash,
+            approved_at_ms,
+        };
+        self.diff_approvals.insert(key, approval);
+        Ok(approval)
+    }
+
+    fn get_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+        self.record("get_manual_merge_resolution_confirmation");
+        self.maybe_fail("get_manual_merge_resolution_confirmation")?;
+        Ok(self
+            .manual_merge_resolution_confirmations
+            .get(&(task_id, merge_conflict_task_version, resolution_digest))
+            .cloned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Result<ManualMergeResolutionConfirmationRecord, RepositoryError> {
+        self.record("ensure_manual_merge_resolution_confirmation");
+        self.maybe_fail("ensure_manual_merge_resolution_confirmation")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != merge_conflict_task_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let key = (task_id, merge_conflict_task_version, resolution_digest);
+        if let Some(existing) = self.manual_merge_resolution_confirmations.get(&key) {
+            return Ok(existing.clone());
+        }
+        let confirmation = ManualMergeResolutionConfirmationRecord {
+            task_id,
+            merge_conflict_task_version,
+            source_approval_task_version,
+            base_commit: base_commit.to_owned(),
+            task_commit: task_commit.to_owned(),
+            merge_head_commit: merge_head_commit.to_owned(),
+            resolution_digest,
+            confirmed_at_ms,
+        };
+        self.manual_merge_resolution_confirmations
+            .insert(key, confirmation.clone());
+        Ok(confirmation)
+    }
+
+    fn save_manual_merge_resolution_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_manual_merge_resolution_transition");
+        self.maybe_fail("save_manual_merge_resolution_transition")?;
+        if task.state() != TaskState::Merging {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        if !self.manual_merge_resolution_confirmations.contains_key(&(
+            task.id(),
+            expected_version,
+            resolution_digest,
+        )) {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        Ok(())
+    }
+
+    fn get_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+    ) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+        self.record("get_merge_abort_approval");
+        self.maybe_fail("get_merge_abort_approval")?;
+        Ok(self
+            .merge_abort_approvals
+            .get(&(task_id, merge_conflict_task_version))
+            .cloned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        approved_at_ms: i64,
+    ) -> Result<MergeAbortApprovalRecord, RepositoryError> {
+        self.record("ensure_merge_abort_approval");
+        self.maybe_fail("ensure_merge_abort_approval")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != merge_conflict_task_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let key = (task_id, merge_conflict_task_version);
+        if let Some(existing) = self.merge_abort_approvals.get(&key) {
+            return Ok(existing.clone());
+        }
+        let approval = MergeAbortApprovalRecord {
+            task_id,
+            merge_conflict_task_version,
+            source_approval_task_version,
+            base_commit: base_commit.to_owned(),
+            task_commit: task_commit.to_owned(),
+            merge_head_commit: merge_head_commit.to_owned(),
+            approved_at_ms,
+        };
+        self.merge_abort_approvals.insert(key, approval.clone());
+        Ok(approval)
+    }
+
+    fn save_merge_abort_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_merge_abort_transition");
+        self.maybe_fail("save_merge_abort_transition")?;
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.state() != TaskState::MergeConflict {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        if !self
+            .merge_abort_approvals
+            .contains_key(&(task.id(), expected_version))
+        {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        if terminal {
+            self.active_lease = None;
+        }
+        Ok(())
     }
 
     fn save_planning_transition(
@@ -361,10 +758,137 @@ impl FoundationRepository for FakeRepository {
                     consent.provider,
                     consent.work_kind,
                     consent.approved_task_version,
+                    consent.data_scope,
                 ),
                 *consent,
             );
         }
+        Ok(())
+    }
+
+    fn save_context_package_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_context_package_planning_transition");
+        self.maybe_fail("save_context_package_planning_transition")?;
+        if task.state() != TaskState::Planning {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = self
+            .isolations
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let key = (
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        );
+        let consent = self.consents.get(&key).copied();
+        let manifest = self.context_package_manifests.get(&key).copied();
+        match (consent, manifest) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(RepositoryError::new(
+                    RepositoryErrorCode::InvalidPersistenceState,
+                ));
+            }
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        Ok(())
+    }
+
+    fn save_context_package_implementation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.record("save_context_package_implementation_transition");
+        self.maybe_fail("save_context_package_implementation_transition")?;
+        if task.state() != TaskState::Implementing {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let current = self
+            .tasks
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if current.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if current.state() != TaskState::AwaitingDesignApproval {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = self
+            .isolations
+            .get(&task.id())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let plan_ready = self.planning_results.get(&task.id()).is_some_and(|result| {
+            result.outcome == chatoms_ports::repository::PlanningResultOutcome::Completed
+                && result
+                    .plan_text
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+        });
+        if !plan_ready {
+            return Err(RepositoryError::new(
+                RepositoryErrorCode::InvalidPersistenceState,
+            ));
+        }
+        let key = (
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        );
+        let consent = self.consents.get(&key).copied();
+        let manifest = self.context_package_manifests.get(&key).copied();
+        match (consent, manifest) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(RepositoryError::new(
+                    RepositoryErrorCode::InvalidPersistenceState,
+                ));
+            }
+        }
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
         Ok(())
     }
 
@@ -390,6 +914,7 @@ impl FoundationRepository for FakeRepository {
                     consent.provider,
                     consent.work_kind,
                     consent.approved_task_version,
+                    consent.data_scope,
                 ),
                 *consent,
             );
@@ -401,6 +926,7 @@ impl FoundationRepository for FakeRepository {
         &mut self,
         expected_version: u64,
         task_id: TaskId,
+        data_scope: ContextDataScope,
         consented_at_ms: i64,
     ) -> Result<ProviderConsent, RepositoryError> {
         self.record("save_review_consent");
@@ -420,6 +946,7 @@ impl FoundationRepository for FakeRepository {
             ProviderKind::Claude,
             WorkKind::Review,
             expected_version,
+            data_scope,
         );
         if let Some(existing) = self.consents.get(&key) {
             return Ok(*existing);
@@ -429,10 +956,96 @@ impl FoundationRepository for FakeRepository {
             provider: ProviderKind::Claude,
             work_kind: WorkKind::Review,
             approved_task_version: expected_version,
+            data_scope,
             consented_at_ms,
         };
         self.consents.insert(key, consent);
         Ok(consent)
+    }
+
+    fn prepare_planning_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.record("prepare_planning_context_package");
+        self.maybe_fail("prepare_planning_context_package")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        let isolation = self
+            .isolations
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::IsolationNotFound))?;
+        if isolation.status != GitIsolationStatus::WorktreeReady {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.fake_prepare_context_package(
+            task_id,
+            WorkKind::Planning,
+            expected_version,
+            prepared_at_ms,
+        )
+    }
+
+    fn prepare_implementation_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.record("prepare_implementation_context_package");
+        self.maybe_fail("prepare_implementation_context_package")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::AwaitingDesignApproval {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.fake_prepare_context_package(
+            task_id,
+            WorkKind::Implementation,
+            expected_version,
+            prepared_at_ms,
+        )
+    }
+
+    fn prepare_review_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.record("prepare_review_context_package");
+        self.maybe_fail("prepare_review_context_package")?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorCode::TaskNotFound))?;
+        if task.version() != expected_version {
+            return Err(RepositoryError::new(RepositoryErrorCode::VersionConflict));
+        }
+        if task.state() != TaskState::Reviewing {
+            return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
+        }
+        self.fake_prepare_context_package(
+            task_id,
+            WorkKind::Review,
+            expected_version,
+            prepared_at_ms,
+        )
     }
 
     fn save_planning_result(
@@ -512,11 +1125,14 @@ impl FoundationRepository for FakeRepository {
             approval.approved_task_version,
             approval.kind,
         );
-        if self.validation_command_approvals.contains_key(&key) {
+        let approvals = match approval.execution_scope {
+            ValidationExecutionScope::TaskWorktree => &mut self.validation_command_approvals,
+            ValidationExecutionScope::ProjectRoot => &mut self.project_root_validation_approvals,
+        };
+        if approvals.contains_key(&key) {
             return Err(RepositoryError::new(RepositoryErrorCode::InvalidAggregate));
         }
-        self.validation_command_approvals
-            .insert(key, approval.clone());
+        approvals.insert(key, approval.clone());
         Ok(())
     }
 
@@ -540,6 +1156,25 @@ impl FoundationRepository for FakeRepository {
                 .unwrap_or(usize::MAX)
         });
         Ok(approvals)
+    }
+
+    fn list_validation_command_approvals_for_scope(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        execution_scope: ValidationExecutionScope,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        self.record("list_validation_command_approvals_for_scope");
+        self.maybe_fail("list_validation_command_approvals_for_scope")?;
+        let approvals = match execution_scope {
+            ValidationExecutionScope::TaskWorktree => &self.validation_command_approvals,
+            ValidationExecutionScope::ProjectRoot => &self.project_root_validation_approvals,
+        };
+        Ok(approvals
+            .iter()
+            .filter(|((id, version, _), _)| *id == task_id && *version == approved_task_version)
+            .map(|(_, approval)| approval.clone())
+            .collect())
     }
 
     fn append_validation_command_result(
@@ -567,6 +1202,7 @@ impl FoundationRepository for FakeRepository {
         let record = ValidationCommandResultRecord {
             task_id: attempt.task_id,
             approved_task_version: attempt.approved_task_version,
+            execution_scope: attempt.execution_scope,
             kind: attempt.kind,
             attempt_sequence,
             outcome: attempt.outcome,
@@ -630,6 +1266,7 @@ impl FoundationRepository for FakeRepository {
             .push(ValidationCommandResultRecord {
                 task_id: attempt.task_id,
                 approved_task_version: attempt.approved_task_version,
+                execution_scope: attempt.execution_scope,
                 kind: attempt.kind,
                 attempt_sequence,
                 outcome: attempt.outcome,
@@ -644,6 +1281,82 @@ impl FoundationRepository for FakeRepository {
             .entry(task.id())
             .or_default()
             .push(transition.clone());
+        Ok(())
+    }
+
+    fn append_post_merge_validation_result(
+        &mut self,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<PostMergeValidationResultRecord, RepositoryError> {
+        self.record("append_post_merge_validation_result");
+        self.maybe_fail("append_post_merge_validation_result")?;
+        let sequence = self
+            .post_merge_validation_results
+            .iter()
+            .filter(|record| {
+                record.task_id == attempt.task_id
+                    && record.approval_task_version == attempt.approval_task_version
+                    && record.post_merge_task_version == attempt.post_merge_task_version
+                    && record.kind == attempt.kind
+            })
+            .count() as u32
+            + 1;
+        let record = PostMergeValidationResultRecord {
+            task_id: attempt.task_id,
+            approval_task_version: attempt.approval_task_version,
+            post_merge_task_version: attempt.post_merge_task_version,
+            execution_scope: attempt.execution_scope,
+            kind: attempt.kind,
+            attempt_sequence: sequence,
+            outcome: attempt.outcome,
+            exit_code: attempt.exit_code,
+            safe_summary: attempt.safe_summary.clone(),
+            started_at_ms: attempt.started_at_ms,
+            completed_at_ms: attempt.completed_at_ms,
+        };
+        self.post_merge_validation_results.push(record.clone());
+        Ok(record)
+    }
+
+    fn list_post_merge_validation_results(
+        &mut self,
+        task_id: TaskId,
+        approval_task_version: u64,
+        post_merge_task_version: u64,
+        kind: ValidationCommandKind,
+    ) -> Result<Vec<PostMergeValidationResultRecord>, RepositoryError> {
+        Ok(self
+            .post_merge_validation_results
+            .iter()
+            .filter(|record| {
+                record.task_id == task_id
+                    && record.approval_task_version == approval_task_version
+                    && record.post_merge_task_version == post_merge_task_version
+                    && record.kind == kind
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn finalize_post_merge_validation_batch(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        self.record("finalize_post_merge_validation_batch");
+        self.maybe_fail("finalize_post_merge_validation_batch")?;
+        self.append_post_merge_validation_result(attempt)?;
+        self.last_saved = Some((expected_version, task.clone(), transition.clone()));
+        self.tasks.insert(task.id(), task.clone());
+        self.transitions
+            .entry(task.id())
+            .or_default()
+            .push(transition.clone());
+        if task.state().is_terminal() {
+            self.active_lease = None;
+        }
         Ok(())
     }
 
@@ -930,6 +1643,77 @@ pub fn restored_task(
         created_at_ms,
     );
     (task, vec![initial])
+}
+
+/// Builds a task by *applying* every state in `states` through
+/// `Task::transition_to`, starting from a freshly `Created` task, and
+/// returns it together with the transition history the state machine
+/// actually produced.
+///
+/// Nothing here is hand-picked: the resulting `task.version()` and every
+/// recorded `task_version`/`sequence` are whatever the domain assigns. That
+/// is the point — a fixture that assigns versions itself can silently make
+/// an unreachable production shape look reachable, which is exactly the
+/// class of defect
+/// `crates/chatoms-application/tests/merge_lifecycle_reachability.rs`
+/// exists to catch. Callers that need the version a task had at some
+/// intermediate state (an isolation record's frozen
+/// `expected_task_version`, say) must read it back out of the returned
+/// history rather than assume it.
+pub fn task_through(states: &[TaskState]) -> (Task, Vec<TaskStateTransition>) {
+    let id = TaskId::new();
+    let created_at_ms = 10;
+    let mut task = Task::restore(TaskSnapshot {
+        id,
+        project_id: ProjectId::new(),
+        state: TaskState::Created,
+        version: 0,
+        task_branch_identity: TaskBranchIdentity::for_task(id),
+        resume_target_state: None,
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+        terminal_at_ms: None,
+    })
+    .expect("a freshly created task satisfies the domain invariants");
+    let mut history = vec![TaskStateTransition::initial(
+        TaskStateTransitionId::new(),
+        id,
+        "test.actor".parse::<ActorKind>().expect("actor"),
+        "test.reason".parse::<ReasonCode>().expect("reason"),
+        created_at_ms,
+    )];
+    for (index, next) in states.iter().copied().enumerate() {
+        let from_state = task.state();
+        let occurred_at_ms = created_at_ms + 1 + index as i64;
+        task.transition_to(next, occurred_at_ms)
+            .expect("the requested chain must be a real state-machine path");
+        history.push(
+            TaskStateTransition::new(chatoms_domain::TaskStateTransitionSnapshot {
+                id: TaskStateTransitionId::new(),
+                task_id: id,
+                sequence: history.len() as u64 + 1,
+                from_state: Some(from_state),
+                to_state: next,
+                task_version: task.version(),
+                actor_kind: "test.actor".parse::<ActorKind>().expect("actor"),
+                reason_code: "test.reason".parse::<ReasonCode>().expect("reason"),
+                occurred_at_ms,
+            })
+            .expect("transition snapshot"),
+        );
+    }
+    (task, history)
+}
+
+/// The `task_version` recorded by the first transition that entered
+/// `state`, read back out of a real history built by [`task_through`].
+#[must_use]
+pub fn version_on_entering(history: &[TaskStateTransition], state: TaskState) -> u64 {
+    history
+        .iter()
+        .find(|transition| transition.to_state() == state)
+        .map(TaskStateTransition::task_version)
+        .expect("the history must contain the requested state")
 }
 
 pub fn storage_failure() -> PortFailure {

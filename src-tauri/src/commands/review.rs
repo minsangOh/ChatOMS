@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
 use chatoms_application::{
+    context_package_review_execution::{
+        BeginContextPackageReviewExecutionRequest, ContextPackageReviewExecutionRecorder,
+        ContextPackageReviewExecutionStarter,
+    },
     error::ApplicationError,
     provider::ProviderConfigService,
     review_execution::{
@@ -163,6 +167,130 @@ pub fn handle_start_claude_review(
     Ok(task_dto)
 }
 
+/// Starts a Context Package v1 Claude Review attempt: fresh-checks Claude
+/// capability, then delegates to
+/// [`ContextPackageReviewExecutionStarter::begin`], which validates every
+/// read-only precondition [`ReviewExecutionStarter::begin`] already checks
+/// (task state/version, `WorktreeReady` isolation, `TaskBrief`, a usable
+/// diff) plus one more — that the exact `(task_id, Claude, Review,
+/// expected_version, ContextPackageV1)` consent and its FK-bound manifest
+/// were already prepared by the separate "Prepare" step. Unlike
+/// [`handle_start_claude_review`], `begin` here never records or reuses any
+/// consent of its own: there is nothing to commit, so the caller gets an
+/// immediate, accurate `TaskDto` reflecting the unchanged `Reviewing` state.
+/// The actual provider process then runs, and its outcome is recorded, on a
+/// detached background thread sharing the exact same [`ReviewRunRegistry`]
+/// [`handle_start_claude_review`] uses — a task can only ever have one
+/// `Reviewing` diff review in flight regardless of which path started it, so
+/// no second registry or cancel command is needed;
+/// [`handle_cancel_claude_review`], [`handle_get_review_result`], and
+/// startup reconciliation already work unchanged for this path.
+pub fn handle_start_claude_review_context_package(
+    runtime: &ManagedRuntime,
+    task_id: &str,
+    expected_version: u64,
+) -> Result<TaskDto, IpcErrorDto> {
+    let id = parse_task_id(task_id)?;
+    let ready = runtime.ready_snapshot()?;
+
+    let Some(executable_path) = claude_executable_path(&ready)? else {
+        return Err(unsupported_capability_error());
+    };
+    let preflight_dir_handle = ready.preflight_dir.clone();
+    let Some(preflight_dir_path) = preflight_dir_handle
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+    else {
+        return Err(unsupported_capability_error());
+    };
+    let redactor = SecretRedactor::new().map_err(|_| IpcErrorDto::internal())?;
+
+    let mut precheck_capability = StdProviderCapabilityAdapter::new(
+        Some(executable_path.clone()),
+        preflight_dir_handle.clone(),
+        StdProcessRunner::new(),
+    );
+
+    // Same two-role split as `handle_start_claude_review`: one clone
+    // verifies worktree identity, the other reads the bounded ephemeral
+    // diff.
+    let git_adapter = GitCliAdapter::from_environment()
+        .map_err(|error| ApplicationError::from_categorized(&error))?;
+    let mut git_for_verify = git_adapter.clone();
+    let mut diff_port = git_adapter;
+    let mut filesystem = ready.filesystem.clone();
+
+    let mut repository = ready.repository.clone();
+    let mut time = ready.time.clone();
+    let inputs = ContextPackageReviewExecutionStarter::new(
+        &mut repository,
+        &mut time,
+        &mut precheck_capability,
+        &mut git_for_verify,
+        &mut filesystem,
+        &mut diff_port,
+    )
+    .begin(BeginContextPackageReviewExecutionRequest::new(
+        id,
+        expected_version,
+    ))
+    .map_err(IpcErrorDto::from)?;
+
+    let started_at_ms = time.now_ms().map_err(|_| IpcErrorDto::internal())?;
+    let task_dto = TaskDto::from(inputs.task.clone());
+
+    let Some(cancellation) = ready.review_runs.register(id) else {
+        // `begin` here commits nothing at all (no transition, no consent —
+        // the Context Package v1 consent was already recorded by the
+        // separate "Prepare" step), so a registry conflict has nothing to
+        // undo either. Return a typed error and leave the task's state
+        // exactly as it was.
+        return Err(registry_conflict_error());
+    };
+    let review_runs = ready.review_runs.clone();
+    let expected_version = inputs.task.version;
+    let worktree_path = inputs.worktree_path;
+    let brief = inputs.brief;
+    let diff_text = inputs.diff_text;
+    let mut repository_for_thread = ready.repository.clone();
+    let mut time_for_thread = ready.time.clone();
+
+    std::thread::spawn(move || {
+        let _unregister_guard = UnregisterOnDrop {
+            review_runs,
+            task_id: id,
+        };
+        let executor_capability = StdProviderCapabilityAdapter::new(
+            Some(executable_path.clone()),
+            preflight_dir_handle,
+            StdProcessRunner::new(),
+        );
+        let mut adapter = ClaudeReviewAdapter::new(
+            executor_capability,
+            StdProcessRunner::new(),
+            executable_path,
+            preflight_dir_path,
+            redactor,
+        );
+        let _ = ContextPackageReviewExecutionRecorder::new(
+            &mut repository_for_thread,
+            &mut time_for_thread,
+        )
+        .run_and_record_with_panic_containment(
+            id,
+            expected_version,
+            &worktree_path,
+            &brief,
+            &diff_text,
+            started_at_ms,
+            &mut adapter,
+            &cancellation,
+        );
+    });
+
+    Ok(task_dto)
+}
+
 /// Requests cancellation of an in-flight Claude Review run for `task_id`.
 /// Returns whether a matching run was found; it does not itself change task
 /// state — only a subsequently *confirmed* process exit is ever recorded as
@@ -244,6 +372,15 @@ pub fn start_claude_review(
     expected_version: u64,
 ) -> Result<TaskDto, IpcErrorDto> {
     handle_start_claude_review(&state, &task_id, expected_version)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn start_claude_review_context_package(
+    state: tauri::State<'_, ManagedRuntime>,
+    task_id: String,
+    expected_version: u64,
+) -> Result<TaskDto, IpcErrorDto> {
+    handle_start_claude_review_context_package(&state, &task_id, expected_version)
 }
 
 #[tauri::command(rename_all = "camelCase")]

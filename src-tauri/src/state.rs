@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex, MutexGuard, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -7,7 +7,8 @@ use std::sync::{
 use chatoms_application::system::CapabilityStatus as AppCapabilityStatus;
 use chatoms_application::{bootstrap::BootstrapStatus, error::ApplicationError};
 use chatoms_domain::{
-    ProjectId, Task, TaskId, TaskStateTransition, ValidationCommandKind, WorkKind,
+    ContextDataScope, HighRiskCategory, ProjectId, Task, TaskId, TaskStateTransition,
+    ValidationCommandKind, ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::bootstrap::{
     LegacyMigrationDiagnostic, SharedDatabase, SharedFoundationRepository, SharedLoggingGuard,
@@ -35,20 +36,26 @@ impl PreflightDirectory {
 }
 use chatoms_ports::{
     PlatformCapabilities, PlatformCapabilityPort, TimeProvider,
+    diff::DiffContentHash,
     error::PortFailure,
     filesystem::{DirectoryIdentity, DirectoryIdentityGuard, FilesystemIdentityPort},
     git::{
         GitService, ProjectInspection, RepositorySafetyToken, RepositoryStatus,
         WorktreeCreationOutcome, WorktreePathProvider,
     },
+    manual_merge_resolution::ManualResolutionDigest,
     provider::ProviderKind,
     repository::{
-        ActiveLease, AppProfileRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
-        GitOperationReceipt, GitOperationReceiptKind, ProjectFilesystemIdentityRecord,
-        ProjectRecord, ProjectSummary, ProviderBindingRecord, ProviderConsent, RepositoryError,
-        TaskBriefRecord, TaskGitIsolation, TaskImplementationResultRecord,
-        TaskPlanningResultRecord, TaskReviewResultRecord, ValidationCommandApprovalRecord,
-        ValidationCommandResultAttempt, ValidationCommandResultRecord,
+        ActiveLease, AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
+        DiffApprovalRecord, FoundationRepository, GitInitApproval, GitOperationAttempt,
+        GitOperationReceipt, GitOperationReceiptKind, HighRiskApprovalRecord,
+        ManualMergeResolutionConfirmationRecord, MergeAbortApprovalRecord,
+        PostMergeValidationResultAttempt, PostMergeValidationResultRecord,
+        ProjectFilesystemIdentityRecord, ProjectRecord, ProjectSummary, ProviderBindingRecord,
+        ProviderConsent, RepositoryError, TaskBriefRecord, TaskGitIsolation,
+        TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
+        ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+        ValidationCommandResultRecord,
     },
 };
 
@@ -227,9 +234,16 @@ impl FoundationRepository for RepositoryHandle {
         provider: ProviderKind,
         work_kind: WorkKind,
         approved_task_version: u64,
+        data_scope: ContextDataScope,
     ) -> Result<Option<ProviderConsent>, RepositoryError> {
         self.with_inner(|inner| {
-            inner.get_provider_consent(task_id, provider, work_kind, approved_task_version)
+            inner.get_provider_consent(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            )
         })
     }
 
@@ -261,10 +275,268 @@ impl FoundationRepository for RepositoryHandle {
         &mut self,
         expected_version: u64,
         task_id: TaskId,
+        data_scope: ContextDataScope,
         consented_at_ms: i64,
     ) -> Result<ProviderConsent, RepositoryError> {
         self.with_inner(|inner| {
-            inner.save_review_consent(expected_version, task_id, consented_at_ms)
+            inner.save_review_consent(expected_version, task_id, data_scope, consented_at_ms)
+        })
+    }
+
+    fn save_context_package_planning_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.save_context_package_planning_transition(expected_version, task, transition)
+        })
+    }
+
+    fn save_context_package_implementation_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.save_context_package_implementation_transition(expected_version, task, transition)
+        })
+    }
+
+    fn prepare_planning_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.prepare_planning_context_package(expected_version, task_id, prepared_at_ms)
+        })
+    }
+
+    fn prepare_implementation_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.prepare_implementation_context_package(expected_version, task_id, prepared_at_ms)
+        })
+    }
+
+    fn prepare_review_context_package(
+        &mut self,
+        expected_version: u64,
+        task_id: TaskId,
+        prepared_at_ms: i64,
+    ) -> Result<ContextPackagePreparation, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.prepare_review_context_package(expected_version, task_id, prepared_at_ms)
+        })
+    }
+
+    fn save_context_package_manifest(
+        &mut self,
+        record: &ContextPackageManifestRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| inner.save_context_package_manifest(record))
+    }
+
+    fn get_context_package_manifest(
+        &mut self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        work_kind: WorkKind,
+        approved_task_version: u64,
+        data_scope: ContextDataScope,
+    ) -> Result<Option<ContextPackageManifestRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_context_package_manifest(
+                task_id,
+                provider,
+                work_kind,
+                approved_task_version,
+                data_scope,
+            )
+        })
+    }
+
+    fn save_high_risk_approval(
+        &mut self,
+        approval: &HighRiskApprovalRecord,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| inner.save_high_risk_approval(approval))
+    }
+
+    fn get_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        risk_category: HighRiskCategory,
+    ) -> Result<Option<HighRiskApprovalRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_high_risk_approval(task_id, approved_task_version, risk_category)
+        })
+    }
+
+    fn ensure_high_risk_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        risk_category: HighRiskCategory,
+        approved_at_ms: i64,
+    ) -> Result<HighRiskApprovalRecord, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.ensure_high_risk_approval(
+                task_id,
+                expected_version,
+                risk_category,
+                approved_at_ms,
+            )
+        })
+    }
+
+    fn save_diff_approval(&mut self, approval: &DiffApprovalRecord) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| inner.save_diff_approval(approval))
+    }
+
+    fn get_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        diff_content_hash: DiffContentHash,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_diff_approval(task_id, approved_task_version, diff_content_hash)
+        })
+    }
+
+    fn get_diff_approval_for_task_version(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+    ) -> Result<Option<DiffApprovalRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_diff_approval_for_task_version(task_id, approved_task_version)
+        })
+    }
+
+    fn ensure_diff_approval(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+        diff_content_hash: DiffContentHash,
+        approved_at_ms: i64,
+    ) -> Result<DiffApprovalRecord, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.ensure_diff_approval(task_id, expected_version, diff_content_hash, approved_at_ms)
+        })
+    }
+
+    fn get_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<Option<ManualMergeResolutionConfirmationRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_manual_merge_resolution_confirmation(
+                task_id,
+                merge_conflict_task_version,
+                resolution_digest,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_manual_merge_resolution_confirmation(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        resolution_digest: ManualResolutionDigest,
+        confirmed_at_ms: i64,
+    ) -> Result<ManualMergeResolutionConfirmationRecord, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.ensure_manual_merge_resolution_confirmation(
+                task_id,
+                merge_conflict_task_version,
+                source_approval_task_version,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                resolution_digest,
+                confirmed_at_ms,
+            )
+        })
+    }
+
+    fn save_manual_merge_resolution_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        resolution_digest: ManualResolutionDigest,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.save_manual_merge_resolution_transition(
+                expected_version,
+                task,
+                transition,
+                resolution_digest,
+            )
+        })
+    }
+
+    fn get_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+    ) -> Result<Option<MergeAbortApprovalRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.get_merge_abort_approval(task_id, merge_conflict_task_version)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_merge_abort_approval(
+        &mut self,
+        task_id: TaskId,
+        merge_conflict_task_version: u64,
+        source_approval_task_version: u64,
+        base_commit: &str,
+        task_commit: &str,
+        merge_head_commit: &str,
+        approved_at_ms: i64,
+    ) -> Result<MergeAbortApprovalRecord, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.ensure_merge_abort_approval(
+                task_id,
+                merge_conflict_task_version,
+                source_approval_task_version,
+                base_commit,
+                task_commit,
+                merge_head_commit,
+                approved_at_ms,
+            )
+        })
+    }
+
+    fn save_merge_abort_transition(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        terminal: bool,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.save_merge_abort_transition(expected_version, task, transition, terminal)
         })
     }
 
@@ -323,6 +595,21 @@ impl FoundationRepository for RepositoryHandle {
         })
     }
 
+    fn list_validation_command_approvals_for_scope(
+        &mut self,
+        task_id: TaskId,
+        approved_task_version: u64,
+        execution_scope: ValidationExecutionScope,
+    ) -> Result<Vec<ValidationCommandApprovalRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.list_validation_command_approvals_for_scope(
+                task_id,
+                approved_task_version,
+                execution_scope,
+            )
+        })
+    }
+
     fn append_validation_command_result(
         &mut self,
         attempt: &ValidationCommandResultAttempt,
@@ -350,6 +637,42 @@ impl FoundationRepository for RepositoryHandle {
     ) -> Result<(), RepositoryError> {
         self.with_inner(|inner| {
             inner.finalize_validation_command_batch(expected_version, task, transition, attempt)
+        })
+    }
+
+    fn append_post_merge_validation_result(
+        &mut self,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<PostMergeValidationResultRecord, RepositoryError> {
+        self.with_inner(|inner| inner.append_post_merge_validation_result(attempt))
+    }
+
+    fn list_post_merge_validation_results(
+        &mut self,
+        task_id: TaskId,
+        approval_task_version: u64,
+        post_merge_task_version: u64,
+        kind: ValidationCommandKind,
+    ) -> Result<Vec<PostMergeValidationResultRecord>, RepositoryError> {
+        self.with_inner(|inner| {
+            inner.list_post_merge_validation_results(
+                task_id,
+                approval_task_version,
+                post_merge_task_version,
+                kind,
+            )
+        })
+    }
+
+    fn finalize_post_merge_validation_batch(
+        &mut self,
+        expected_version: u64,
+        task: &Task,
+        transition: &TaskStateTransition,
+        attempt: &PostMergeValidationResultAttempt,
+    ) -> Result<(), RepositoryError> {
+        self.with_inner(|inner| {
+            inner.finalize_post_merge_validation_batch(expected_version, task, transition, attempt)
         })
     }
 
@@ -924,6 +1247,132 @@ impl ImplementationRunRegistry {
     }
 }
 
+/// In-memory-only registry preventing two concurrent `git merge --abort`
+/// write attempts for the same task. Unlike
+/// [`PlanningRunRegistry`]/[`ImplementationRunRegistry`]/[`TestingRunRegistry`]/[`ReviewRunRegistry`],
+/// this registry never hands back a cancellation signal: a merge abort is a
+/// single short-lived Git write with a fixed 20-second timeout that is never
+/// interrupted mid-flight, and cancellation is explicitly out of scope for
+/// this Unit (`docs/PHASE_PLAN.md` Phase 5e-4). Its sole purpose is
+/// duplicate-execution prevention -- a second `confirm_merge_abort_and_start`
+/// call for a task that already has one in flight must not spawn a second
+/// background Git write against the same original checkout. Never
+/// persisted: an app restart has no running process to duplicate against
+/// anyway, and a task left `MergeConflict` after a restart is only ever
+/// re-inspected read-only, never auto-retried (see
+/// `TaskService::reconcile_startup_merge`, which this registry does not
+/// participate in).
+#[derive(Clone, Default)]
+pub struct MergeAbortRunRegistry {
+    inner: Arc<Mutex<HashSet<TaskId>>>,
+}
+
+impl MergeAbortRunRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `task_id` as having an in-flight abort attempt. Returns
+    /// `false` without registering anything if an entry already exists --
+    /// the caller must not start a second background execution, must not
+    /// treat this as an error, and must not have performed any Git write or
+    /// approval write yet (registration is always the very first step).
+    pub fn register(&self, task_id: TaskId) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        guard.insert(task_id)
+    }
+
+    pub fn unregister(&self, task_id: TaskId) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.remove(&task_id);
+        }
+    }
+}
+
+/// In-memory-only mutual exclusion between the two `MergeConflict` recovery
+/// paths that write to the *same original checkout*: merge-continue
+/// (`git merge --continue`, `commands::merge_continue`) and merge-abort
+/// (`git merge --abort`, `commands::merge_abort`). Both operate on one
+/// task's single original checkout, and the two writes contradict each
+/// other -- one completes the staged resolution as a merge commit, the
+/// other discards it -- so starting them concurrently for the same task
+/// would race two Git processes over the same index and `MERGE_HEAD`.
+///
+/// This lock is neither persistent state nor an approval identity: it
+/// records only "a merge-conflict write for this task is executing right
+/// now". It carries no cancellation signal (neither write is ever
+/// interrupted mid-flight), no task version binding (the immutable
+/// approvals and confirmations already carry that, and each command
+/// re-verifies state/version transactionally), and nothing durable. Held
+/// strictly for the duration of the write: every acquisition is released
+/// by an RAII guard, including on background-thread panic and on uncertain
+/// outcomes -- an entry is never left behind as a recovery marker.
+///
+/// Deliberately separate from [`MergeAbortRunRegistry`], which prevents a
+/// *second abort* for the same task and is not generalized or renamed for
+/// this cross-command role: a started abort holds both, and their release
+/// conditions are documented independently.
+///
+/// An app restart clears this lock along with the rest of the process
+/// memory. That is correct: a restart has no running Git process left to
+/// exclude against, and a task left in `MergeConflict` (or `Merging`) is
+/// recovered by the existing startup reconciliation
+/// (`TaskService::reconcile_startup_merge`), which this lock does not
+/// participate in.
+#[derive(Clone, Default)]
+pub struct MergeConflictWriteLock {
+    inner: Arc<Mutex<HashSet<TaskId>>>,
+}
+
+impl MergeConflictWriteLock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Acquires the lock for `task_id`. Returns `false` without recording
+    /// anything if a merge-conflict write for that task is already in
+    /// flight -- the caller must not start a Git write, must not record an
+    /// approval or confirmation, must not commit a state transition, and
+    /// must not spawn a background thread.
+    pub fn register(&self, task_id: TaskId) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        guard.insert(task_id)
+    }
+
+    pub fn unregister(&self, task_id: TaskId) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.remove(&task_id);
+        }
+    }
+
+    /// Read-only: whether a merge-conflict write for `task_id` is executing
+    /// right now. Observes the same shared set every clone of this handle
+    /// sees and mutates nothing -- it neither acquires nor releases the
+    /// lock, so it can never be mistaken for a `register`.
+    ///
+    /// This exists so the UI can gate its merge-continue/merge-abort
+    /// actions on the *authoritative* in-flight state rather than on a
+    /// local flag that a polling tick would clear while the write is still
+    /// running. It stays a boolean on purpose: which of the two writes is
+    /// running, and everything it touches, is not the UI's business.
+    ///
+    /// A poisoned mutex reports `true`, matching `register`'s fail-closed
+    /// direction: an unreadable lock must never be presented as "nothing is
+    /// running, go ahead".
+    #[must_use]
+    pub fn is_running(&self, task_id: TaskId) -> bool {
+        self.inner
+            .lock()
+            .map_or(true, |guard| guard.contains(&task_id))
+    }
+}
+
 /// In-memory-only registry of cancellation handles for Cargo-only Testing
 /// batches currently executing on a background thread, keyed by task id.
 /// Mirrors [`PlanningRunRegistry`]/[`ImplementationRunRegistry`] exactly
@@ -1067,6 +1516,8 @@ pub struct AppRuntime {
     pub implementation_runs: ImplementationRunRegistry,
     pub testing_runs: TestingRunRegistry,
     pub review_runs: ReviewRunRegistry,
+    pub merge_abort_runs: MergeAbortRunRegistry,
+    pub merge_conflict_writes: MergeConflictWriteLock,
     resources: RuntimeResources,
 }
 
@@ -1083,6 +1534,8 @@ pub struct RuntimePorts {
     pub implementation_runs: ImplementationRunRegistry,
     pub testing_runs: TestingRunRegistry,
     pub review_runs: ReviewRunRegistry,
+    pub merge_abort_runs: MergeAbortRunRegistry,
+    pub merge_conflict_writes: MergeConflictWriteLock,
 }
 
 impl AppRuntime {
@@ -1105,6 +1558,8 @@ impl AppRuntime {
             implementation_runs: ports.implementation_runs,
             testing_runs: ports.testing_runs,
             review_runs: ports.review_runs,
+            merge_abort_runs: ports.merge_abort_runs,
+            merge_conflict_writes: ports.merge_conflict_writes,
             resources,
         }
     }
@@ -1311,6 +1766,142 @@ mod planning_run_registry_tests {
             "the stale signal must not be reachable anymore"
         );
         assert!(second.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod merge_abort_run_registry_tests {
+    use super::MergeAbortRunRegistry;
+    use chatoms_domain::TaskId;
+
+    #[test]
+    fn the_first_registration_for_a_task_id_succeeds() {
+        let registry = MergeAbortRunRegistry::new();
+        assert!(registry.register(TaskId::new()));
+    }
+
+    #[test]
+    fn a_second_registration_for_the_same_task_id_is_rejected() {
+        let registry = MergeAbortRunRegistry::new();
+        let task_id = TaskId::new();
+        assert!(registry.register(task_id));
+
+        assert!(
+            !registry.register(task_id),
+            "a second concurrent registration for the same task id must be rejected"
+        );
+    }
+
+    #[test]
+    fn unregistering_allows_a_later_registration_to_succeed_again() {
+        let registry = MergeAbortRunRegistry::new();
+        let task_id = TaskId::new();
+        assert!(registry.register(task_id));
+
+        registry.unregister(task_id);
+
+        assert!(
+            registry.register(task_id),
+            "registration after unregister must succeed"
+        );
+    }
+
+    #[test]
+    fn a_clone_shares_the_same_underlying_registry() {
+        let registry = MergeAbortRunRegistry::new();
+        let clone = registry.clone();
+        let task_id = TaskId::new();
+        assert!(registry.register(task_id));
+
+        assert!(
+            !clone.register(task_id),
+            "a clone must observe the same registered task id"
+        );
+    }
+
+    #[test]
+    fn unregistering_an_unregistered_task_id_is_a_no_op() {
+        let registry = MergeAbortRunRegistry::new();
+        registry.unregister(TaskId::new());
+        // No panic, and a fresh registration for a different id still works.
+        assert!(registry.register(TaskId::new()));
+    }
+}
+
+#[cfg(test)]
+mod merge_conflict_write_lock_tests {
+    use super::MergeConflictWriteLock;
+    use chatoms_domain::TaskId;
+
+    #[test]
+    fn the_first_acquisition_for_a_task_id_succeeds() {
+        let lock = MergeConflictWriteLock::new();
+        assert!(lock.register(TaskId::new()));
+    }
+
+    #[test]
+    fn a_second_acquisition_for_the_same_task_id_is_rejected() {
+        let lock = MergeConflictWriteLock::new();
+        let task_id = TaskId::new();
+        assert!(lock.register(task_id));
+
+        assert!(
+            !lock.register(task_id),
+            "a merge-conflict write already in flight for this task must exclude a second one"
+        );
+    }
+
+    #[test]
+    fn an_acquisition_for_a_different_task_id_is_not_blocked() {
+        let lock = MergeConflictWriteLock::new();
+        assert!(lock.register(TaskId::new()));
+
+        assert!(
+            lock.register(TaskId::new()),
+            "the lock is per task: a different task's original checkout is not excluded"
+        );
+    }
+
+    #[test]
+    fn releasing_allows_a_later_acquisition_to_succeed_again() {
+        let lock = MergeConflictWriteLock::new();
+        let task_id = TaskId::new();
+        assert!(lock.register(task_id));
+
+        lock.unregister(task_id);
+
+        assert!(
+            lock.register(task_id),
+            "acquisition after release must succeed: the lock is not a recovery marker"
+        );
+    }
+
+    #[test]
+    fn a_clone_shares_the_same_underlying_lock() {
+        let lock = MergeConflictWriteLock::new();
+        let clone = lock.clone();
+        let task_id = TaskId::new();
+        assert!(lock.register(task_id));
+
+        assert!(
+            !clone.register(task_id),
+            "a clone handed to a background thread must observe the same held lock"
+        );
+
+        clone.unregister(task_id);
+
+        assert!(
+            lock.register(task_id),
+            "a release through one clone must be observable through the other"
+        );
+    }
+
+    #[test]
+    fn releasing_an_unheld_task_id_is_a_no_op() {
+        let lock = MergeConflictWriteLock::new();
+        lock.unregister(TaskId::new());
+        // No panic, and a fresh acquisition for a different id still works.
+        assert!(lock.register(TaskId::new()));
     }
 }
 

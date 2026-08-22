@@ -62,7 +62,7 @@ use chatoms_ports::{
     repository::ValidationCommandApprovalRecord,
     validation_execution::{
         ValidationBindingRejection, ValidationCommandExecutor, ValidationExecutionOutcome,
-        ValidationExecutionStartOutcome,
+        ValidationExecutionRequest, ValidationExecutionStartOutcome, ValidationExecutionTarget,
     },
 };
 
@@ -112,18 +112,38 @@ where
         }
     }
 
-    /// Re-verifies the approval's fixed Cargo vocabulary and every identity
-    /// binding, then — only if every check passes — spawns exactly the
-    /// approved executable with the approved argv, `worktree_path` as CWD,
-    /// and a fully `env_clear`'d, minimal environment. Never falls back to
-    /// a PATH search and never accepts a shell string.
     pub fn start_validation_command(
         &mut self,
-        worktree_path: &Path,
-        approval: &ValidationCommandApprovalRecord,
+        request: ValidationExecutionRequest<'_>,
         cancellation: &dyn CancellationSignal,
     ) -> Result<ValidationExecutionStartOutcome, PortFailure> {
-        if let Err(rejection) = self.verify_bindings(worktree_path, approval) {
+        let approval = request.approval;
+        let directory_identity = request.target.directory_identity();
+        if approval.execution_scope != request.target.scope() {
+            return Ok(ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::UnsupportedExecutionScope,
+            ));
+        }
+        if let ValidationExecutionTarget::ProjectRoot {
+            project_id,
+            project_identity_revision,
+            directory_identity,
+        } = request.target
+        {
+            if approval.target_project_id != Some(*project_id)
+                || approval.target_project_identity_revision != Some(*project_identity_revision)
+                || approval.target_root_volume_serial_hex.as_deref()
+                    != Some(directory_identity.volume_serial_hex.as_str())
+                || approval.target_root_file_id_hex.as_deref()
+                    != Some(directory_identity.file_id_hex.as_str())
+            {
+                return Ok(ValidationExecutionStartOutcome::BindingRejected(
+                    ValidationBindingRejection::IdentityMismatch,
+                ));
+            }
+        }
+        let worktree_path = directory_identity.canonical_path.as_path();
+        if let Err(rejection) = self.verify_bindings(directory_identity, approval) {
             return Ok(ValidationExecutionStartOutcome::BindingRejected(rejection));
         }
 
@@ -167,7 +187,7 @@ where
     /// mismatch) is treated identically: reject, never spawn.
     fn verify_bindings(
         &mut self,
-        worktree_path: &Path,
+        worktree_identity: &chatoms_ports::filesystem::DirectoryIdentity,
         approval: &ValidationCommandApprovalRecord,
     ) -> Result<(), ValidationBindingRejection> {
         let Some(expected_arguments) = expected_cargo_arguments(approval.kind) else {
@@ -203,27 +223,38 @@ where
         {
             return Err(ValidationBindingRejection::IdentityMismatch);
         }
+        if tool_directory_identity
+            .canonical_path
+            .starts_with(&worktree_identity.canonical_path)
+        {
+            return Err(ValidationBindingRejection::BindingInsideExecutionTarget);
+        }
 
-        let worktree_identity = self
+        let current_worktree_identity = self
             .filesystem
-            .inspect_supported_directory(worktree_path)
+            .inspect_supported_directory(&worktree_identity.canonical_path)
             .map_err(|_error| ValidationBindingRejection::IdentityMismatch)?;
+        if current_worktree_identity != *worktree_identity {
+            return Err(ValidationBindingRejection::IdentityMismatch);
+        }
         if executable_identity
             .canonical_path
             .starts_with(&worktree_identity.canonical_path)
         {
-            return Err(ValidationBindingRejection::ExecutableInsideWorktree);
+            return Err(ValidationBindingRejection::ExecutableInsideExecutionTarget);
         }
 
         self.verify_environment_binding(
             approval.approved_cargo_home_path.as_deref(),
             approval.cargo_home_volume_serial_hex.as_deref(),
             approval.cargo_home_file_id_hex.as_deref(),
+            &worktree_identity.canonical_path,
         )?;
         self.verify_environment_binding(
             approval.approved_rustup_home_path.as_deref(),
             approval.rustup_home_volume_serial_hex.as_deref(),
             approval.rustup_home_file_id_hex.as_deref(),
+            &worktree_identity.canonical_path,
         )?;
         Ok(())
     }
@@ -242,6 +273,7 @@ where
         approved_path: Option<&str>,
         approved_volume_serial_hex: Option<&str>,
         approved_file_id_hex: Option<&str>,
+        execution_target: &Path,
     ) -> Result<(), ValidationBindingRejection> {
         match (
             approved_path,
@@ -260,6 +292,9 @@ where
                 {
                     return Err(ValidationBindingRejection::IdentityMismatch);
                 }
+                if current.canonical_path.starts_with(execution_target) {
+                    return Err(ValidationBindingRejection::BindingInsideExecutionTarget);
+                }
                 Ok(())
             }
             _ => Err(ValidationBindingRejection::IdentityMismatch),
@@ -274,16 +309,10 @@ where
 {
     fn start_validation_command(
         &mut self,
-        worktree_path: &Path,
-        approval: &ValidationCommandApprovalRecord,
+        request: ValidationExecutionRequest<'_>,
         cancellation: &dyn CancellationSignal,
     ) -> Result<ValidationExecutionStartOutcome, PortFailure> {
-        CargoValidationAdapter::start_validation_command(
-            self,
-            worktree_path,
-            approval,
-            cancellation,
-        )
+        CargoValidationAdapter::start_validation_command(self, request, cancellation)
     }
 }
 
@@ -418,7 +447,7 @@ fn interpret_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chatoms_domain::TaskId;
+    use chatoms_domain::{TaskId, ValidationExecutionScope};
     use chatoms_ports::{
         error::FailureCategory, filesystem::DirectoryIdentity, process::AtomicCancellationSignal,
     };
@@ -431,6 +460,7 @@ mod tests {
         ValidationCommandApprovalRecord {
             task_id: TaskId::new(),
             approved_task_version: 3,
+            execution_scope: ValidationExecutionScope::TaskWorktree,
             kind,
             executable: CARGO_EXECUTABLE_NAME.to_owned(),
             arguments: arguments
@@ -449,6 +479,10 @@ mod tests {
             approved_rustup_home_path: None,
             rustup_home_volume_serial_hex: None,
             rustup_home_file_id_hex: None,
+            target_project_id: None,
+            target_project_identity_revision: None,
+            target_root_volume_serial_hex: None,
+            target_root_file_id_hex: None,
             approved_at_ms: 30,
         }
     }
@@ -476,8 +510,43 @@ mod tests {
         approval_for(ValidationCommandKind::Test, &["test", "--workspace"])
     }
 
+    fn project_root_path() -> PathBuf {
+        PathBuf::from("C:/projects/demo")
+    }
+
+    fn project_root_identity() -> DirectoryIdentity {
+        DirectoryIdentity {
+            canonical_path: project_root_path(),
+            volume_serial_hex: "0000000000000007".to_owned(),
+            file_id_hex: "00000000000000000000000000000007".to_owned(),
+        }
+    }
+
+    fn project_root_approval_for(
+        kind: ValidationCommandKind,
+        arguments: &[&str],
+        project_id: chatoms_domain::ProjectId,
+    ) -> ValidationCommandApprovalRecord {
+        let mut approval = approval_for(kind, arguments);
+        let root = project_root_identity();
+        approval.execution_scope = ValidationExecutionScope::ProjectRoot;
+        approval.target_project_id = Some(project_id);
+        approval.target_project_identity_revision = Some(7);
+        approval.target_root_volume_serial_hex = Some(root.volume_serial_hex);
+        approval.target_root_file_id_hex = Some(root.file_id_hex);
+        approval
+    }
+
     fn worktree_path() -> PathBuf {
         PathBuf::from("C:/managed/task")
+    }
+
+    fn worktree_identity() -> DirectoryIdentity {
+        DirectoryIdentity {
+            canonical_path: worktree_path(),
+            volume_serial_hex: "0000000000000009".to_owned(),
+            file_id_hex: "00000000000000000000000000000009".to_owned(),
+        }
     }
 
     fn cargo_home_binding() -> DirectoryIdentity {
@@ -544,6 +613,8 @@ mod tests {
                 rustup_home_binding().canonical_path.clone(),
                 rustup_home_binding(),
             );
+            fs.directories
+                .insert(project_root_path(), project_root_identity());
             fs
         }
     }
@@ -640,7 +711,15 @@ mod tests {
         approval: &ValidationCommandApprovalRecord,
     ) -> ValidationExecutionStartOutcome {
         adapter
-            .start_validation_command(&worktree_path(), approval, &never_cancelled())
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &ValidationExecutionTarget::TaskWorktree {
+                        directory_identity: worktree_identity(),
+                    },
+                    approval,
+                },
+                &never_cancelled(),
+            )
             .expect("start_validation_command returns a typed outcome")
     }
 
@@ -676,6 +755,328 @@ mod tests {
         );
         assert_eq!(spec.working_directory, worktree_path());
         assert_eq!(*max_bytes, MAX_STDOUT_BYTES);
+    }
+
+    #[test]
+    fn project_root_test_and_build_spawn_with_the_approved_root_target_and_fixed_argv() {
+        let project_id = chatoms_domain::ProjectId::new();
+        for (kind, arguments) in [
+            (ValidationCommandKind::Test, &["test", "--workspace"][..]),
+            (ValidationCommandKind::Build, &["build", "--workspace"][..]),
+        ] {
+            let streaming = FakeStreamingRunner {
+                scripted: Some(completed(0)),
+                ..FakeStreamingRunner::default()
+            };
+            let observed = streaming.observed.clone();
+            let mut adapter =
+                make_adapter(FakeFilesystemIdentity::with_valid_bindings(), streaming);
+            let approval = project_root_approval_for(kind, arguments, project_id);
+            let target = ValidationExecutionTarget::ProjectRoot {
+                project_id,
+                project_identity_revision: 7,
+                directory_identity: project_root_identity(),
+            };
+
+            let outcome = adapter
+                .start_validation_command(
+                    ValidationExecutionRequest {
+                        target: &target,
+                        approval: &approval,
+                    },
+                    &never_cancelled(),
+                )
+                .expect("project root execution returns a typed outcome");
+
+            assert_eq!(
+                completed_outcome(&outcome),
+                ValidationExecutionOutcome::Success
+            );
+            let runs = observed.lock().expect("observed lock");
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].0.working_directory, project_root_path());
+            assert_eq!(
+                runs[0].0.arguments,
+                arguments
+                    .iter()
+                    .map(|argument| OsString::from(*argument))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn project_root_scope_mismatch_rejects_before_spawn() {
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(FakeFilesystemIdentity::with_valid_bindings(), streaming);
+        let approval = test_approval();
+        let target = ValidationExecutionTarget::ProjectRoot {
+            project_id: chatoms_domain::ProjectId::new(),
+            project_identity_revision: 1,
+            directory_identity: project_root_identity(),
+        };
+
+        let outcome = adapter
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &target,
+                    approval: &approval,
+                },
+                &never_cancelled(),
+            )
+            .expect("scope mismatch is a typed pre-spawn outcome");
+
+        assert_eq!(
+            outcome,
+            ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::UnsupportedExecutionScope
+            )
+        );
+        assert!(observed.lock().expect("observed lock").is_empty());
+    }
+
+    #[test]
+    fn project_root_project_id_or_revision_mismatch_rejects_before_spawn() {
+        let project_id = chatoms_domain::ProjectId::new();
+        let approval = project_root_approval_for(
+            ValidationCommandKind::Test,
+            &["test", "--workspace"],
+            project_id,
+        );
+        for target in [
+            ValidationExecutionTarget::ProjectRoot {
+                project_id: chatoms_domain::ProjectId::new(),
+                project_identity_revision: 7,
+                directory_identity: project_root_identity(),
+            },
+            ValidationExecutionTarget::ProjectRoot {
+                project_id,
+                project_identity_revision: 8,
+                directory_identity: project_root_identity(),
+            },
+        ] {
+            let streaming = FakeStreamingRunner {
+                scripted: Some(completed(0)),
+                ..FakeStreamingRunner::default()
+            };
+            let observed = streaming.observed.clone();
+            let mut adapter =
+                make_adapter(FakeFilesystemIdentity::with_valid_bindings(), streaming);
+
+            let outcome = adapter
+                .start_validation_command(
+                    ValidationExecutionRequest {
+                        target: &target,
+                        approval: &approval,
+                    },
+                    &never_cancelled(),
+                )
+                .expect("identity mismatch is a typed pre-spawn outcome");
+
+            assert_eq!(
+                outcome,
+                ValidationExecutionStartOutcome::BindingRejected(
+                    ValidationBindingRejection::IdentityMismatch
+                )
+            );
+            assert!(observed.lock().expect("observed lock").is_empty());
+        }
+    }
+
+    #[test]
+    fn project_root_live_identity_or_approval_snapshot_mismatch_rejects_before_spawn() {
+        let project_id = chatoms_domain::ProjectId::new();
+        let approval = project_root_approval_for(
+            ValidationCommandKind::Build,
+            &["build", "--workspace"],
+            project_id,
+        );
+        let mut filesystem = FakeFilesystemIdentity::with_valid_bindings();
+        filesystem.directories.insert(
+            project_root_path(),
+            DirectoryIdentity {
+                canonical_path: project_root_path(),
+                volume_serial_hex: "0000000000000099".to_owned(),
+                file_id_hex: "00000000000000000000000000000099".to_owned(),
+            },
+        );
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(filesystem, streaming);
+        let target = ValidationExecutionTarget::ProjectRoot {
+            project_id,
+            project_identity_revision: 7,
+            directory_identity: project_root_identity(),
+        };
+
+        let outcome = adapter
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &target,
+                    approval: &approval,
+                },
+                &never_cancelled(),
+            )
+            .expect("live identity mismatch is a typed pre-spawn outcome");
+
+        assert_eq!(
+            outcome,
+            ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::IdentityMismatch
+            )
+        );
+        assert!(observed.lock().expect("observed lock").is_empty());
+    }
+
+    #[test]
+    fn project_root_approval_root_identity_mismatch_rejects_before_spawn() {
+        let project_id = chatoms_domain::ProjectId::new();
+        let mut approval = project_root_approval_for(
+            ValidationCommandKind::Test,
+            &["test", "--workspace"],
+            project_id,
+        );
+        approval.target_root_file_id_hex = Some("00000000000000000000000000000099".to_owned());
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(FakeFilesystemIdentity::with_valid_bindings(), streaming);
+        let target = ValidationExecutionTarget::ProjectRoot {
+            project_id,
+            project_identity_revision: 7,
+            directory_identity: project_root_identity(),
+        };
+
+        let outcome = adapter
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &target,
+                    approval: &approval,
+                },
+                &never_cancelled(),
+            )
+            .expect("approval mismatch is a typed pre-spawn outcome");
+
+        assert_eq!(
+            outcome,
+            ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::IdentityMismatch
+            )
+        );
+        assert!(observed.lock().expect("observed lock").is_empty());
+    }
+
+    #[test]
+    fn project_root_tool_directory_inside_target_rejects_before_spawn() {
+        let project_id = chatoms_domain::ProjectId::new();
+        let root_tool_directory = project_root_path().join("tools");
+        let root_tool_identity = DirectoryIdentity {
+            canonical_path: root_tool_directory.clone(),
+            volume_serial_hex: "0000000000000008".to_owned(),
+            file_id_hex: "00000000000000000000000000000008".to_owned(),
+        };
+        let mut approval = project_root_approval_for(
+            ValidationCommandKind::Test,
+            &["test", "--workspace"],
+            project_id,
+        );
+        approval.tool_directory_path = root_tool_directory.to_string_lossy().into_owned();
+        approval.tool_directory_volume_serial_hex = root_tool_identity.volume_serial_hex.clone();
+        approval.tool_directory_file_id_hex = root_tool_identity.file_id_hex.clone();
+        let mut filesystem = FakeFilesystemIdentity::with_valid_bindings();
+        filesystem
+            .directories
+            .insert(root_tool_directory, root_tool_identity);
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(filesystem, streaming);
+        let target = ValidationExecutionTarget::ProjectRoot {
+            project_id,
+            project_identity_revision: 7,
+            directory_identity: project_root_identity(),
+        };
+
+        let outcome = adapter
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &target,
+                    approval: &approval,
+                },
+                &never_cancelled(),
+            )
+            .expect("binding rejection is typed");
+
+        assert_eq!(
+            outcome,
+            ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::BindingInsideExecutionTarget
+            )
+        );
+        assert!(observed.lock().expect("observed lock").is_empty());
+    }
+
+    #[test]
+    fn project_root_environment_directory_inside_target_rejects_before_spawn() {
+        let project_id = chatoms_domain::ProjectId::new();
+        let root_cargo_home = project_root_path().join("cargo-home");
+        let root_cargo_identity = DirectoryIdentity {
+            canonical_path: root_cargo_home.clone(),
+            volume_serial_hex: "0000000000000008".to_owned(),
+            file_id_hex: "00000000000000000000000000000008".to_owned(),
+        };
+        let mut approval = project_root_approval_for(
+            ValidationCommandKind::Build,
+            &["build", "--workspace"],
+            project_id,
+        );
+        approval.approved_cargo_home_path = Some(root_cargo_home.to_string_lossy().into_owned());
+        approval.cargo_home_volume_serial_hex = Some(root_cargo_identity.volume_serial_hex.clone());
+        approval.cargo_home_file_id_hex = Some(root_cargo_identity.file_id_hex.clone());
+        let mut filesystem = FakeFilesystemIdentity::with_valid_bindings();
+        filesystem
+            .directories
+            .insert(root_cargo_home, root_cargo_identity);
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(filesystem, streaming);
+        let target = ValidationExecutionTarget::ProjectRoot {
+            project_id,
+            project_identity_revision: 7,
+            directory_identity: project_root_identity(),
+        };
+
+        let outcome = adapter
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &target,
+                    approval: &approval,
+                },
+                &never_cancelled(),
+            )
+            .expect("binding rejection is typed");
+
+        assert_eq!(
+            outcome,
+            ValidationExecutionStartOutcome::BindingRejected(
+                ValidationBindingRejection::BindingInsideExecutionTarget
+            )
+        );
+        assert!(observed.lock().expect("observed lock").is_empty());
     }
 
     #[test]
@@ -867,7 +1268,7 @@ mod tests {
         assert_eq!(
             outcome,
             ValidationExecutionStartOutcome::BindingRejected(
-                ValidationBindingRejection::ExecutableInsideWorktree
+                ValidationBindingRejection::ExecutableInsideExecutionTarget
             )
         );
         assert!(observed.lock().expect("observed lock").is_empty());
@@ -1031,7 +1432,15 @@ mod tests {
         cancellation.cancel();
 
         let outcome = adapter
-            .start_validation_command(&worktree_path(), &test_approval(), &cancellation)
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &ValidationExecutionTarget::TaskWorktree {
+                        directory_identity: worktree_identity(),
+                    },
+                    approval: &test_approval(),
+                },
+                &cancellation,
+            )
             .expect("typed outcome");
 
         assert_eq!(
@@ -1095,7 +1504,15 @@ mod tests {
         );
 
         adapter
-            .start_validation_command(&worktree_path(), &test_approval(), &never_cancelled())
+            .start_validation_command(
+                ValidationExecutionRequest {
+                    target: &ValidationExecutionTarget::TaskWorktree {
+                        directory_identity: worktree_identity(),
+                    },
+                    approval: &test_approval(),
+                },
+                &never_cancelled(),
+            )
             .expect_err("a genuine spawn failure must not be silently swallowed");
     }
 

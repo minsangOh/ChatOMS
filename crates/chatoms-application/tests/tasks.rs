@@ -5,19 +5,24 @@ use std::str::FromStr;
 use chatoms_application::{
     error::ApplicationErrorCode,
     tasks::{
-        CreateTaskRequest, RecordImplementationResultRequest, RecordPlanningResultRequest,
-        RecordReviewResultRequest, StartImplementationRequest, StartPlanningRequest,
-        StartReviewRequest, TaskActionRequest, TaskService, TransitionTaskRequest,
+        ApproveHighRiskOperationRequest, CreateTaskRequest,
+        PrepareImplementationContextPackageRequest, PreparePlanningContextPackageRequest,
+        PrepareReviewContextPackageRequest, RecordDiffApprovalRequest,
+        RecordImplementationResultRequest, RecordPlanningResultRequest, RecordReviewResultRequest,
+        StartContextPackageImplementationRequest, StartContextPackagePlanningRequest,
+        StartImplementationRequest, StartPlanningRequest, StartReviewRequest, TaskActionRequest,
+        TaskService, TransitionTaskRequest,
     },
 };
-use chatoms_domain::{ProjectId, TaskId, TaskState, WorkKind};
+use chatoms_domain::{ContextDataScope, HighRiskCategory, ProjectId, TaskId, TaskState, WorkKind};
 use chatoms_ports::{
+    diff::DiffContentHash,
     error::{CategorizedFailure, FailureCategory, PortFailure},
     provider::ProviderKind,
     repository::{
-        ActiveLease, GitIsolationStatus, ImplementationResultOutcome, PlanningResultOutcome,
-        RepositoryErrorCode, ReviewResultOutcome, TaskGitIsolation, TaskPlanningResultRecord,
-        TaskReviewResultRecord,
+        ActiveLease, ContextPackageManifestRecord, GitIsolationStatus, ImplementationResultOutcome,
+        PlanningResultOutcome, ProviderConsent, RepositoryErrorCode, ReviewResultOutcome,
+        TaskBriefRecord, TaskGitIsolation, TaskPlanningResultRecord, TaskReviewResultRecord,
     },
 };
 
@@ -74,6 +79,48 @@ fn start_implementation(task_id: TaskId, expected_version: u64) -> StartImplemen
 
 fn start_review(task_id: TaskId, expected_version: u64) -> StartReviewRequest {
     StartReviewRequest::new(task_id, expected_version)
+}
+
+fn prepare_planning(
+    task_id: TaskId,
+    expected_version: u64,
+) -> PreparePlanningContextPackageRequest {
+    PreparePlanningContextPackageRequest::new(task_id, expected_version)
+}
+
+fn prepare_implementation(
+    task_id: TaskId,
+    expected_version: u64,
+) -> PrepareImplementationContextPackageRequest {
+    PrepareImplementationContextPackageRequest::new(task_id, expected_version)
+}
+
+fn prepare_review(task_id: TaskId, expected_version: u64) -> PrepareReviewContextPackageRequest {
+    PrepareReviewContextPackageRequest::new(task_id, expected_version)
+}
+
+fn start_context_package_planning(
+    task_id: TaskId,
+    expected_version: u64,
+) -> StartContextPackagePlanningRequest {
+    StartContextPackagePlanningRequest::new(
+        task_id,
+        expected_version,
+        "user".to_owned(),
+        "task.planning.context_package.transition".to_owned(),
+    )
+}
+
+fn start_context_package_implementation(
+    task_id: TaskId,
+    expected_version: u64,
+) -> StartContextPackageImplementationRequest {
+    StartContextPackageImplementationRequest::new(
+        task_id,
+        expected_version,
+        "user".to_owned(),
+        "task.implementation.context_package.transition".to_owned(),
+    )
 }
 
 fn worktree_ready_isolation(task_id: TaskId, expected_version: u64) -> TaskGitIsolation {
@@ -902,7 +949,13 @@ fn start_planning_records_new_consent_and_transitions_atomically() {
     assert_eq!(record.to_state(), TaskState::Planning);
     let consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Planning, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("consent recorded");
     assert_eq!(consent.consented_at_ms, 20);
     assert!(repository.calls.contains(&"save_planning_transition"));
@@ -922,10 +975,17 @@ fn start_planning_reuses_an_existing_same_version_consent_without_overwriting_it
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Planning,
         approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 5,
     };
     repository.consents.insert(
-        (task_id, ProviderKind::Claude, WorkKind::Planning, 1),
+        (
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ),
         existing_consent,
     );
     let mut time = FakeTime::at(20);
@@ -937,7 +997,13 @@ fn start_planning_reuses_an_existing_same_version_consent_without_overwriting_it
     assert_eq!(view.state, TaskState::Planning);
     let consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Planning, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("consent still present");
     assert_eq!(
         consent.consented_at_ms, 5,
@@ -1069,7 +1135,13 @@ fn start_implementation_records_new_consent_and_transitions_atomically() {
     assert_eq!(record.to_state(), TaskState::Implementing);
     let consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("consent recorded");
     assert_eq!(consent.consented_at_ms, 20);
     assert!(repository.calls.contains(&"save_implementation_transition"));
@@ -1086,10 +1158,17 @@ fn start_implementation_reuses_an_existing_same_version_consent_without_overwrit
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Implementation,
         approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 5,
     };
     repository.consents.insert(
-        (task_id, ProviderKind::Claude, WorkKind::Implementation, 1),
+        (
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ),
         existing_consent,
     );
     let mut time = FakeTime::at(20);
@@ -1101,7 +1180,13 @@ fn start_implementation_reuses_an_existing_same_version_consent_without_overwrit
     assert_eq!(view.state, TaskState::Implementing);
     let consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("consent still present");
     assert_eq!(
         consent.consented_at_ms, 5,
@@ -1187,10 +1272,17 @@ fn start_implementation_consent_is_independent_of_a_planning_consent_for_the_sam
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Planning,
         approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 5,
     };
     repository.consents.insert(
-        (task_id, ProviderKind::Claude, WorkKind::Planning, 1),
+        (
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ),
         planning_consent,
     );
     let mut time = FakeTime::at(20);
@@ -1201,13 +1293,25 @@ fn start_implementation_consent_is_independent_of_a_planning_consent_for_the_sam
 
     let implementation_consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("a fresh Implementation consent must have been recorded");
     assert_eq!(implementation_consent.consented_at_ms, 20);
     assert_eq!(
         repository
             .consents
-            .get(&(task_id, ProviderKind::Claude, WorkKind::Planning, 1))
+            .get(&(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Planning,
+                1,
+                ContextDataScope::LegacyPhase4
+            ))
             .expect("the pre-existing Planning consent must be untouched"),
         &planning_consent
     );
@@ -1230,7 +1334,13 @@ fn start_review_records_new_consent_without_transitioning_or_writing_history() {
     assert_eq!(view.version, 1);
     let consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Review, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("consent recorded");
     assert_eq!(consent.consented_at_ms, 20);
     assert!(repository.calls.contains(&"save_review_consent"));
@@ -1254,10 +1364,17 @@ fn start_review_reuses_an_existing_same_version_consent_without_overwriting_it()
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Review,
         approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 5,
     };
     repository.consents.insert(
-        (task_id, ProviderKind::Claude, WorkKind::Review, 1),
+        (
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ),
         existing_consent,
     );
     let mut time = FakeTime::at(20);
@@ -1269,7 +1386,13 @@ fn start_review_reuses_an_existing_same_version_consent_without_overwriting_it()
     assert_eq!(view.state, TaskState::Reviewing);
     let consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Review, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("consent still present");
     assert_eq!(
         consent.consented_at_ms, 5,
@@ -1345,6 +1468,7 @@ fn start_review_consent_is_independent_of_planning_and_implementation_consents_f
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Planning,
         approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 5,
     };
     let implementation_consent = chatoms_ports::repository::ProviderConsent {
@@ -1352,14 +1476,27 @@ fn start_review_consent_is_independent_of_planning_and_implementation_consents_f
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Implementation,
         approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 6,
     };
     repository.consents.insert(
-        (task_id, ProviderKind::Claude, WorkKind::Planning, 1),
+        (
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ),
         planning_consent,
     );
     repository.consents.insert(
-        (task_id, ProviderKind::Claude, WorkKind::Implementation, 1),
+        (
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ),
         implementation_consent,
     );
     let mut time = FakeTime::at(20);
@@ -1370,20 +1507,38 @@ fn start_review_consent_is_independent_of_planning_and_implementation_consents_f
 
     let review_consent = repository
         .consents
-        .get(&(task_id, ProviderKind::Claude, WorkKind::Review, 1))
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            1,
+            ContextDataScope::LegacyPhase4,
+        ))
         .expect("a fresh Review consent must have been recorded");
     assert_eq!(review_consent.consented_at_ms, 20);
     assert_eq!(
         repository
             .consents
-            .get(&(task_id, ProviderKind::Claude, WorkKind::Planning, 1))
+            .get(&(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Planning,
+                1,
+                ContextDataScope::LegacyPhase4
+            ))
             .expect("the pre-existing Planning consent must be untouched"),
         &planning_consent
     );
     assert_eq!(
         repository
             .consents
-            .get(&(task_id, ProviderKind::Claude, WorkKind::Implementation, 1))
+            .get(&(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Implementation,
+                1,
+                ContextDataScope::LegacyPhase4
+            ))
             .expect("the pre-existing Implementation consent must be untouched"),
         &implementation_consent
     );
@@ -2335,4 +2490,1467 @@ fn record_review_result_persistence_failure_fallback_also_fails_and_propagates_t
         TaskState::Reviewing,
         "the task must be left exactly as it was, not silently advanced, when recovery itself fails"
     );
+}
+
+#[test]
+fn prepare_planning_context_package_calls_the_repository_and_returns_the_preparation() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    let mut time = FakeTime::at(20);
+
+    let preparation = TaskService::new(&mut repository, &mut time)
+        .prepare_planning_context_package(prepare_planning(task_id, 1))
+        .expect("prepare planning context package");
+
+    assert_eq!(preparation.consent.task_id, task_id);
+    assert_eq!(preparation.consent.work_kind, WorkKind::Planning);
+    assert_eq!(
+        preparation.consent.data_scope,
+        ContextDataScope::ContextPackageV1
+    );
+    assert_eq!(preparation.consent.approved_task_version, 1);
+    assert_eq!(preparation.manifest.work_kind, WorkKind::Planning);
+    assert!(
+        repository
+            .calls
+            .contains(&"prepare_planning_context_package")
+    );
+    assert!(
+        repository.last_saved.is_none(),
+        "preparation must never drive a state transition"
+    );
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::WorktreeReady,
+        "preparation must leave the task's state exactly as it was"
+    );
+}
+
+#[test]
+fn prepare_planning_context_package_rejects_wrong_state_without_calling_the_repository() {
+    let (task, history) = restored_task(TaskState::Planning, 2, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .prepare_planning_context_package(prepare_planning(task_id, 2))
+        .expect_err("Planning must not be accepted as WorktreeReady");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(
+        !repository
+            .calls
+            .contains(&"prepare_planning_context_package"),
+        "a precondition failure must short-circuit before ever calling the repository"
+    );
+}
+
+#[test]
+fn prepare_planning_context_package_propagates_a_repository_failure_without_converting_it_to_success()
+ {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "prepare_planning_context_package",
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .prepare_planning_context_package(prepare_planning(task_id, 1))
+        .expect_err("a repository failure must propagate as an error, never Ok or None");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+}
+
+#[test]
+fn prepare_implementation_context_package_calls_the_repository_and_returns_the_preparation() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 3, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let preparation = TaskService::new(&mut repository, &mut time)
+        .prepare_implementation_context_package(prepare_implementation(task_id, 3))
+        .expect("prepare implementation context package");
+
+    assert_eq!(preparation.consent.work_kind, WorkKind::Implementation);
+    assert_eq!(
+        preparation.consent.data_scope,
+        ContextDataScope::ContextPackageV1
+    );
+    assert!(
+        repository
+            .calls
+            .contains(&"prepare_implementation_context_package")
+    );
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::AwaitingDesignApproval
+    );
+}
+
+#[test]
+fn prepare_implementation_context_package_rejects_wrong_state_without_calling_the_repository() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .prepare_implementation_context_package(prepare_implementation(task_id, 1))
+        .expect_err("WorktreeReady must not be accepted as AwaitingDesignApproval");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(
+        !repository
+            .calls
+            .contains(&"prepare_implementation_context_package")
+    );
+}
+
+#[test]
+fn prepare_implementation_context_package_propagates_a_repository_failure() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 3, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "prepare_implementation_context_package",
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .prepare_implementation_context_package(prepare_implementation(task_id, 3))
+        .expect_err("a repository failure must propagate as an error, never Ok or None");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+}
+
+#[test]
+fn prepare_review_context_package_calls_the_repository_and_returns_the_preparation() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let preparation = TaskService::new(&mut repository, &mut time)
+        .prepare_review_context_package(prepare_review(task_id, 6))
+        .expect("prepare review context package");
+
+    assert_eq!(preparation.consent.work_kind, WorkKind::Review);
+    assert_eq!(
+        preparation.consent.data_scope,
+        ContextDataScope::ContextPackageV1
+    );
+    assert!(repository.calls.contains(&"prepare_review_context_package"));
+}
+
+#[test]
+fn prepare_review_context_package_rejects_wrong_state_without_calling_the_repository() {
+    let (task, history) = restored_task(TaskState::Testing, 5, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .prepare_review_context_package(prepare_review(task_id, 5))
+        .expect_err("Testing must not be accepted as Reviewing");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(!repository.calls.contains(&"prepare_review_context_package"));
+}
+
+#[test]
+fn prepare_review_context_package_propagates_a_repository_failure() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "prepare_review_context_package",
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .prepare_review_context_package(prepare_review(task_id, 6))
+        .expect_err("a repository failure must propagate as an error, never Ok or None");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+}
+
+#[test]
+fn context_package_v1_preparation_coexists_with_an_unmodified_legacy_phase4_start_review() {
+    let (task, history) = restored_task(TaskState::Reviewing, 6, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let legacy_view = TaskService::new(&mut repository, &mut time)
+        .start_review(start_review(task_id, 6))
+        .expect("existing LegacyPhase4 start_review must be entirely unaffected by this Unit");
+    assert_eq!(legacy_view.state, TaskState::Reviewing);
+
+    let preparation = TaskService::new(&mut repository, &mut time)
+        .prepare_review_context_package(prepare_review(task_id, 6))
+        .expect(
+            "ContextPackageV1 preparation must succeed independently of the LegacyPhase4 consent",
+        );
+
+    let legacy_consent = repository
+        .consents
+        .get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Review,
+            6,
+            ContextDataScope::LegacyPhase4,
+        ))
+        .expect("the LegacyPhase4 consent recorded by start_review must still be present");
+    assert_ne!(
+        preparation.consent, *legacy_consent,
+        "the two scopes must be recorded as independent consents"
+    );
+    assert_eq!(repository.consents.len(), 2, "both scopes coexist");
+}
+
+fn seed_context_package_planning_pair(
+    repository: &mut FakeRepository,
+    task_id: TaskId,
+    expected_version: u64,
+    at_ms: i64,
+) {
+    let key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Planning,
+        expected_version,
+        ContextDataScope::ContextPackageV1,
+    );
+    repository.consents.insert(
+        key,
+        ProviderConsent {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Planning,
+            approved_task_version: expected_version,
+            data_scope: ContextDataScope::ContextPackageV1,
+            consented_at_ms: at_ms,
+        },
+    );
+    repository.context_package_manifests.insert(
+        key,
+        ContextPackageManifestRecord {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Planning,
+            approved_task_version: expected_version,
+            data_scope: ContextDataScope::ContextPackageV1,
+            created_at_ms: at_ms,
+        },
+    );
+}
+
+#[test]
+fn context_package_planning_readiness_is_true_only_when_both_consent_and_manifest_exist() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    seed_context_package_planning_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(20);
+
+    let readiness = TaskService::new(&mut repository, &mut time)
+        .get_context_package_planning_readiness(task_id, 1)
+        .expect("readiness lookup");
+
+    assert!(readiness.ready);
+}
+
+#[test]
+fn context_package_planning_readiness_is_false_when_neither_consent_nor_manifest_exist() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let readiness = TaskService::new(&mut repository, &mut time)
+        .get_context_package_planning_readiness(task_id, 1)
+        .expect("readiness lookup");
+
+    assert!(!readiness.ready);
+}
+
+#[test]
+fn context_package_planning_readiness_is_a_fail_closed_error_on_a_partial_pair() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Planning,
+        1,
+        ContextDataScope::ContextPackageV1,
+    );
+    repository.consents.insert(
+        key,
+        ProviderConsent {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Planning,
+            approved_task_version: 1,
+            data_scope: ContextDataScope::ContextPackageV1,
+            consented_at_ms: 200,
+        },
+    );
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_context_package_planning_readiness(task_id, 1)
+        .expect_err("a consent-only partial pair must never be reported as ready: false");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+}
+
+#[test]
+fn context_package_planning_readiness_propagates_a_repository_failure_without_converting_it_to_ready_false()
+ {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "get_provider_consent",
+            RepositoryErrorCode::DatabaseUnavailable,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_context_package_planning_readiness(task_id, 1)
+        .expect_err("a repository failure must propagate, never become ready: false");
+
+    assert_eq!(error.code(), ApplicationErrorCode::StorageUnavailable);
+}
+
+#[test]
+fn start_context_package_planning_commits_the_transition_when_the_pair_is_prepared() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    seed_context_package_planning_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .start_context_package_planning(start_context_package_planning(task_id, 1))
+        .expect("start context package planning");
+
+    assert_eq!(view.state, TaskState::Planning);
+    assert!(
+        repository
+            .calls
+            .contains(&"save_context_package_planning_transition")
+    );
+    assert_eq!(
+        repository.consents.get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Planning,
+            1,
+            ContextDataScope::LegacyPhase4,
+        )),
+        None,
+        "this path must never create a LegacyPhase4 consent"
+    );
+}
+
+#[test]
+fn start_context_package_planning_rejects_when_the_pair_is_not_prepared_without_writing_anything() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_planning(start_context_package_planning(task_id, 1))
+        .expect_err("an unprepared task must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_planning_transition"),
+        "a precondition failure must short-circuit before ever calling the repository"
+    );
+    assert_eq!(repository.tasks[&task_id].state(), TaskState::WorktreeReady);
+}
+
+#[test]
+fn start_context_package_planning_rejects_wrong_state_without_calling_the_repository() {
+    let (task, history) = restored_task(TaskState::Planning, 2, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_planning(start_context_package_planning(task_id, 2))
+        .expect_err("Planning must not be accepted as WorktreeReady");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_planning_transition")
+    );
+}
+
+#[test]
+fn start_context_package_planning_rejects_a_non_worktree_ready_isolation_without_calling_the_repository()
+ {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut isolation = worktree_ready_isolation(task_id, 1);
+    isolation.status = GitIsolationStatus::WorktreeCreating;
+    repository.isolations.insert(task_id, isolation);
+    seed_context_package_planning_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_planning(start_context_package_planning(task_id, 1))
+        .expect_err("a non-WorktreeReady isolation must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_planning_transition")
+    );
+}
+
+#[test]
+fn start_context_package_planning_propagates_a_repository_failure_without_converting_it_to_success()
+{
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "save_context_package_planning_transition",
+            RepositoryErrorCode::InvalidAggregate,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    seed_context_package_planning_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_planning(start_context_package_planning(task_id, 1))
+        .expect_err("a repository failure must propagate, never be treated as success");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidInput);
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::WorktreeReady,
+        "a rejected write must leave the task exactly as it was"
+    );
+}
+
+#[test]
+fn context_package_planning_never_reuses_or_touches_a_legacy_phase4_planning_consent() {
+    let (task, history) = restored_task(TaskState::WorktreeReady, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    let legacy_key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Planning,
+        1,
+        ContextDataScope::LegacyPhase4,
+    );
+    let legacy_consent = ProviderConsent {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
+        consented_at_ms: 90,
+    };
+    repository.consents.insert(legacy_key, legacy_consent);
+    seed_context_package_planning_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    TaskService::new(&mut repository, &mut time)
+        .start_context_package_planning(start_context_package_planning(task_id, 1))
+        .expect("start context package planning succeeds independently of the legacy consent");
+
+    assert_eq!(
+        repository.consents.get(&legacy_key),
+        Some(&legacy_consent),
+        "the pre-existing LegacyPhase4 consent must be completely untouched"
+    );
+    assert_eq!(repository.consents.len(), 2, "both scopes coexist");
+}
+
+fn seed_context_package_implementation_pair(
+    repository: &mut FakeRepository,
+    task_id: TaskId,
+    expected_version: u64,
+    at_ms: i64,
+) {
+    let key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Implementation,
+        expected_version,
+        ContextDataScope::ContextPackageV1,
+    );
+    repository.consents.insert(
+        key,
+        ProviderConsent {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Implementation,
+            approved_task_version: expected_version,
+            data_scope: ContextDataScope::ContextPackageV1,
+            consented_at_ms: at_ms,
+        },
+    );
+    repository.context_package_manifests.insert(
+        key,
+        ContextPackageManifestRecord {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Implementation,
+            approved_task_version: expected_version,
+            data_scope: ContextDataScope::ContextPackageV1,
+            created_at_ms: at_ms,
+        },
+    );
+}
+
+fn seed_completed_planning_result(
+    repository: &mut FakeRepository,
+    task_id: TaskId,
+    plan_text: &str,
+) {
+    repository.planning_results.insert(
+        task_id,
+        TaskPlanningResultRecord {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Planning,
+            outcome: PlanningResultOutcome::Completed,
+            exit_code: Some(0),
+            turn_count: Some(5),
+            started_at_ms: 135,
+            completed_at_ms: 150,
+            plan_text: Some(plan_text.to_owned()),
+        },
+    );
+}
+
+fn seed_task_brief(repository: &mut FakeRepository, task_id: TaskId) {
+    repository.briefs.insert(
+        task_id,
+        TaskBriefRecord {
+            task_id,
+            requirements: "Add CSV export".to_owned(),
+            completion_criteria: "Export button downloads a CSV".to_owned(),
+            prohibited_scope: "Do not touch the import pipeline".to_owned(),
+            created_at_ms: 10,
+        },
+    );
+}
+
+/// Seeds every structural precondition
+/// `start_context_package_implementation` checks besides the Context
+/// Package v1 pair itself: a `WorktreeReady` isolation, a `Completed`
+/// non-empty stored Claude Planning result, and a `TaskBrief`.
+fn seed_context_package_implementation_evidence(
+    repository: &mut FakeRepository,
+    task_id: TaskId,
+    expected_version: u64,
+) {
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, expected_version));
+    seed_completed_planning_result(repository, task_id, "a stored plan");
+    seed_task_brief(repository, task_id);
+}
+
+#[test]
+fn context_package_implementation_readiness_is_true_only_when_both_consent_and_manifest_exist() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(20);
+
+    let readiness = TaskService::new(&mut repository, &mut time)
+        .get_context_package_implementation_readiness(task_id, 1)
+        .expect("readiness lookup");
+
+    assert!(readiness.ready);
+}
+
+#[test]
+fn context_package_implementation_readiness_is_false_when_neither_consent_nor_manifest_exist() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let readiness = TaskService::new(&mut repository, &mut time)
+        .get_context_package_implementation_readiness(task_id, 1)
+        .expect("readiness lookup");
+
+    assert!(!readiness.ready);
+}
+
+#[test]
+fn context_package_implementation_readiness_is_a_fail_closed_error_on_a_partial_pair() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Implementation,
+        1,
+        ContextDataScope::ContextPackageV1,
+    );
+    repository.consents.insert(
+        key,
+        ProviderConsent {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Implementation,
+            approved_task_version: 1,
+            data_scope: ContextDataScope::ContextPackageV1,
+            consented_at_ms: 200,
+        },
+    );
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_context_package_implementation_readiness(task_id, 1)
+        .expect_err("a consent-only partial pair must never be reported as ready: false");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+}
+
+#[test]
+fn context_package_implementation_readiness_propagates_a_repository_failure_without_converting_it_to_ready_false()
+ {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "get_provider_consent",
+            RepositoryErrorCode::DatabaseUnavailable,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_context_package_implementation_readiness(task_id, 1)
+        .expect_err("a repository failure must propagate, never become ready: false");
+
+    assert_eq!(error.code(), ApplicationErrorCode::StorageUnavailable);
+}
+
+#[test]
+fn start_context_package_implementation_commits_the_transition_when_everything_is_ready() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    seed_context_package_implementation_evidence(&mut repository, task_id, 1);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let view = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect("start context package implementation");
+
+    assert_eq!(view.state, TaskState::Implementing);
+    assert!(
+        repository
+            .calls
+            .contains(&"save_context_package_implementation_transition")
+    );
+    assert_eq!(
+        repository.consents.get(&(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            1,
+            ContextDataScope::LegacyPhase4,
+        )),
+        None,
+        "this path must never create a LegacyPhase4 consent"
+    );
+}
+
+#[test]
+fn start_context_package_implementation_rejects_when_the_pair_is_not_prepared_without_writing_anything()
+ {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    seed_context_package_implementation_evidence(&mut repository, task_id, 1);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect_err("an unprepared task must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_implementation_transition"),
+        "a precondition failure must short-circuit before ever calling the repository"
+    );
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::AwaitingDesignApproval
+    );
+}
+
+#[test]
+fn start_context_package_implementation_rejects_wrong_state_without_calling_the_repository() {
+    let (task, history) = restored_task(TaskState::Implementing, 2, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 2))
+        .expect_err("Implementing must not be accepted as AwaitingDesignApproval");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidState);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_implementation_transition")
+    );
+}
+
+#[test]
+fn start_context_package_implementation_rejects_a_missing_isolation_without_calling_the_repository()
+{
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    seed_completed_planning_result(&mut repository, task_id, "a stored plan");
+    seed_task_brief(&mut repository, task_id);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect_err("a missing isolation must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::NotFound);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_implementation_transition")
+    );
+}
+
+#[test]
+fn start_context_package_implementation_rejects_a_non_worktree_ready_isolation_without_calling_the_repository()
+ {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut isolation = worktree_ready_isolation(task_id, 1);
+    isolation.status = GitIsolationStatus::WorktreeCreating;
+    repository.isolations.insert(task_id, isolation);
+    seed_completed_planning_result(&mut repository, task_id, "a stored plan");
+    seed_task_brief(&mut repository, task_id);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect_err("a non-WorktreeReady isolation must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_implementation_transition")
+    );
+}
+
+#[test]
+fn start_context_package_implementation_rejects_a_missing_stored_planning_result_without_calling_the_repository()
+ {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    seed_task_brief(&mut repository, task_id);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect_err("a missing stored planning result must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::NotFound);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_implementation_transition")
+    );
+}
+
+#[test]
+fn start_context_package_implementation_rejects_a_non_completed_stored_planning_result_without_calling_the_repository()
+ {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    repository.planning_results.insert(
+        task_id,
+        TaskPlanningResultRecord {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Planning,
+            outcome: PlanningResultOutcome::Cancelled,
+            exit_code: None,
+            turn_count: None,
+            started_at_ms: 135,
+            completed_at_ms: 150,
+            plan_text: None,
+        },
+    );
+    seed_task_brief(&mut repository, task_id);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect_err("a non-Completed stored planning result must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_implementation_transition")
+    );
+}
+
+#[test]
+fn start_context_package_implementation_rejects_a_missing_task_brief_without_calling_the_repository()
+ {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository
+        .isolations
+        .insert(task_id, worktree_ready_isolation(task_id, 1));
+    seed_completed_planning_result(&mut repository, task_id, "a stored plan");
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect_err("a missing TaskBrief must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+    assert!(
+        !repository
+            .calls
+            .contains(&"save_context_package_implementation_transition")
+    );
+}
+
+#[test]
+fn start_context_package_implementation_propagates_a_repository_failure_without_converting_it_to_success()
+ {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "save_context_package_implementation_transition",
+            RepositoryErrorCode::InvalidAggregate,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    seed_context_package_implementation_evidence(&mut repository, task_id, 1);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect_err("a repository failure must propagate, never be treated as success");
+
+    assert_eq!(error.code(), ApplicationErrorCode::InvalidInput);
+    assert_eq!(
+        repository.tasks[&task_id].state(),
+        TaskState::AwaitingDesignApproval,
+        "a rejected write must leave the task exactly as it was"
+    );
+}
+
+#[test]
+fn context_package_implementation_never_reuses_or_touches_a_legacy_phase4_implementation_consent() {
+    let (task, history) = restored_task(TaskState::AwaitingDesignApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    seed_context_package_implementation_evidence(&mut repository, task_id, 1);
+    let legacy_key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Implementation,
+        1,
+        ContextDataScope::LegacyPhase4,
+    );
+    let legacy_consent = ProviderConsent {
+        task_id,
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Implementation,
+        approved_task_version: 1,
+        data_scope: ContextDataScope::LegacyPhase4,
+        consented_at_ms: 90,
+    };
+    repository.consents.insert(legacy_key, legacy_consent);
+    seed_context_package_implementation_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(210);
+
+    TaskService::new(&mut repository, &mut time)
+        .start_context_package_implementation(start_context_package_implementation(task_id, 1))
+        .expect(
+            "start context package implementation succeeds independently of the legacy consent",
+        );
+
+    assert_eq!(
+        repository.consents.get(&legacy_key),
+        Some(&legacy_consent),
+        "the pre-existing LegacyPhase4 consent must be completely untouched"
+    );
+    assert_eq!(repository.consents.len(), 2, "both scopes coexist");
+}
+
+fn seed_context_package_review_pair(
+    repository: &mut FakeRepository,
+    task_id: TaskId,
+    expected_version: u64,
+    at_ms: i64,
+) {
+    let key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Review,
+        expected_version,
+        ContextDataScope::ContextPackageV1,
+    );
+    repository.consents.insert(
+        key,
+        ProviderConsent {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Review,
+            approved_task_version: expected_version,
+            data_scope: ContextDataScope::ContextPackageV1,
+            consented_at_ms: at_ms,
+        },
+    );
+    repository.context_package_manifests.insert(
+        key,
+        ContextPackageManifestRecord {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Review,
+            approved_task_version: expected_version,
+            data_scope: ContextDataScope::ContextPackageV1,
+            created_at_ms: at_ms,
+        },
+    );
+}
+
+#[test]
+fn context_package_review_readiness_is_true_only_when_both_consent_and_manifest_exist() {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    seed_context_package_review_pair(&mut repository, task_id, 1, 200);
+    let mut time = FakeTime::at(20);
+
+    let readiness = TaskService::new(&mut repository, &mut time)
+        .get_context_package_review_readiness(task_id, 1)
+        .expect("readiness lookup");
+
+    assert!(readiness.ready);
+}
+
+#[test]
+fn context_package_review_readiness_is_false_when_neither_consent_nor_manifest_exist() {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let readiness = TaskService::new(&mut repository, &mut time)
+        .get_context_package_review_readiness(task_id, 1)
+        .expect("readiness lookup");
+
+    assert!(!readiness.ready);
+}
+
+#[test]
+fn context_package_review_readiness_is_a_fail_closed_error_on_a_partial_pair() {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let key = (
+        task_id,
+        ProviderKind::Claude,
+        WorkKind::Review,
+        1,
+        ContextDataScope::ContextPackageV1,
+    );
+    repository.consents.insert(
+        key,
+        ProviderConsent {
+            task_id,
+            provider: ProviderKind::Claude,
+            work_kind: WorkKind::Review,
+            approved_task_version: 1,
+            data_scope: ContextDataScope::ContextPackageV1,
+            consented_at_ms: 200,
+        },
+    );
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_context_package_review_readiness(task_id, 1)
+        .expect_err("a consent-only partial pair must never be reported as ready: false");
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+}
+
+#[test]
+fn context_package_review_readiness_propagates_a_repository_failure_without_converting_it_to_ready_false()
+ {
+    let (task, history) = restored_task(TaskState::Reviewing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "get_provider_consent",
+            RepositoryErrorCode::DatabaseUnavailable,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_context_package_review_readiness(task_id, 1)
+        .expect_err("a repository failure must propagate, never become ready: false");
+
+    assert_eq!(error.code(), ApplicationErrorCode::StorageUnavailable);
+}
+
+#[test]
+fn high_risk_approval_status_is_true_only_for_the_exact_task_version_and_category() {
+    let (task, history) = restored_task(TaskState::Testing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    repository.high_risk_approvals.insert(
+        (task_id, 1, HighRiskCategory::DataMigration),
+        chatoms_ports::repository::HighRiskApprovalRecord {
+            task_id,
+            approved_task_version: 1,
+            risk_category: HighRiskCategory::DataMigration,
+            approved_at_ms: 200,
+        },
+    );
+    let mut time = FakeTime::at(20);
+
+    let matching = TaskService::new(&mut repository, &mut time)
+        .get_high_risk_approval_status(task_id, 1, HighRiskCategory::DataMigration)
+        .expect("status lookup for the exact identity");
+    assert!(matching.approved);
+
+    let different_category = TaskService::new(&mut repository, &mut time)
+        .get_high_risk_approval_status(task_id, 1, HighRiskCategory::ArchitectureChange)
+        .expect("status lookup for a different category");
+    assert!(!different_category.approved);
+}
+
+#[test]
+fn high_risk_approval_status_is_false_when_no_approval_has_been_recorded() {
+    let (task, history) = restored_task(TaskState::Testing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let status = TaskService::new(&mut repository, &mut time)
+        .get_high_risk_approval_status(task_id, 1, HighRiskCategory::DataMigration)
+        .expect("status lookup");
+
+    assert!(!status.approved);
+}
+
+#[test]
+fn high_risk_approval_status_propagates_a_stale_version_instead_of_reporting_false() {
+    let (task, history) = restored_task(TaskState::Testing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_high_risk_approval_status(task_id, 0, HighRiskCategory::DataMigration)
+        .expect_err("a stale expected_version must be rejected, never reported as approved: false");
+
+    assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
+}
+
+#[test]
+fn high_risk_approval_status_propagates_a_repository_failure_instead_of_reporting_false() {
+    let (task, history) = restored_task(TaskState::Testing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository {
+        fail_on: Some((
+            "get_high_risk_approval",
+            RepositoryErrorCode::InvalidPersistenceState,
+        )),
+        ..FakeRepository::default()
+    };
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .get_high_risk_approval_status(task_id, 1, HighRiskCategory::DataMigration)
+        .expect_err(
+            "a repository failure (including a corrupted persisted category) must propagate, \
+             never become approved: false",
+        );
+
+    assert_eq!(error.code(), ApplicationErrorCode::Internal);
+}
+
+#[test]
+fn approve_high_risk_operation_create_and_reuse_return_the_same_content_free_result() {
+    let (task, history) = restored_task(TaskState::Testing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let created = TaskService::new(&mut repository, &mut time)
+        .approve_high_risk_operation(ApproveHighRiskOperationRequest::new(
+            task_id,
+            1,
+            HighRiskCategory::DifficultToRecoverChange,
+            210,
+        ))
+        .expect("first call creates the approval");
+    let reused = TaskService::new(&mut repository, &mut time)
+        .approve_high_risk_operation(ApproveHighRiskOperationRequest::new(
+            task_id,
+            1,
+            HighRiskCategory::DifficultToRecoverChange,
+            999,
+        ))
+        .expect("second call reuses the existing approval");
+
+    assert_eq!(
+        created, reused,
+        "create and reuse must return the same content-free semantic result"
+    );
+    assert_eq!(
+        created.approved_at_ms, 210,
+        "the original timestamp must win"
+    );
+    assert_eq!(
+        repository.high_risk_approvals.len(),
+        1,
+        "reuse must never insert a second row"
+    );
+}
+
+#[test]
+fn approve_high_risk_operation_never_mutates_task_state_version_history_or_lease() {
+    let (task, history) = restored_task(TaskState::Testing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    let before_task = repository.tasks.get(&task_id).cloned();
+    let before_history_len = repository.transitions.get(&task_id).map(Vec::len);
+    let before_lease = repository.active_lease;
+
+    TaskService::new(&mut repository, &mut time)
+        .approve_high_risk_operation(ApproveHighRiskOperationRequest::new(
+            task_id,
+            1,
+            HighRiskCategory::SecurityPolicyChange,
+            210,
+        ))
+        .expect("approve the operation");
+
+    assert_eq!(repository.tasks.get(&task_id).cloned(), before_task);
+    assert_eq!(
+        repository.transitions.get(&task_id).map(Vec::len),
+        before_history_len
+    );
+    assert_eq!(repository.active_lease, before_lease);
+}
+
+#[test]
+fn approve_high_risk_operation_never_touches_provider_consent_manifest_or_validation_approval() {
+    let (task, history) = restored_task(TaskState::Testing, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+
+    TaskService::new(&mut repository, &mut time)
+        .approve_high_risk_operation(ApproveHighRiskOperationRequest::new(
+            task_id,
+            1,
+            HighRiskCategory::ExternalDataTransmissionAddition,
+            210,
+        ))
+        .expect("approve the operation");
+    TaskService::new(&mut repository, &mut time)
+        .get_high_risk_approval_status(
+            task_id,
+            1,
+            HighRiskCategory::ExternalDataTransmissionAddition,
+        )
+        .expect("read the status back");
+
+    assert!(
+        repository.consents.is_empty(),
+        "no provider consent must be created"
+    );
+    assert!(
+        repository.context_package_manifests.is_empty(),
+        "no Context Package manifest must be created"
+    );
+    assert!(
+        repository.validation_command_approvals.is_empty(),
+        "no validation command approval must be created"
+    );
+    assert_eq!(
+        repository.high_risk_approvals.len(),
+        1,
+        "exactly one high-risk approval must exist"
+    );
+}
+
+#[test]
+fn record_diff_approval_create_and_reuse_return_the_same_content_free_result() {
+    let (task, history) = restored_task(TaskState::AwaitingUserDiffApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+    let hash = DiffContentHash::from_digest_bytes([1u8; 32]);
+
+    let created = TaskService::new(&mut repository, &mut time)
+        .record_diff_approval(RecordDiffApprovalRequest::new(task_id, 1, hash, 210))
+        .expect("first call creates the approval");
+    let reused = TaskService::new(&mut repository, &mut time)
+        .record_diff_approval(RecordDiffApprovalRequest::new(task_id, 1, hash, 999))
+        .expect("second call reuses the existing approval");
+
+    assert_eq!(
+        created, reused,
+        "create and reuse must return the same content-free semantic result"
+    );
+    assert_eq!(
+        created.approved_at_ms, 210,
+        "the original timestamp must win"
+    );
+    assert_eq!(
+        repository.diff_approvals.len(),
+        1,
+        "reuse must never insert a second row"
+    );
+}
+
+#[test]
+fn record_diff_approval_rejects_a_stale_version_without_writing_anything() {
+    let (task, history) = restored_task(TaskState::AwaitingUserDiffApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+    let hash = DiffContentHash::from_digest_bytes([2u8; 32]);
+
+    let error = TaskService::new(&mut repository, &mut time)
+        .record_diff_approval(RecordDiffApprovalRequest::new(task_id, 0, hash, 210))
+        .expect_err("a stale expected_version must be rejected");
+
+    assert_eq!(error.code(), ApplicationErrorCode::VersionConflict);
+    assert!(repository.diff_approvals.is_empty());
+}
+
+#[test]
+fn record_diff_approval_never_mutates_task_state_version_history_or_lease() {
+    let (task, history) = restored_task(TaskState::AwaitingUserDiffApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+    let hash = DiffContentHash::from_digest_bytes([3u8; 32]);
+
+    let before_task = repository.tasks.get(&task_id).cloned();
+    let before_history_len = repository.transitions.get(&task_id).map(Vec::len);
+    let before_lease = repository.active_lease;
+
+    TaskService::new(&mut repository, &mut time)
+        .record_diff_approval(RecordDiffApprovalRequest::new(task_id, 1, hash, 210))
+        .expect("record the approval");
+
+    assert_eq!(repository.tasks.get(&task_id).cloned(), before_task);
+    assert_eq!(
+        repository.transitions.get(&task_id).map(Vec::len),
+        before_history_len
+    );
+    assert_eq!(repository.active_lease, before_lease);
+    assert_eq!(
+        before_task.map(|task| task.state()),
+        Some(TaskState::AwaitingUserDiffApproval),
+        "recording a diff approval must never transition out of AwaitingUserDiffApproval, \
+         and must never reach Merging or Completed"
+    );
+}
+
+#[test]
+fn record_diff_approval_never_touches_provider_consent_manifest_or_high_risk_approval() {
+    let (task, history) = restored_task(TaskState::AwaitingUserDiffApproval, 1, 10, None);
+    let task_id = task.id();
+    let mut repository = FakeRepository::default();
+    repository.seed_task(task, history);
+    let mut time = FakeTime::at(20);
+    let hash = DiffContentHash::from_digest_bytes([4u8; 32]);
+
+    TaskService::new(&mut repository, &mut time)
+        .record_diff_approval(RecordDiffApprovalRequest::new(task_id, 1, hash, 210))
+        .expect("record the approval");
+
+    assert!(
+        repository.consents.is_empty(),
+        "no provider consent must be created"
+    );
+    assert!(
+        repository.context_package_manifests.is_empty(),
+        "no Context Package manifest must be created"
+    );
+    assert!(
+        repository.high_risk_approvals.is_empty(),
+        "no high-risk approval must be created"
+    );
+    assert_eq!(
+        repository.diff_approvals.len(),
+        1,
+        "exactly one diff approval must exist"
+    );
+}
+
+#[test]
+fn reconcile_startup_merge_recovers_merging_and_post_merge_testing() {
+    for state in [TaskState::Merging, TaskState::PostMergeTesting] {
+        let (task, history) = restored_task(state, 4, 20, None);
+        let task_id = task.id();
+        let mut repository = FakeRepository::default();
+        repository.seed_task(task, history);
+        let mut time = FakeTime::at(30);
+
+        let view = TaskService::new(&mut repository, &mut time)
+            .reconcile_startup_merge()
+            .expect("startup reconciliation succeeds")
+            .expect("active merge work is recovered");
+
+        assert_eq!(view.state, TaskState::RecoveryRequired);
+        assert_eq!(view.version, 5);
+        assert_eq!(
+            repository.tasks[&task_id].state(),
+            TaskState::RecoveryRequired
+        );
+        assert!(repository.active_lease.is_some());
+    }
 }

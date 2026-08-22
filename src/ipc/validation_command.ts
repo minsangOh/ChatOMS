@@ -2,6 +2,7 @@ import { isRecord } from "./errors";
 import type {
   ApproveValidationCommandResultDto,
   CancelTestingDto,
+  ProjectRootValidationApprovalStatusDto,
   ValidationCommandApprovalStatusDto,
   ValidationCommandCandidateDto,
   ValidationCommandKind,
@@ -17,6 +18,7 @@ const VALIDATION_COMMAND_KINDS: readonly ValidationCommandKind[] = [
 const CANDIDATE_KEYS = ["kind", "label"] as const;
 const APPROVAL_STATUS_KEYS = ["approvedKinds"] as const;
 const APPROVE_RESULT_KEYS = ["approvedKinds"] as const;
+const PROJECT_ROOT_APPROVAL_STATUS_KEYS = ["testApproved", "buildApproved"] as const;
 const CANCEL_TESTING_KEYS = ["requested"] as const;
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -64,6 +66,17 @@ export function isApproveValidationCommandResultDto(
     isRecord(value) &&
     hasExactKeys(value, APPROVE_RESULT_KEYS) &&
     isValidationCommandKindArray(value.approvedKinds)
+  );
+}
+
+export function isProjectRootValidationApprovalStatusDto(
+  value: unknown,
+): value is ProjectRootValidationApprovalStatusDto {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, PROJECT_ROOT_APPROVAL_STATUS_KEYS) &&
+    typeof value.testApproved === "boolean" &&
+    typeof value.buildApproved === "boolean"
   );
 }
 

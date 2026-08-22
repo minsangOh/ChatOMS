@@ -9,7 +9,7 @@ use chatoms_application::{
         ImplementationExecutionStarter,
     },
 };
-use chatoms_domain::{GitOperationId, ProjectId, TaskId, TaskState, WorkKind};
+use chatoms_domain::{ContextDataScope, GitOperationId, ProjectId, TaskId, TaskState, WorkKind};
 use chatoms_ports::{
     error::{FailureCategory, PortFailure},
     implementation::{
@@ -309,7 +309,13 @@ fn begin_rejects_missing_isolation_record_with_no_state_change() {
     assert!(repository.last_saved.is_none());
     assert!(
         repository
-            .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Implementation, 3)
+            .get_provider_consent(
+                task_id,
+                ProviderKind::Claude,
+                WorkKind::Implementation,
+                3,
+                ContextDataScope::LegacyPhase4
+            )
             .expect("consent lookup")
             .is_none(),
         "no consent may be recorded when required evidence is missing"
@@ -666,7 +672,13 @@ fn begin_then_run_and_record_connects_consent_state_adapter_and_result_end_to_en
     assert_eq!(inputs.task.state, TaskState::Implementing);
 
     let consent = repository
-        .get_provider_consent(task_id, ProviderKind::Claude, WorkKind::Implementation, 3)
+        .get_provider_consent(
+            task_id,
+            ProviderKind::Claude,
+            WorkKind::Implementation,
+            3,
+            ContextDataScope::LegacyPhase4,
+        )
         .expect("consent lookup")
         .expect("consent recorded exactly once by begin");
     assert_eq!(consent.approved_task_version, 3);

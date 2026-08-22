@@ -18,20 +18,27 @@ use std::sync::{Arc, Mutex};
 
 use chatoms_app_lib::state::RepositoryHandle;
 use chatoms_domain::{
-    ActorKind, ProjectId, ReasonCode, Task, TaskId, TaskState, TaskStateTransition,
-    TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind, WorkKind,
+    ActorKind, ContextDataScope, HighRiskCategory, ProjectId, ReasonCode, Task, TaskId, TaskState,
+    TaskStateTransition, TaskStateTransitionId, TaskStateTransitionSnapshot, ValidationCommandKind,
+    ValidationExecutionScope, WorkKind,
 };
 use chatoms_infrastructure::bootstrap::{DatabaseBootstrapAdapter, SharedDatabase};
 use chatoms_ports::{
     DatabaseBootstrapPort, DatabaseBootstrapState,
+    diff::DiffContentHash,
     git::RepositoryKind,
+    manual_merge_resolution::ManualResolutionDigest,
     path::ResolvedAppPaths,
     provider::ProviderKind,
     repository::{
-        AppProfileRecord, FoundationRepository, ImplementationResultOutcome, PlanningResultOutcome,
-        ProjectFilesystemIdentityRecord, ProjectRecord, ProviderBindingRecord, ProviderConsent,
-        ReviewResultOutcome, TaskImplementationResultRecord, TaskPlanningResultRecord,
-        TaskReviewResultRecord, ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
+        AppProfileRecord, ContextPackageManifestRecord, ContextPackagePreparation,
+        DiffApprovalRecord, FoundationRepository, GitIsolationStatus, HighRiskApprovalRecord,
+        ImplementationResultOutcome, ManualMergeResolutionConfirmationRecord,
+        MergeAbortApprovalRecord, PlanningResultOutcome, PostMergeValidationResultAttempt,
+        PostMergeValidationResultOutcome, ProjectFilesystemIdentityRecord, ProjectRecord,
+        ProviderBindingRecord, ProviderConsent, ReviewResultOutcome, TaskGitIsolation,
+        TaskImplementationResultRecord, TaskPlanningResultRecord, TaskReviewResultRecord,
+        ValidationCommandApprovalRecord, ValidationCommandResultAttempt,
         ValidationCommandResultOutcome,
     },
 };
@@ -246,6 +253,7 @@ fn planning_consent_and_transition_delegation_reaches_real_sqlite_through_both_w
             ProviderKind::Claude,
             WorkKind::Planning,
             task.version(),
+            ContextDataScope::LegacyPhase4,
         )
         .expect(
             "get_provider_consent must reach the real repository, not the trait's \
@@ -258,6 +266,7 @@ fn planning_consent_and_transition_delegation_reaches_real_sqlite_through_both_w
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Planning,
         approved_task_version: task.version(),
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 135,
     };
     let expected_version = task.version();
@@ -283,6 +292,7 @@ fn planning_consent_and_transition_delegation_reaches_real_sqlite_through_both_w
             ProviderKind::Claude,
             WorkKind::Planning,
             consent.approved_task_version,
+            ContextDataScope::LegacyPhase4,
         )
         .expect("get_provider_consent after save must reach the real repository")
         .expect("the consent just saved must be persisted and readable back");
@@ -320,6 +330,7 @@ fn implementation_consent_and_transition_delegation_reaches_real_sqlite_through_
             ProviderKind::Claude,
             WorkKind::Implementation,
             task.version(),
+            ContextDataScope::LegacyPhase4,
         )
         .expect(
             "get_provider_consent must reach the real repository, not the trait's \
@@ -332,6 +343,7 @@ fn implementation_consent_and_transition_delegation_reaches_real_sqlite_through_
         provider: ProviderKind::Claude,
         work_kind: WorkKind::Implementation,
         approved_task_version: task.version(),
+        data_scope: ContextDataScope::LegacyPhase4,
         consented_at_ms: 155,
     };
     let expected_version = task.version();
@@ -357,6 +369,7 @@ fn implementation_consent_and_transition_delegation_reaches_real_sqlite_through_
             ProviderKind::Claude,
             WorkKind::Implementation,
             consent.approved_task_version,
+            ContextDataScope::LegacyPhase4,
         )
         .expect("get_provider_consent after save must reach the real repository")
         .expect("the consent just saved must be persisted and readable back");
@@ -397,6 +410,7 @@ fn review_consent_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
             ProviderKind::Claude,
             WorkKind::Review,
             expected_version,
+            ContextDataScope::LegacyPhase4,
         )
         .expect(
             "get_provider_consent must reach the real repository, not the trait's \
@@ -405,7 +419,12 @@ fn review_consent_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
     assert_eq!(none_yet, None, "no consent has been recorded yet");
 
     let consent = repository
-        .save_review_consent(expected_version, task.id(), 185)
+        .save_review_consent(
+            expected_version,
+            task.id(),
+            ContextDataScope::LegacyPhase4,
+            185,
+        )
         .expect(
             "save_review_consent must reach the real repository, not the trait's \
              OperationFailed default",
@@ -426,17 +445,283 @@ fn review_consent_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
             ProviderKind::Claude,
             WorkKind::Review,
             expected_version,
+            ContextDataScope::LegacyPhase4,
         )
         .expect("get_provider_consent after save must reach the real repository")
         .expect("the consent just saved must be persisted and readable back");
     assert_eq!(reloaded, consent);
 
     let reused = repository
-        .save_review_consent(expected_version, task.id(), 999)
+        .save_review_consent(
+            expected_version,
+            task.id(),
+            ContextDataScope::LegacyPhase4,
+            999,
+        )
         .expect("a second call must reuse the existing consent, not fail");
     assert_eq!(
         reused, consent,
         "reusing an existing same-version consent must return it unchanged"
+    );
+}
+
+#[test]
+fn context_package_manifest_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("context-package-manifest");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+    advance(&mut repository, &mut task, TaskState::Reviewing, 180);
+    let expected_version = task.version();
+
+    let consent = repository
+        .save_review_consent(
+            expected_version,
+            task.id(),
+            ContextDataScope::ContextPackageV1,
+            185,
+        )
+        .expect("save_review_consent must reach the real repository");
+
+    assert_eq!(
+        repository
+            .get_context_package_manifest(
+                task.id(),
+                ProviderKind::Claude,
+                WorkKind::Review,
+                expected_version,
+                ContextDataScope::ContextPackageV1,
+            )
+            .expect(
+                "get_context_package_manifest must reach the real repository, not the trait's \
+                 OperationFailed default"
+            ),
+        None,
+        "no manifest has been recorded yet"
+    );
+
+    let manifest = ContextPackageManifestRecord {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Review,
+        approved_task_version: consent.approved_task_version,
+        data_scope: ContextDataScope::ContextPackageV1,
+        created_at_ms: 190,
+    };
+    repository.save_context_package_manifest(&manifest).expect(
+        "save_context_package_manifest must reach the real repository, not the trait's \
+             OperationFailed default",
+    );
+
+    let reloaded = repository
+        .get_context_package_manifest(
+            task.id(),
+            ProviderKind::Claude,
+            WorkKind::Review,
+            expected_version,
+            ContextDataScope::ContextPackageV1,
+        )
+        .expect("get_context_package_manifest after save must reach the real repository")
+        .expect("the manifest just saved must be persisted and readable back");
+    assert_eq!(reloaded, manifest);
+}
+
+#[test]
+fn high_risk_approval_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("high-risk-approval");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    let expected_version = task.version();
+
+    assert_eq!(
+        repository
+            .get_high_risk_approval(task.id(), expected_version, HighRiskCategory::DataMigration,)
+            .expect(
+                "get_high_risk_approval must reach the real repository, not the trait's \
+                 OperationFailed default"
+            ),
+        None,
+        "no approval has been recorded yet"
+    );
+
+    let approval = HighRiskApprovalRecord {
+        task_id: task.id(),
+        approved_task_version: expected_version,
+        risk_category: HighRiskCategory::DataMigration,
+        approved_at_ms: 210,
+    };
+    repository.save_high_risk_approval(&approval).expect(
+        "save_high_risk_approval must reach the real repository, not the trait's \
+         OperationFailed default",
+    );
+
+    let reloaded = repository
+        .get_high_risk_approval(task.id(), expected_version, HighRiskCategory::DataMigration)
+        .expect("get_high_risk_approval after save must reach the real repository")
+        .expect("the approval just saved must be persisted and readable back");
+    assert_eq!(reloaded, approval);
+}
+
+#[test]
+fn ensure_high_risk_approval_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("ensure-high-risk-approval");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    let expected_version = task.version();
+
+    let created = repository
+        .ensure_high_risk_approval(
+            task.id(),
+            expected_version,
+            HighRiskCategory::ArchitectureChange,
+            210,
+        )
+        .expect(
+            "ensure_high_risk_approval must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(
+        created,
+        HighRiskApprovalRecord {
+            task_id: task.id(),
+            approved_task_version: expected_version,
+            risk_category: HighRiskCategory::ArchitectureChange,
+            approved_at_ms: 210,
+        }
+    );
+
+    let reused = repository
+        .ensure_high_risk_approval(
+            task.id(),
+            expected_version,
+            HighRiskCategory::ArchitectureChange,
+            999,
+        )
+        .expect("a second call through both wrapper layers must reuse, not fail or overwrite");
+    assert_eq!(
+        reused, created,
+        "reuse through the real wrapper chain must return the original persisted approval"
+    );
+}
+
+#[test]
+fn diff_approval_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("diff-approval");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    let expected_version = task.version();
+    let hash = DiffContentHash::from_digest_bytes([11u8; 32]);
+
+    assert_eq!(
+        repository
+            .get_diff_approval(task.id(), expected_version, hash)
+            .expect(
+                "get_diff_approval must reach the real repository, not the trait's \
+                 OperationFailed default"
+            ),
+        None,
+        "no approval has been recorded yet"
+    );
+
+    let approval = DiffApprovalRecord {
+        task_id: task.id(),
+        approved_task_version: expected_version,
+        diff_content_hash: hash,
+        approved_at_ms: 210,
+    };
+    repository.save_diff_approval(&approval).expect(
+        "save_diff_approval must reach the real repository, not the trait's OperationFailed \
+         default",
+    );
+
+    let reloaded = repository
+        .get_diff_approval(task.id(), expected_version, hash)
+        .expect("get_diff_approval after save must reach the real repository")
+        .expect("the approval just saved must be persisted and readable back");
+    assert_eq!(reloaded, approval);
+}
+
+#[test]
+fn ensure_diff_approval_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("ensure-diff-approval");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    let expected_version = task.version();
+    let hash = DiffContentHash::from_digest_bytes([22u8; 32]);
+
+    let created = repository
+        .ensure_diff_approval(task.id(), expected_version, hash, 210)
+        .expect(
+            "ensure_diff_approval must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(
+        created,
+        DiffApprovalRecord {
+            task_id: task.id(),
+            approved_task_version: expected_version,
+            diff_content_hash: hash,
+            approved_at_ms: 210,
+        }
+    );
+
+    let reused = repository
+        .ensure_diff_approval(task.id(), expected_version, hash, 999)
+        .expect("a second call through both wrapper layers must reuse, not fail or overwrite");
+    assert_eq!(
+        reused, created,
+        "reuse through the real wrapper chain must return the original persisted approval"
     );
 }
 
@@ -669,6 +954,11 @@ fn validation_command_approval_delegation_reaches_real_sqlite_through_both_wrapp
     );
 
     let approval = ValidationCommandApprovalRecord {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        target_project_id: None,
+        target_project_identity_revision: None,
+        target_root_volume_serial_hex: None,
+        target_root_file_id_hex: None,
         task_id: task.id(),
         approved_task_version: task.version(),
         kind: ValidationCommandKind::Test,
@@ -698,7 +988,15 @@ fn validation_command_approval_delegation_reaches_real_sqlite_through_both_wrapp
     let stored = repository
         .list_validation_command_approvals(task.id(), task.version())
         .expect("list_validation_command_approvals after save must reach the real repository");
-    assert_eq!(stored, vec![approval]);
+    assert_eq!(stored, vec![approval.clone()]);
+    let scoped = repository
+        .list_validation_command_approvals_for_scope(
+            task.id(),
+            task.version(),
+            chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        )
+        .expect("scoped approval lookup must reach the real repository");
+    assert_eq!(scoped, vec![approval]);
 }
 
 #[test]
@@ -739,6 +1037,11 @@ fn validation_command_result_delegation_reaches_real_sqlite_through_both_wrapper
     );
 
     let approval = ValidationCommandApprovalRecord {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        target_project_id: None,
+        target_project_identity_revision: None,
+        target_root_volume_serial_hex: None,
+        target_root_file_id_hex: None,
         task_id: task.id(),
         approved_task_version: task.version(),
         kind: ValidationCommandKind::Test,
@@ -763,6 +1066,7 @@ fn validation_command_result_delegation_reaches_real_sqlite_through_both_wrapper
         .expect("seed the approval this result attempt is bound to");
 
     let attempt = ValidationCommandResultAttempt {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
         task_id: task.id(),
         approved_task_version: task.version(),
         kind: ValidationCommandKind::Test,
@@ -814,6 +1118,11 @@ fn finalize_validation_command_batch_delegation_reaches_real_sqlite_through_both
     let expected_version = task.version();
 
     let approval = ValidationCommandApprovalRecord {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
+        target_project_id: None,
+        target_project_identity_revision: None,
+        target_root_volume_serial_hex: None,
+        target_root_file_id_hex: None,
         task_id: task.id(),
         approved_task_version: expected_version,
         kind: ValidationCommandKind::Test,
@@ -838,6 +1147,7 @@ fn finalize_validation_command_batch_delegation_reaches_real_sqlite_through_both
         .expect("seed the approval this final result attempt is bound to");
 
     let attempt = ValidationCommandResultAttempt {
+        execution_scope: chatoms_domain::ValidationExecutionScope::TaskWorktree,
         task_id: task.id(),
         approved_task_version: expected_version,
         kind: ValidationCommandKind::Test,
@@ -876,5 +1186,635 @@ fn finalize_validation_command_batch_delegation_reaches_real_sqlite_through_both
             .map(|lease| lease.task_id),
         Some(task.id()),
         "Reviewing is not terminal and must keep the lease"
+    );
+}
+
+/// Advances a freshly created task through the real Git isolation state
+/// machine to `WorktreeReady` (task state *and* a real `task_git_isolations`
+/// row at the matching status), mirroring
+/// `chatoms-infrastructure/tests/repository_transactions.rs`'s identically
+/// named helper. `advance` (used by every other test in this file) only
+/// bumps the task's own state via a plain `save_transition` and never
+/// creates an isolation row, which `prepare_planning_context_package`
+/// requires.
+fn worktree_ready_task_with_real_isolation(
+    repository: &mut RepositoryHandle,
+    project_id: ProjectId,
+) -> Task {
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    task.transition_to(TaskState::ProjectValidated, 101)
+        .expect("classify project");
+    let classified = transition_record(&task, TaskState::Created, 101);
+    let mut isolation = TaskGitIsolation {
+        task_id: task.id(),
+        project_id,
+        status: GitIsolationStatus::Ready,
+        operation_id: None,
+        expected_task_version: 1,
+        base_branch: None,
+        base_commit: None,
+        worktree_path: None,
+        branch_created_by_app: false,
+        worktree_created_by_app: false,
+        created_at_ms: 100,
+        updated_at_ms: 101,
+    };
+    repository
+        .create_isolation_task(&task, &initial, &classified, 100, &isolation, None)
+        .expect("create isolation task through both wrapper layers");
+
+    let previous = task.state();
+    task.transition_to(TaskState::WorktreeCreating, 102)
+        .expect("worktree intent state");
+    let worktree_transition = transition_record(&task, previous, 102);
+    isolation.status = GitIsolationStatus::WorktreeCreating;
+    isolation.operation_id = Some(chatoms_domain::GitOperationId::new());
+    isolation.expected_task_version = task.version();
+    isolation.base_branch = Some("main".to_owned());
+    isolation.base_commit = Some("a".repeat(40));
+    isolation.worktree_path = Some("C:/managed/project/task".to_owned());
+    isolation.updated_at_ms = 102;
+    repository
+        .save_isolation_transition(1, &task, &worktree_transition, &isolation)
+        .expect("worktree creating transition through both wrapper layers");
+
+    let previous = task.state();
+    task.transition_to(TaskState::WorktreeReady, 103)
+        .expect("worktree ready state");
+    let ready_transition = transition_record(&task, previous, 103);
+    isolation.status = GitIsolationStatus::WorktreeReady;
+    isolation.expected_task_version = task.version();
+    isolation.branch_created_by_app = true;
+    isolation.worktree_created_by_app = true;
+    isolation.updated_at_ms = 103;
+    repository
+        .save_worktree_completion(2, &task, &ready_transition, &isolation)
+        .expect("worktree ready completion through both wrapper layers");
+
+    task
+}
+
+#[test]
+fn planning_context_package_preparation_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+{
+    let (_dir, mut repository) = real_repository_handle("prepare-planning-context-package");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+    let task = worktree_ready_task_with_real_isolation(&mut repository, project_id);
+
+    let first: ContextPackagePreparation = repository
+        .prepare_planning_context_package(task.version(), task.id(), 200)
+        .expect(
+            "prepare_planning_context_package must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(first.consent.work_kind, WorkKind::Planning);
+    assert_eq!(first.consent.data_scope, ContextDataScope::ContextPackageV1);
+    assert_eq!(first.manifest.work_kind, WorkKind::Planning);
+
+    let second = repository
+        .prepare_planning_context_package(task.version(), task.id(), 999)
+        .expect("a second call must reuse the existing pair, not fail");
+    assert_eq!(
+        second, first,
+        "reusing an existing pair must return it unchanged"
+    );
+
+    let unchanged = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task exists");
+    assert_eq!(unchanged.state(), TaskState::WorktreeReady);
+    assert_eq!(unchanged.version(), task.version());
+}
+
+#[test]
+fn context_package_planning_transition_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+{
+    let (_dir, mut repository) = real_repository_handle("save-context-package-planning-transition");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+    let mut task = worktree_ready_task_with_real_isolation(&mut repository, project_id);
+    let expected_version = task.version();
+    repository
+        .prepare_planning_context_package(expected_version, task.id(), 200)
+        .expect("prepare the exact ContextPackageV1 pair first");
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Planning, 210)
+        .expect("WorktreeReady -> Planning");
+    let record = transition_record(&task, previous_state, 210);
+
+    repository
+        .save_context_package_planning_transition(expected_version, &task, &record)
+        .expect(
+            "save_context_package_planning_transition must reach the real repository, not the \
+             trait's OperationFailed default",
+        );
+
+    let reloaded = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task exists");
+    assert_eq!(reloaded.state(), TaskState::Planning);
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active_lease through both wrapper layers")
+            .map(|lease| lease.task_id),
+        Some(task.id()),
+        "Planning is not terminal and must keep the lease"
+    );
+}
+
+#[test]
+fn context_package_implementation_transition_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+ {
+    let (_dir, mut repository) =
+        real_repository_handle("save-context-package-implementation-transition");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+    let mut task = worktree_ready_task_with_real_isolation(&mut repository, project_id);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+
+    let plan_expected_version = task.version();
+    let previous_state = task.state();
+    task.transition_to(TaskState::AwaitingDesignApproval, 150)
+        .expect("Planning -> AwaitingDesignApproval");
+    let plan_transition = transition_record(&task, previous_state, 150);
+    let plan_result = TaskPlanningResultRecord {
+        task_id: task.id(),
+        provider: ProviderKind::Claude,
+        work_kind: WorkKind::Planning,
+        outcome: PlanningResultOutcome::Completed,
+        exit_code: Some(0),
+        turn_count: Some(3),
+        started_at_ms: 135,
+        completed_at_ms: 150,
+        plan_text: Some("masked plan text".to_owned()),
+    };
+    repository
+        .save_planning_result(
+            plan_expected_version,
+            &task,
+            &plan_transition,
+            &plan_result,
+            false,
+        )
+        .expect("save_planning_result must reach the real repository");
+
+    let expected_version = task.version();
+    repository
+        .prepare_implementation_context_package(expected_version, task.id(), 200)
+        .expect("prepare the exact ContextPackageV1 pair first");
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Implementing, 210)
+        .expect("AwaitingDesignApproval -> Implementing");
+    let record = transition_record(&task, previous_state, 210);
+
+    repository
+        .save_context_package_implementation_transition(expected_version, &task, &record)
+        .expect(
+            "save_context_package_implementation_transition must reach the real repository, not \
+             the trait's OperationFailed default",
+        );
+
+    let reloaded = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task exists");
+    assert_eq!(reloaded.state(), TaskState::Implementing);
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active_lease through both wrapper layers")
+            .map(|lease| lease.task_id),
+        Some(task.id()),
+        "Implementing is not terminal and must keep the lease"
+    );
+}
+
+#[test]
+fn implementation_context_package_preparation_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+ {
+    let (_dir, mut repository) = real_repository_handle("prepare-implementation-context-package");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+
+    let first: ContextPackagePreparation = repository
+        .prepare_implementation_context_package(task.version(), task.id(), 200)
+        .expect(
+            "prepare_implementation_context_package must reach the real repository, not the \
+             trait's OperationFailed default",
+        );
+    assert_eq!(first.consent.work_kind, WorkKind::Implementation);
+    assert_eq!(first.consent.data_scope, ContextDataScope::ContextPackageV1);
+
+    let second = repository
+        .prepare_implementation_context_package(task.version(), task.id(), 999)
+        .expect("a second call must reuse the existing pair, not fail");
+    assert_eq!(
+        second, first,
+        "reusing an existing pair must return it unchanged"
+    );
+}
+
+#[test]
+fn review_context_package_preparation_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("prepare-review-context-package");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+    advance(&mut repository, &mut task, TaskState::Reviewing, 180);
+
+    let first: ContextPackagePreparation = repository
+        .prepare_review_context_package(task.version(), task.id(), 200)
+        .expect(
+            "prepare_review_context_package must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(first.consent.work_kind, WorkKind::Review);
+    assert_eq!(first.consent.data_scope, ContextDataScope::ContextPackageV1);
+
+    let second = repository
+        .prepare_review_context_package(task.version(), task.id(), 999)
+        .expect("a second call must reuse the existing pair, not fail");
+    assert_eq!(
+        second, first,
+        "reusing an existing pair must return it unchanged"
+    );
+}
+
+#[test]
+fn post_merge_validation_delegation_reaches_real_sqlite_through_both_wrapper_layers() {
+    let (_dir, mut repository) = real_repository_handle("post-merge-validation");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance(&mut repository, &mut task, TaskState::ProjectValidated, 110);
+    advance(&mut repository, &mut task, TaskState::WorktreeCreating, 120);
+    advance(&mut repository, &mut task, TaskState::WorktreeReady, 130);
+    advance(&mut repository, &mut task, TaskState::Planning, 140);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingDesignApproval,
+        150,
+    );
+    advance(&mut repository, &mut task, TaskState::Implementing, 160);
+    advance(&mut repository, &mut task, TaskState::Testing, 170);
+    advance(&mut repository, &mut task, TaskState::Reviewing, 180);
+    advance(
+        &mut repository,
+        &mut task,
+        TaskState::AwaitingUserDiffApproval,
+        190,
+    );
+
+    let approval_task_version = task.version();
+    repository
+        .save_validation_command_approval(&ValidationCommandApprovalRecord {
+            task_id: task.id(),
+            approved_task_version: approval_task_version,
+            execution_scope: ValidationExecutionScope::ProjectRoot,
+            kind: ValidationCommandKind::Test,
+            executable: "cargo".to_owned(),
+            arguments: vec!["test".to_owned(), "--workspace".to_owned()],
+            approved_executable_path: "C:/tools/cargo/bin/cargo.exe".to_owned(),
+            executable_volume_serial_hex: "0000000000000002".to_owned(),
+            executable_file_id_hex: "00000000000000000000000000000002".to_owned(),
+            tool_directory_path: "C:/tools/cargo/bin".to_owned(),
+            tool_directory_volume_serial_hex: "0000000000000001".to_owned(),
+            tool_directory_file_id_hex: "00000000000000000000000000000001".to_owned(),
+            approved_cargo_home_path: None,
+            cargo_home_volume_serial_hex: None,
+            cargo_home_file_id_hex: None,
+            approved_rustup_home_path: None,
+            rustup_home_volume_serial_hex: None,
+            rustup_home_file_id_hex: None,
+            target_project_id: Some(project_id),
+            target_project_identity_revision: Some(1),
+            target_root_volume_serial_hex: Some("0000000000000001".to_owned()),
+            target_root_file_id_hex: Some("00000000000000000000000000000001".to_owned()),
+            approved_at_ms: 195,
+        })
+        .expect("save ProjectRoot approval through both wrapper layers");
+
+    advance(&mut repository, &mut task, TaskState::Merging, 200);
+    advance(&mut repository, &mut task, TaskState::PostMergeTesting, 210);
+    let post_merge_task_version = task.version();
+    let attempt = PostMergeValidationResultAttempt {
+        task_id: task.id(),
+        approval_task_version,
+        post_merge_task_version,
+        execution_scope: ValidationExecutionScope::ProjectRoot,
+        kind: ValidationCommandKind::Test,
+        outcome: PostMergeValidationResultOutcome::Success,
+        exit_code: Some(0),
+        safe_summary: "approved post-merge test passed".to_owned(),
+        started_at_ms: 220,
+        completed_at_ms: 230,
+    };
+    let appended = repository
+        .append_post_merge_validation_result(&attempt)
+        .expect("append_post_merge_validation_result must reach the real repository");
+    assert_eq!(appended.attempt_sequence, 1);
+    assert_eq!(
+        repository
+            .list_post_merge_validation_results(
+                task.id(),
+                approval_task_version,
+                post_merge_task_version,
+                ValidationCommandKind::Test,
+            )
+            .expect("list_post_merge_validation_results must reach the real repository"),
+        vec![appended],
+    );
+
+    let expected_version = task.version();
+    let previous_state = task.state();
+    task.transition_to(TaskState::Completed, 240)
+        .expect("PostMergeTesting -> Completed");
+    let transition = transition_record(&task, previous_state, 240);
+    repository
+        .finalize_post_merge_validation_batch(expected_version, &task, &transition, &attempt)
+        .expect("finalize_post_merge_validation_batch must reach the real repository");
+
+    let reloaded = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task exists");
+    assert_eq!(reloaded.state(), TaskState::Completed);
+    assert_eq!(
+        repository
+            .list_post_merge_validation_results(
+                task.id(),
+                approval_task_version,
+                post_merge_task_version,
+                ValidationCommandKind::Test,
+            )
+            .expect("final post-merge result must be readable through both wrappers")
+            .len(),
+        2,
+    );
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active_lease through both wrapper layers"),
+        None,
+        "Completed must release the active lease"
+    );
+}
+
+/// Advances `task` from `Created` all the way to `MergeConflict` via plain
+/// `save_transition` calls (mirroring `advance`'s "only the stored state
+/// matters" reasoning) -- neither `ensure_manual_merge_resolution_confirmation`/
+/// `save_manual_merge_resolution_transition` nor
+/// `ensure_merge_abort_approval`/`save_merge_abort_transition` need a real
+/// Git isolation record, only the task's current state and version.
+fn advance_to_merge_conflict(repository: &mut RepositoryHandle, task: &mut Task) {
+    advance(repository, task, TaskState::ProjectValidated, 110);
+    advance(repository, task, TaskState::WorktreeCreating, 120);
+    advance(repository, task, TaskState::WorktreeReady, 130);
+    advance(repository, task, TaskState::Planning, 140);
+    advance(repository, task, TaskState::AwaitingDesignApproval, 150);
+    advance(repository, task, TaskState::Implementing, 160);
+    advance(repository, task, TaskState::Testing, 170);
+    advance(repository, task, TaskState::Reviewing, 180);
+    advance(repository, task, TaskState::AwaitingUserDiffApproval, 190);
+    advance(repository, task, TaskState::Merging, 200);
+    advance(repository, task, TaskState::MergeConflict, 210);
+}
+
+#[test]
+fn manual_merge_resolution_confirmation_and_transition_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+ {
+    // Regression test for a delegation gap this Unit found: `RepositoryHandle`
+    // (src-tauri/src/state.rs) had no `with_inner` overrides at all for
+    // `get_manual_merge_resolution_confirmation`,
+    // `ensure_manual_merge_resolution_confirmation`, or
+    // `save_manual_merge_resolution_transition` -- every call silently fell
+    // through to the `FoundationRepository` trait's `OperationFailed`
+    // default instead of ever reaching `SharedFoundationRepository`, the
+    // same class of bug this file's module doc describes for provider
+    // binding and Claude Planning.
+    let (_dir, mut repository) = real_repository_handle("manual-merge-resolution");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+    let digest = ManualResolutionDigest::from_digest_bytes([33u8; 32]);
+
+    assert_eq!(
+        repository
+            .get_manual_merge_resolution_confirmation(task.id(), expected_version, digest)
+            .expect(
+                "get_manual_merge_resolution_confirmation must reach the real repository, not \
+                 the trait's OperationFailed default"
+            ),
+        None,
+        "no confirmation has been recorded yet"
+    );
+
+    let created = repository
+        .ensure_manual_merge_resolution_confirmation(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            digest,
+            300,
+        )
+        .expect(
+            "ensure_manual_merge_resolution_confirmation must reach the real repository, not \
+             the trait's OperationFailed default",
+        );
+    assert_eq!(
+        created,
+        ManualMergeResolutionConfirmationRecord {
+            task_id: task.id(),
+            merge_conflict_task_version: expected_version,
+            source_approval_task_version: 0,
+            base_commit: "a".repeat(40),
+            task_commit: "b".repeat(40),
+            merge_head_commit: "b".repeat(40),
+            resolution_digest: digest,
+            confirmed_at_ms: 300,
+        }
+    );
+
+    let reloaded = repository
+        .get_manual_merge_resolution_confirmation(task.id(), expected_version, digest)
+        .expect(
+            "get_manual_merge_resolution_confirmation after ensure must reach the real repository",
+        )
+        .expect("the confirmation just created must be persisted and readable back");
+    assert_eq!(reloaded, created);
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Merging, 310)
+        .expect("MergeConflict -> Merging is a valid domain transition");
+    let record = transition_record(&task, previous_state, 310);
+    repository
+        .save_manual_merge_resolution_transition(expected_version, &task, &record, digest)
+        .expect(
+            "save_manual_merge_resolution_transition must reach the real repository, not the \
+             trait's OperationFailed default",
+        );
+
+    let persisted = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task still exists");
+    assert_eq!(persisted.state(), TaskState::Merging);
+    assert_eq!(persisted.version(), expected_version + 1);
+}
+
+#[test]
+fn merge_abort_approval_and_transition_delegation_reaches_real_sqlite_through_both_wrapper_layers()
+{
+    let (_dir, mut repository) = real_repository_handle("merge-abort");
+    let project_id = ProjectId::new();
+    repository
+        .create_project_with_identity(&project_record(project_id), &confirmed_identity(project_id))
+        .expect("seed the owning project");
+
+    let mut task = Task::new(TaskId::new(), project_id, 100);
+    let initial = initial_transition(&task);
+    repository
+        .create_task(&task, &initial, 100)
+        .expect("create_task through both wrapper layers");
+    advance_to_merge_conflict(&mut repository, &mut task);
+    let expected_version = task.version();
+
+    assert_eq!(
+        repository
+            .get_merge_abort_approval(task.id(), expected_version)
+            .expect(
+                "get_merge_abort_approval must reach the real repository, not the trait's \
+                 OperationFailed default"
+            ),
+        None,
+        "no approval has been recorded yet"
+    );
+
+    let created = repository
+        .ensure_merge_abort_approval(
+            task.id(),
+            expected_version,
+            0,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"b".repeat(40),
+            300,
+        )
+        .expect(
+            "ensure_merge_abort_approval must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+    assert_eq!(
+        created,
+        MergeAbortApprovalRecord {
+            task_id: task.id(),
+            merge_conflict_task_version: expected_version,
+            source_approval_task_version: 0,
+            base_commit: "a".repeat(40),
+            task_commit: "b".repeat(40),
+            merge_head_commit: "b".repeat(40),
+            approved_at_ms: 300,
+        }
+    );
+
+    let reloaded = repository
+        .get_merge_abort_approval(task.id(), expected_version)
+        .expect("get_merge_abort_approval after ensure must reach the real repository")
+        .expect("the approval just created must be persisted and readable back");
+    assert_eq!(reloaded, created);
+
+    let previous_state = task.state();
+    task.transition_to(TaskState::Cancelled, 310)
+        .expect("MergeConflict -> Cancelled is a valid domain transition");
+    let record = transition_record(&task, previous_state, 310);
+    repository
+        .save_merge_abort_transition(expected_version, &task, &record, true)
+        .expect(
+            "save_merge_abort_transition must reach the real repository, not the trait's \
+             OperationFailed default",
+        );
+
+    let persisted = repository
+        .get_task(task.id())
+        .expect("get_task through both wrapper layers")
+        .expect("task still exists");
+    assert_eq!(persisted.state(), TaskState::Cancelled);
+    assert_eq!(persisted.version(), expected_version + 1);
+    assert_eq!(
+        repository
+            .active_lease()
+            .expect("active_lease through both wrapper layers"),
+        None,
+        "Cancelled must release the active lease"
     );
 }

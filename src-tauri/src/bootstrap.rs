@@ -41,9 +41,9 @@ use chatoms_ports::{
 
 use crate::state::{
     AppRuntime, CapabilityHandle, FilesystemIdentityHandle, GitServiceHandle,
-    ImplementationRunRegistry, ManagedRuntime, PlanningRunRegistry, ProviderCapabilityHandle,
-    RepositoryHandle, ReviewRunRegistry, RuntimePorts, RuntimeResources, TestingRunRegistry,
-    TimeProviderHandle, WorktreePathHandle,
+    ImplementationRunRegistry, ManagedRuntime, MergeAbortRunRegistry, MergeConflictWriteLock,
+    PlanningRunRegistry, ProviderCapabilityHandle, RepositoryHandle, ReviewRunRegistry,
+    RuntimePorts, RuntimeResources, TestingRunRegistry, TimeProviderHandle, WorktreePathHandle,
 };
 
 pub fn compose_runtime<S, D, L, R, T, C>(
@@ -117,6 +117,11 @@ where
                 return ManagedRuntime::unavailable(error, Some(status));
             }
             if let Err(error) =
+                TaskService::new(&mut repository, &mut time).reconcile_startup_merge()
+            {
+                return ManagedRuntime::unavailable(error, Some(status));
+            }
+            if let Err(error) =
                 TaskService::new(&mut repository, &mut time).reconcile_startup_testing()
             {
                 return ManagedRuntime::unavailable(error, Some(status));
@@ -142,6 +147,8 @@ where
                     implementation_runs: ImplementationRunRegistry::new(),
                     testing_runs: TestingRunRegistry::new(),
                     review_runs: ReviewRunRegistry::new(),
+                    merge_abort_runs: MergeAbortRunRegistry::new(),
+                    merge_conflict_writes: MergeConflictWriteLock::new(),
                 },
                 resources,
             ))
@@ -696,7 +703,7 @@ mod tests {
             calls,
             [
                 "storage", "database", "logging", "lease", "lease", "lease", "lease", "lease",
-                "lease"
+                "lease", "lease"
             ]
         );
 
@@ -717,7 +724,7 @@ mod tests {
             calls,
             [
                 "storage", "database", "logging", "lease", "lease", "lease", "lease", "lease",
-                "lease"
+                "lease", "lease"
             ]
         );
     }

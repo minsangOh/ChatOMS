@@ -70,7 +70,7 @@ fn newer_database_is_incompatible_and_failures_are_safe() {
     connection
         .execute(
             "INSERT INTO schema_migrations (version, name, checksum_sha256, applied_at_ms)
-             VALUES (16, 'future', ?1, 1)",
+             VALUES (23, 'future', ?1, 1)",
             ["0".repeat(64)],
         )
         .expect("future migration marker");

@@ -1,11 +1,19 @@
 #![doc = "Port boundary for persistence, platform, provider, Git, process, and update interfaces."]
 #![forbid(unsafe_code)]
 
+pub mod context_package_implementation;
+pub mod context_package_planning;
+pub mod context_package_review;
 pub mod diff;
 pub mod error;
 pub mod filesystem;
 pub mod git;
 pub mod implementation;
+pub mod manual_merge_resolution;
+pub mod merge_abort;
+pub mod merge_conflict_inspection;
+pub mod merge_continue;
+pub mod merge_execution;
 pub mod path;
 pub mod permissions;
 pub mod planning;

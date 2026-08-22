@@ -4,9 +4,28 @@ import type { FormEvent } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
+import { UserDiffReviewModal } from "../components/UserDiffReviewModal";
 import type { IpcClient } from "../ipc/client";
 import { FrontendError, toFrontendError } from "../ipc/errors";
-import type { ApproveValidationCommandInput, EligibilityBlockingReason, PlanningResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, ReviewResultDto, TaskBriefInput, TaskIsolationDto, ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKind } from "../ipc/types";
+import { HIGH_RISK_CATEGORIES } from "../ipc/high_risk_approval";
+import type { ApproveValidationCommandInput, EligibilityBlockingReason, HighRiskCategory, MergeConflictInspectionDto, PlanningResultDto, PostMergeValidationResultDto, ProjectCandidateDto, ProjectDto, ProjectStatusDto, ProviderEligibilityDto, ReviewResultDto, TaskBriefInput, TaskIsolationDto, ValidationCommandApprovalStatusDto, ValidationCommandCandidateDto, ValidationCommandKind } from "../ipc/types";
+
+type ContextPackagePlanningReadinessLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; ready: boolean }
+  | { kind: "error" };
+type ContextPackageImplementationReadinessLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; ready: boolean }
+  | { kind: "error" };
+type ContextPackageReviewReadinessLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; ready: boolean }
+  | { kind: "error" };
+type HighRiskApprovalLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; approved: boolean }
+  | { kind: "error" };
 
 interface ProjectsPageProps { client: IpcClient; }
 type ProjectsPageState = { kind: "loading" } | { kind: "error"; error: FrontendError } | { kind: "ready"; projects: ProjectDto[] };
@@ -18,6 +37,26 @@ type PlanningResultLoadState =
 type ReviewResultLoadState =
   | { kind: "loading" }
   | { kind: "ready"; result: ReviewResultDto | null }
+  | { kind: "error" };
+type PostMergeValidationLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; results: readonly PostMergeValidationResultDto[] }
+  | { kind: "error" };
+/**
+ * The authoritative answer to "is a merge-conflict Git write executing for
+ * this task right now", as reported by the Tauri runtime's shared
+ * `MergeConflictWriteLock`. `loading` and `error` are both treated as
+ * fail-safe: no merge action is offered until a `ready` response says the
+ * lock is free.
+ */
+type MergeConflictWriteStatusState =
+  | { kind: "loading" }
+  | { kind: "error" }
+  | { kind: "ready"; running: boolean };
+
+type MergeConflictInspectionLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; result: MergeConflictInspectionDto | null }
   | { kind: "error" };
 type ValidationCandidatesLoadState =
   | { kind: "loading" }
@@ -55,13 +94,38 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [briefError, setBriefError] = useState<string | null>(null);
   const [eligibilities, setEligibilities] = useState<Record<string, readonly ProviderEligibilityDto[]>>({});
   const [consentDialog, setConsentDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; workKind: "planning" | "implementation" | "review" } | null>(null);
+  const [contextPackagePrepDialog, setContextPackagePrepDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; workKind: "planning" | "implementation" | "review" } | null>(null);
+  const [contextPackagePreparationNotice, setContextPackagePreparationNotice] = useState<string | null>(null);
+  const [contextPackagePlanningReadiness, setContextPackagePlanningReadiness] = useState<Record<string, ContextPackagePlanningReadinessLoadState>>({});
+  const [contextPackageImplementationReadiness, setContextPackageImplementationReadiness] = useState<Record<string, ContextPackageImplementationReadinessLoadState>>({});
+  const [contextPackageReviewReadiness, setContextPackageReviewReadiness] = useState<Record<string, ContextPackageReviewReadinessLoadState>>({});
   const [planningResults, setPlanningResults] = useState<Record<string, PlanningResultLoadState>>({});
   const [reviewResults, setReviewResults] = useState<Record<string, ReviewResultLoadState>>({});
+  const [postMergeValidationResults, setPostMergeValidationResults] = useState<Record<string, PostMergeValidationLoadState>>({});
+  const [mergeConflictInspections, setMergeConflictInspections] = useState<Record<string, MergeConflictInspectionLoadState>>({});
+  const [mergeConflictWriteStatuses, setMergeConflictWriteStatuses] = useState<Record<string, MergeConflictWriteStatusState>>({});
   const [validationCandidates, setValidationCandidates] = useState<Record<string, ValidationCandidatesLoadState>>({});
   const [validationApprovals, setValidationApprovals] = useState<Record<string, ValidationApprovalLoadState>>({});
   const [validationForm, setValidationForm] = useState<ValidationCommandForm>(emptyValidationCommandForm);
   const [testingRuns, setTestingRuns] = useState<Record<string, boolean>>({});
   const [reviewRuns, setReviewRuns] = useState<Record<string, boolean>>({});
+  const [highRiskApprovals, setHighRiskApprovals] = useState<Record<string, Partial<Record<HighRiskCategory, HighRiskApprovalLoadState>>>>({});
+  const [highRiskApprovalDialog, setHighRiskApprovalDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; category: HighRiskCategory } | null>(null);
+  const [userDiffReviewDialog, setUserDiffReviewDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
+  const [mergeContinueDialog, setMergeContinueDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
+  const [mergeContinueConfirmed, setMergeContinueConfirmed] = useState(false);
+  const [mergeAbortDialog, setMergeAbortDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
+  const [mergeAbortConfirmed, setMergeAbortConfirmed] = useState(false);
+  const [mergeAbortNotice, setMergeAbortNotice] = useState<string | null>(null);
+  /**
+   * Set the moment this page successfully asks the backend to start a
+   * merge-conflict write, so a second click cannot get through before the
+   * first status poll comes back. Unlike the flag it replaces, nothing
+   * clears this on a timer: only an authoritative `running: false`, or the
+   * task leaving `mergeConflict`, does.
+   */
+  const [mergeConflictWriteStarts, setMergeConflictWriteStarts] = useState<Record<string, boolean>>({});
+  const [mergeConflictWriteNotices, setMergeConflictWriteNotices] = useState<Record<string, string>>({});
 
   useEffect(() => {
     let active = true;
@@ -104,6 +168,84 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
     ).catch(() => {});
     return () => { active = false; };
   }, [client, isolations, eligibilities]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) =>
+        isolation.taskState === "worktreeReady" &&
+        contextPackagePlanningReadiness[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setContextPackagePlanningReadiness((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getContextPackagePlanningReadiness(isolation.taskId, isolation.taskVersion);
+          if (active) setContextPackagePlanningReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "ready", ready: status.ready } }));
+        } catch {
+          if (active) setContextPackagePlanningReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, contextPackagePlanningReadiness]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) =>
+        isolation.taskState === "awaitingDesignApproval" &&
+        contextPackageImplementationReadiness[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setContextPackageImplementationReadiness((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getContextPackageImplementationReadiness(isolation.taskId, isolation.taskVersion);
+          if (active) setContextPackageImplementationReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "ready", ready: status.ready } }));
+        } catch {
+          if (active) setContextPackageImplementationReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, contextPackageImplementationReadiness]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) =>
+        isolation.taskState === "reviewing" &&
+        contextPackageReviewReadiness[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setContextPackageReviewReadiness((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getContextPackageReviewReadiness(isolation.taskId, isolation.taskVersion);
+          if (active) setContextPackageReviewReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "ready", ready: status.ready } }));
+        } catch {
+          if (active) setContextPackageReviewReadiness((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, contextPackageReviewReadiness]);
 
   useEffect(() => {
     const pending = Object.values(isolations).filter(
@@ -155,6 +297,80 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
 
   useEffect(() => {
     const pending = Object.values(isolations).filter(
+      (isolation) =>
+        (isolation.taskState === "completed" || isolation.taskState === "recoveryRequired") &&
+        postMergeValidationResults[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setPostMergeValidationResults((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const results = await client.getPostMergeValidationResults(isolation.taskId);
+          if (active) setPostMergeValidationResults((current) => ({ ...current, [isolation.taskId]: { kind: "ready", results } }));
+        } catch {
+          if (active) setPostMergeValidationResults((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, postMergeValidationResults]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) => isolation.taskState === "mergeConflict" && mergeConflictInspections[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setMergeConflictInspections((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const result = await client.getMergeConflictInspection(isolation.taskId);
+          if (active) setMergeConflictInspections((current) => ({ ...current, [isolation.taskId]: { kind: "ready", result } }));
+        } catch {
+          if (active) setMergeConflictInspections((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, mergeConflictInspections]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
+      (isolation) => isolation.taskState === "mergeConflict" && mergeConflictWriteStatuses[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setMergeConflictWriteStatuses((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getMergeConflictWriteStatus(isolation.taskId);
+          if (active) setMergeConflictWriteStatuses((current) => ({ ...current, [isolation.taskId]: { kind: "ready", running: status.running } }));
+        } catch {
+          if (active) setMergeConflictWriteStatuses((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, mergeConflictWriteStatuses]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
       (isolation) => isolation.taskState === "testing" && validationCandidates[isolation.taskId] === undefined,
     );
     if (pending.length === 0) return;
@@ -202,12 +418,63 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   }, [client, isolations, validationApprovals]);
 
   useEffect(() => {
+    const pending: { taskId: string; taskVersion: number; category: HighRiskCategory }[] = [];
+    for (const isolation of Object.values(isolations)) {
+      if (isolation.taskState !== "awaitingDesignApproval") continue;
+      const existing = highRiskApprovals[isolation.taskId];
+      for (const category of HIGH_RISK_CATEGORIES) {
+        if (existing?.[category] === undefined) {
+          pending.push({ taskId: isolation.taskId, taskVersion: isolation.taskVersion, category });
+        }
+      }
+    }
+    if (pending.length === 0) return;
+    setHighRiskApprovals((current) => {
+      const next = { ...current };
+      for (const item of pending) {
+        next[item.taskId] = { ...next[item.taskId], [item.category]: { kind: "loading" } };
+      }
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (item) => {
+        try {
+          const status = await client.getHighRiskApprovalStatus(item.taskId, item.taskVersion, item.category);
+          if (active) {
+            setHighRiskApprovals((current) => ({
+              ...current,
+              [item.taskId]: { ...current[item.taskId], [item.category]: { kind: "ready", approved: status.approved } },
+            }));
+          }
+        } catch {
+          if (active) {
+            setHighRiskApprovals((current) => ({
+              ...current,
+              [item.taskId]: { ...current[item.taskId], [item.category]: { kind: "error" } },
+            }));
+          }
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, highRiskApprovals]);
+
+  useEffect(() => {
     setValidationForm(emptyValidationCommandForm);
   }, [activeTaskId]);
 
   useEffect(() => {
+    setContextPackagePreparationNotice(null);
+  }, [activeTaskId]);
+
+  useEffect(() => {
+    setUserDiffReviewDialog(null);
+  }, [activeTaskId]);
+
+  useEffect(() => {
     const activeExecutionEntries = Object.entries(isolations).filter(
-      ([, isolation]) => isolation.taskState === "planning" || isolation.taskState === "implementing" || isolation.taskState === "testing" || isolation.taskState === "reviewing",
+      ([, isolation]) => isolation.taskState === "planning" || isolation.taskState === "implementing" || isolation.taskState === "testing" || isolation.taskState === "reviewing" || isolation.taskState === "merging" || isolation.taskState === "mergeConflict" || isolation.taskState === "postMergeTesting",
     );
     if (activeExecutionEntries.length === 0) return;
     const interval = setInterval(() => {
@@ -215,12 +482,49 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
         activeExecutionEntries.map(async ([projectId, isolation]) => {
           const next = await client.getTaskIsolation(isolation.taskId);
           setIsolations((current) => ({ ...current, [projectId]: next }));
+          if (next.taskState === "mergeConflict") {
+            try {
+              const result = await client.getMergeConflictInspection(next.taskId);
+              setMergeConflictInspections((current) => ({ ...current, [next.taskId]: { kind: "ready", result } }));
+            } catch {
+              setMergeConflictInspections((current) => ({ ...current, [next.taskId]: { kind: "error" } }));
+            }
+            // A background merge-conflict write never changes task state
+            // until it is confirmed one way or another, so "still
+            // `mergeConflict` after another tick" says nothing at all about
+            // whether a write is running. The authoritative answer is the
+            // runtime's shared `MergeConflictWriteLock`, so ask it — and
+            // clear this page's local in-flight flag only when that lock
+            // reports itself free, never on the strength of a tick.
+            try {
+              const status = await client.getMergeConflictWriteStatus(next.taskId);
+              setMergeConflictWriteStatuses((current) => ({ ...current, [next.taskId]: { kind: "ready", running: status.running } }));
+              if (!status.running) {
+                setMergeConflictWriteStarts((current) => (current[next.taskId] ? { ...current, [next.taskId]: false } : current));
+              }
+            } catch {
+              setMergeConflictWriteStatuses((current) => ({ ...current, [next.taskId]: { kind: "error" } }));
+            }
+          } else {
+            // `cancelled`, `merging`, `postMergeTesting`, `recoveryRequired`
+            // and friends: the merge-conflict surface is gone, so drop the
+            // state that belongs to it rather than leaving a stale
+            // in-flight flag behind for a later re-entry into
+            // `mergeConflict`.
+            clearMergeConflictWriteState(next.taskId);
+          }
         }),
       ).catch(() => {});
     }, 2000);
     return () => clearInterval(interval);
   }, [client, isolations]);
 
+  const clearMergeConflictWriteState = useCallback((taskId: string) => {
+    setMergeConflictWriteStatuses((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+    setMergeConflictWriteStarts((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+    setMergeConflictWriteNotices((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+    setMergeConflictInspections((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+  }, []);
   const retry = useCallback(() => setRequestId((value) => value + 1), []);
   const run = async (operation: () => Promise<void>) => {
     setBusy(true);
@@ -299,6 +603,77 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       }
     });
   };
+  const prepareContextPackage = async () => {
+    if (!contextPackagePrepDialog) return;
+    const dialog = contextPackagePrepDialog;
+    await run(async () => {
+      if (dialog.workKind === "planning") {
+        await client.preparePlanningContextPackage(dialog.taskId, dialog.taskVersion);
+        // The cached readiness read for this task is now stale (it was
+        // "not ready" before this call); clearing it makes the readiness
+        // effect refetch and the activation button below reflect reality.
+        setContextPackagePlanningReadiness((current) => {
+          const next = { ...current };
+          delete next[dialog.taskId];
+          return next;
+        });
+      } else if (dialog.workKind === "implementation") {
+        await client.prepareImplementationContextPackage(dialog.taskId, dialog.taskVersion);
+        // Same reasoning as the planning branch above: this task's cached
+        // Implementation readiness read was "not ready" before this call,
+        // so clearing it makes the readiness effect refetch and the
+        // activation button below reflect reality.
+        setContextPackageImplementationReadiness((current) => {
+          const next = { ...current };
+          delete next[dialog.taskId];
+          return next;
+        });
+      } else {
+        await client.prepareReviewContextPackage(dialog.taskId, dialog.taskVersion);
+        // Same reasoning as the planning/implementation branches above: this
+        // task's cached Review readiness read was "not ready" before this
+        // call, so clearing it makes the readiness effect refetch and the
+        // activation button below reflect reality.
+        setContextPackageReviewReadiness((current) => {
+          const next = { ...current };
+          delete next[dialog.taskId];
+          return next;
+        });
+      }
+      // Deliberately does not update `isolations` (unlike `startWork`, which
+      // does): preparation never starts Claude and never changes this
+      // task's state or version, so there is nothing here to refresh.
+      setContextPackagePrepDialog(null);
+      setContextPackagePreparationNotice(
+        "Context Package v1 consent recorded. Claude was not started and this task's status is unchanged.",
+      );
+    });
+  };
+  const startContextPackagePlanning = async (projectId: string, taskId: string, taskVersion: number) => run(async () => {
+    const result = await client.startClaudePlanningContextPackage(taskId, taskVersion);
+    setIsolations((current) => {
+      const existing = current[projectId];
+      if (!existing) return current;
+      return { ...current, [projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+    });
+  });
+  const startContextPackageImplementation = async (projectId: string, taskId: string, taskVersion: number) => run(async () => {
+    const result = await client.startClaudeImplementationContextPackage(taskId, taskVersion);
+    setIsolations((current) => {
+      const existing = current[projectId];
+      if (!existing) return current;
+      return { ...current, [projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+    });
+  });
+  const startContextPackageReview = async (projectId: string, taskId: string, taskVersion: number) => run(async () => {
+    const result = await client.startClaudeReviewContextPackage(taskId, taskVersion);
+    setIsolations((current) => {
+      const existing = current[projectId];
+      if (!existing) return current;
+      return { ...current, [projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+    });
+    setReviewRuns((current) => ({ ...current, [taskId]: true }));
+  });
   const cancelPlanning = async (taskId: string) => run(async () => {
     const result = await client.cancelClaudePlanning(taskId);
     if (!result.requested) {
@@ -373,6 +748,97 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       });
     }
   });
+  const confirmHighRiskApproval = async () => {
+    if (!highRiskApprovalDialog) return;
+    const dialog = highRiskApprovalDialog;
+    await run(async () => {
+      await client.approveHighRiskOperation(dialog.taskId, dialog.taskVersion, dialog.category);
+      setHighRiskApprovalDialog(null);
+      // Approve and reuse are not distinguished here: either way, only this
+      // category's status for this task changes. Task state/version are
+      // never touched by this call, so `isolations` is deliberately left
+      // alone (mirrors `prepareContextPackage`'s reasoning).
+      setHighRiskApprovals((current) => ({
+        ...current,
+        [dialog.taskId]: { ...current[dialog.taskId], [dialog.category]: { kind: "ready", approved: true } },
+      }));
+    });
+  };
+  const refreshMergeConflictWriteStatus = async (taskId: string): Promise<MergeConflictWriteStatusState> => {
+    let next: MergeConflictWriteStatusState;
+    try {
+      const status = await client.getMergeConflictWriteStatus(taskId);
+      next = { kind: "ready", running: status.running };
+    } catch {
+      next = { kind: "error" };
+    }
+    setMergeConflictWriteStatuses((current) => ({ ...current, [taskId]: next }));
+    return next;
+  };
+  const confirmMergeContinue = async () => {
+    if (!mergeContinueDialog) return;
+    const dialog = mergeContinueDialog;
+    await run(async () => {
+      let result;
+      try {
+        result = await client.confirmManualResolutionAndStartMergeContinue(
+          dialog.taskId,
+          dialog.taskVersion,
+        );
+      } catch (error: unknown) {
+        // The rejection may be the shared lock turning this call away
+        // because a merge-conflict write is already running, or it may be a
+        // genuine failure the user needs to read (a stale resolution
+        // digest, say). The error code alone cannot tell those apart —
+        // `APP_CONFLICT` covers both — so ask the authoritative lock
+        // instead. Only a confirmed in-flight write is swallowed into the
+        // fixed busy notice; everything else propagates to the existing
+        // error surface with the dialog left open.
+        const status = await refreshMergeConflictWriteStatus(dialog.taskId);
+        if (status.kind === "ready" && status.running) {
+          setMergeContinueDialog(null);
+          setMergeContinueConfirmed(false);
+          setMergeConflictWriteNotices((current) => ({ ...current, [dialog.taskId]: MERGE_CONFLICT_WRITE_BUSY_NOTICE }));
+          return;
+        }
+        throw error;
+      }
+      setMergeContinueDialog(null);
+      setMergeContinueConfirmed(false);
+      // The write is now running and holds the shared lock. Nothing but an
+      // authoritative `running: false` clears this.
+      setMergeConflictWriteStarts((current) => ({ ...current, [dialog.taskId]: true }));
+      setMergeConflictWriteNotices((current) => { const next = { ...current }; delete next[dialog.taskId]; return next; });
+      setIsolations((current) => {
+        const existing = current[dialog.projectId];
+        if (!existing) return current;
+        return { ...current, [dialog.projectId]: { ...existing, taskState: result.state, taskVersion: result.version } };
+      });
+    });
+  };
+  const confirmMergeAbort = async () => {
+    if (!mergeAbortDialog) return;
+    const dialog = mergeAbortDialog;
+    await run(async () => {
+      const result = await client.confirmMergeAbortAndStart(dialog.taskId, dialog.taskVersion);
+      if (result.started) {
+        setMergeAbortDialog(null);
+        setMergeAbortConfirmed(false);
+        setMergeAbortNotice(null);
+        // Task state stays `mergeConflict` while the background abort runs.
+        // This flag withholds both the continue and abort actions until the
+        // shared `MergeConflictWriteLock` itself reports the write finished,
+        // which is what keeps merge-continue and merge-abort from ever
+        // appearing simultaneously executable for the same task.
+        setMergeConflictWriteStarts((current) => ({ ...current, [dialog.taskId]: true }));
+        setMergeConflictWriteNotices((current) => { const next = { ...current }; delete next[dialog.taskId]; return next; });
+      } else {
+        await refreshMergeConflictWriteStatus(dialog.taskId);
+        setMergeAbortNotice(MERGE_CONFLICT_WRITE_BUSY_NOTICE);
+        setMergeConflictWriteNotices((current) => ({ ...current, [dialog.taskId]: MERGE_CONFLICT_WRITE_BUSY_NOTICE }));
+      }
+    });
+  };
 
   if (state.kind === "loading") return <LoadingState message="Loading projects" />;
   if (state.kind === "error") return <ErrorState error={state.error} onRetry={retry} />;
@@ -412,6 +878,106 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
     </div>;
   }
 
+  if (contextPackagePrepDialog) {
+    const preparationCopy = contextPackagePreparationCopy(contextPackagePrepDialog.workKind);
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">Context Package v1</p><h1>{preparationCopy.title}</h1><p>{preparationCopy.description}</p></div></header>
+      <section className="content-card" aria-labelledby="context-package-prep-form"><h2 id="context-package-prep-form">Context Package v1 data-scope consent</h2>
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => setContextPackagePrepDialog(null)} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy} onClick={() => void prepareContextPackage()}>Confirm preparation</button>
+        </div>
+      </section>
+    </div>;
+  }
+
+  if (userDiffReviewDialog) {
+    const dialog = userDiffReviewDialog;
+    return <UserDiffReviewModal
+      client={client}
+      taskId={dialog.taskId}
+      taskVersion={dialog.taskVersion}
+      onClose={() => setUserDiffReviewDialog(null)}
+      onMergeStarted={(task) => {
+        setUserDiffReviewDialog(null);
+        setIsolations((current) => {
+          const existing = current[dialog.projectId];
+          if (!existing) return current;
+          return { ...current, [dialog.projectId]: { ...existing, taskState: task.state, taskVersion: task.version } };
+        });
+      }}
+    />;
+  }
+
+  if (highRiskApprovalDialog) {
+    const categoryLabel = highRiskCategoryLabel(highRiskApprovalDialog.category);
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">High-risk approval</p><h1>Approve {categoryLabel}</h1></div></header>
+      <section className="content-card" aria-labelledby="high-risk-approval-form"><h2 id="high-risk-approval-form">{categoryLabel}</h2>
+        <ul>
+          <li>This approval applies only to the {categoryLabel} effect category for this task's current version.</li>
+          <li>Approval does not run any provider and does not change this task's status.</li>
+          <li>If the version changes, this approval cannot be reused.</li>
+        </ul>
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => setHighRiskApprovalDialog(null)} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy} onClick={() => void confirmHighRiskApproval()}>Confirm approval</button>
+        </div>
+      </section>
+    </div>;
+  }
+
+  if (mergeContinueDialog) {
+    // Re-checked here, not only where the action was offered: if the shared
+    // lock is taken (or its status becomes unreadable) while this dialog is
+    // open, confirming must not be possible.
+    const actionsAllowed = mergeConflictActionsAllowed(
+      mergeConflictWriteStatuses[mergeContinueDialog.taskId],
+      mergeConflictWriteStarts[mergeContinueDialog.taskId] === true,
+    );
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">Merge conflict resolution</p><h1>Confirm the staged merge resolution</h1><p>Git reports no unresolved entries. Continuing will create a merge commit from the currently staged resolution in the original checkout. ChatOMS will stop if that staged result changes before the commit.</p></div></header>
+      <section className="content-card" aria-labelledby="merge-continue-confirm-form"><h2 id="merge-continue-confirm-form">Confirm and continue</h2>
+        <label className="checkbox-row">
+          <input type="checkbox" checked={mergeContinueConfirmed} onChange={(event) => setMergeContinueConfirmed(event.target.checked)} disabled={busy} />
+          I reviewed the staged merge resolution and approve creating the merge commit.
+        </label>
+        <p className="muted">This confirmation is separate from the earlier task diff approval.</p>
+        {!actionsAllowed && <p className="muted">{MERGE_CONFLICT_WRITE_BUSY_NOTICE}</p>}
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => { setMergeContinueDialog(null); setMergeContinueConfirmed(false); }} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy || !mergeContinueConfirmed || !actionsAllowed} onClick={() => void confirmMergeContinue()}>Confirm and continue</button>
+        </div>
+      </section>
+    </div>;
+  }
+
+  if (mergeAbortDialog) {
+    const actionsAllowed = mergeConflictActionsAllowed(
+      mergeConflictWriteStatuses[mergeAbortDialog.taskId],
+      mergeConflictWriteStarts[mergeAbortDialog.taskId] === true,
+    );
+    return <div className="page-stack">
+      <header className="page-header"><div><p className="eyebrow">Merge conflict resolution</p><h1>Abort the in-progress merge</h1><p>This discards the staged merge resolution in the original checkout and restores it to the base commit it had before the merge started. Your task branch and its commit are not deleted. The task is then cancelled and cannot be resumed.</p></div></header>
+      <section className="content-card" aria-labelledby="merge-abort-confirm-form"><h2 id="merge-abort-confirm-form">Confirm abort</h2>
+        <label className="checkbox-row">
+          <input type="checkbox" checked={mergeAbortConfirmed} onChange={(event) => setMergeAbortConfirmed(event.target.checked)} disabled={busy} />
+          I approve aborting the in-progress merge and cancelling this task.
+        </label>
+        <p className="muted">This approval is separate from the earlier task diff approval and from any staged-resolution confirmation.</p>
+        {mergeAbortNotice && <p className="muted">{mergeAbortNotice}</p>}
+        {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
+        <div className="form-actions">
+          <button className="button button--secondary" type="button" onClick={() => { setMergeAbortDialog(null); setMergeAbortConfirmed(false); setMergeAbortNotice(null); }} disabled={busy}>Cancel</button>
+          <button className="button" type="button" disabled={busy || !mergeAbortConfirmed || !actionsAllowed} onClick={() => void confirmMergeAbort()}>Confirm abort</button>
+        </div>
+      </section>
+    </div>;
+  }
+
   return <div className="page-stack">
     <header className="page-header"><div><p className="eyebrow">Git isolation</p><h1>Projects</h1><p>Register a local project and create one isolated branch and worktree per task.</p></div><span className="count-label">{state.projects.length} total</span></header>
 
@@ -437,9 +1003,16 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
             {isolation.taskState === "worktreeReady" && (() => {
               const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "planning" && candidate.provider === "claude");
               const eligible = entry?.eligible ?? false;
+              const readinessState = contextPackagePlanningReadiness[isolation.taskId];
+              const contextPackageReady = readinessState?.kind === "ready" && readinessState.ready;
               return <div className="planning-panel">
                 {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
                 <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "planning" })}>Start Claude Planning</button>
+                <button className="button button--secondary" disabled={busy || !eligible} onClick={() => setContextPackagePrepDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "planning" })}>Prepare Context Package v1 consent</button>
+                {contextPackagePreparationNotice && <p className="muted">{contextPackagePreparationNotice}</p>}
+                <button className="button button--secondary" disabled={busy || !eligible || !contextPackageReady} onClick={() => void startContextPackagePlanning(project.id, isolation.taskId, isolation.taskVersion)}>Start Claude Planning (Context Package v1)</button>
+                {readinessState?.kind === "ready" && !readinessState.ready && <p className="muted">Prepare Context Package v1 consent first.</p>}
+                {readinessState?.kind === "error" && <p className="inline-notice">Context Package v1 readiness could not be loaded. Refresh to try again.</p>}
               </div>;
             })()}
             {isolation.taskState === "planning" && <div className="planning-panel">
@@ -452,11 +1025,32 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               {(() => {
                 const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "implementation" && candidate.provider === "claude");
                 const eligible = entry?.eligible ?? false;
+                const readinessState = contextPackageImplementationReadiness[isolation.taskId];
+                const contextPackageReady = readinessState?.kind === "ready" && readinessState.ready;
                 return <div className="planning-panel">
                   {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
                   <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "implementation" })}>Start Claude Implementation</button>
+                  <button className="button button--secondary" disabled={busy || !eligible} onClick={() => setContextPackagePrepDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "implementation" })}>Prepare Context Package v1 consent</button>
+                  {contextPackagePreparationNotice && <p className="muted">{contextPackagePreparationNotice}</p>}
+                  <button className="button button--secondary" disabled={busy || !eligible || !contextPackageReady} onClick={() => void startContextPackageImplementation(project.id, isolation.taskId, isolation.taskVersion)}>Start Claude Implementation (Context Package v1)</button>
+                  {readinessState?.kind === "ready" && !readinessState.ready && <p className="muted">Prepare Context Package v1 consent first.</p>}
+                  {readinessState?.kind === "error" && <p className="inline-notice">Context Package v1 readiness could not be loaded. Refresh to try again.</p>}
                 </div>;
               })()}
+              <section className="high-risk-approval-panel" aria-label="High-risk approval">
+                <h3>High-risk approval</h3>
+                <ul>{HIGH_RISK_CATEGORIES.map((category) => {
+                  const approvalState = highRiskApprovals[isolation.taskId]?.[category];
+                  const approved = approvalState?.kind === "ready" && approvalState.approved;
+                  return <li key={category} className="high-risk-approval-row">
+                    <span>{highRiskCategoryLabel(category)}</span>
+                    {approvalState === undefined || approvalState.kind === "loading" ? <span className="muted">Loading…</span>
+                      : approvalState.kind === "error" ? <span className="inline-notice">Status could not be loaded.</span>
+                      : approved ? <span className="muted">Approved</span>
+                      : <button className="button button--secondary" disabled={busy} onClick={() => setHighRiskApprovalDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, category })}>Approve</button>}
+                  </li>;
+                })}</ul>
+              </section>
             </div>}
             {isolation.taskState === "implementing" && <div className="planning-panel">
               <p className="muted">Claude Implementation is applying changes inside this task's isolated worktree. This may take a few minutes.</p>
@@ -510,6 +1104,8 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               const entry = eligibilities[isolation.taskId]?.find((candidate) => candidate.workKind === "review" && candidate.provider === "claude");
               const eligible = entry?.eligible ?? false;
               const running = reviewRuns[isolation.taskId] === true;
+              const readinessState = contextPackageReviewReadiness[isolation.taskId];
+              const contextPackageReady = readinessState?.kind === "ready" && readinessState.ready;
               return <div className="review-panel" aria-label="Claude Review">
                 {running ? <>
                   <p className="muted">Claude Review is analyzing the changes in this task's isolated worktree. This may take a few minutes.</p>
@@ -517,18 +1113,43 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
                 </> : <>
                   {entry && !eligible && <p className="inline-notice">{entry.blockingReasons.map(eligibilityBlockerMessage).join(" ")}</p>}
                   <button className="button" disabled={busy || !eligible} onClick={() => setConsentDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "review" })}>Start Claude Review</button>
+                  <button className="button button--secondary" disabled={busy || !eligible} onClick={() => setContextPackagePrepDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion, workKind: "review" })}>Prepare Context Package v1 consent</button>
+                  {contextPackagePreparationNotice && <p className="muted">{contextPackagePreparationNotice}</p>}
+                  <button className="button button--secondary" disabled={busy || !eligible || !contextPackageReady} onClick={() => void startContextPackageReview(project.id, isolation.taskId, isolation.taskVersion)}>Start Claude Review (Context Package v1)</button>
+                  {readinessState?.kind === "ready" && !readinessState.ready && <p className="muted">Prepare Context Package v1 consent first.</p>}
+                  {readinessState?.kind === "error" && <p className="inline-notice">Context Package v1 readiness could not be loaded. Refresh to try again.</p>}
                 </>}
               </div>;
             })()}
             {isolation.taskState === "awaitingUserDiffApproval" && <div className="review-panel" aria-label="Claude Review result">
               <p className="muted">Claude Review finished. The review is awaiting your decision on the diff.</p>
               {renderReviewResult(reviewResults[isolation.taskId])}
+              <button className="button button--secondary" disabled={busy} onClick={() => setUserDiffReviewDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion })}>Review current diff</button>
             </div>}
-            {isolation.taskState === "completed" && <p className="muted">This task is completed. Its active task lease has been released.</p>}
-            {isolation.taskState === "recoveryRequired" && <p className="muted">This task requires manual recovery before continuing. Review the task before proceeding.</p>}
+            {isolation.taskState === "merging" && <p className="muted">The approved change is being committed and merged. This status updates automatically; merge cancellation is not available.</p>}
+            {isolation.taskState === "postMergeTesting" && <>
+              <p className="muted">The merge completed. Post-merge validation is pending.</p>
+              <p className="muted">Execution status updates automatically while validation runs.</p>
+            </>}
+            {isolation.taskState === "mergeConflict" && renderMergeConflictInspection(
+              mergeConflictInspections[isolation.taskId],
+              () => { setMergeAbortDialog(null); setMergeContinueDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion }); },
+              () => { setMergeContinueDialog(null); setMergeAbortNotice(null); setMergeAbortDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion }); },
+              mergeConflictWriteStatuses[isolation.taskId],
+              mergeConflictWriteStarts[isolation.taskId] === true,
+              mergeConflictWriteNotices[isolation.taskId],
+            )}
+            {isolation.taskState === "completed" && <>
+              <p className="muted">This task is completed. Its active task lease has been released.</p>
+              {renderPostMergeValidationResults(postMergeValidationResults[isolation.taskId])}
+            </>}
+            {isolation.taskState === "recoveryRequired" && <>
+              <p className="muted">The task result could not be confirmed. Review the repository safely before proceeding.</p>
+              {renderPostMergeValidationResults(postMergeValidationResults[isolation.taskId])}
+            </>}
             {isolation.taskState === "failed" && <p className="inline-notice">Claude Planning failed. Review the task before retrying.</p>}
             {isolation.taskState === "cancelled" && <p className="muted">Claude Planning was cancelled.</p>}
-            <button className="button button--secondary" disabled={busy} onClick={() => void run(async () => { const next = await client.getTaskIsolation(isolation.taskId); setIsolations((current) => ({ ...current, [project.id]: next })); })}>Refresh isolation</button>
+            {isolation.taskState !== "mergeConflict" && <button className="button button--secondary" disabled={busy} onClick={() => void run(async () => { const next = await client.getTaskIsolation(isolation.taskId); setIsolations((current) => ({ ...current, [project.id]: next })); })}>Refresh isolation</button>}
           </section>}
         </li>;
       })}</ul>}
@@ -553,6 +1174,37 @@ function consentDialogCopy(workKind: "planning" | "implementation" | "review"): 
         title: "Send task brief to Claude",
         description: "Claude Planning will read this task's requirements, completion criteria, and prohibited scope from a read-only copy of the worktree. It runs read-only and cannot create, edit, or delete files.",
       };
+  }
+}
+
+function contextPackagePreparationCopy(workKind: "planning" | "implementation" | "review"): { title: string; description: string } {
+  const categories = workKind === "implementation"
+    ? "requirements, completion criteria, prohibited scope, and the approved plan"
+    : workKind === "review"
+    ? "requirements, completion criteria, prohibited scope, and the current Git diff"
+    : "requirements, completion criteria, and prohibited scope";
+  return {
+    title: "Prepare Context Package v1 consent",
+    description: `This records a one-time transmission consent and a content-free reference for the Context Package v1 data scope, covering ${categories}. Actual values are never shown here. This does not start Claude and does not change this task's status.`,
+  };
+}
+
+function highRiskCategoryLabel(category: HighRiskCategory): string {
+  switch (category) {
+    case "architectureChange": return "Architecture change";
+    case "databaseSchemaChange": return "Database schema change";
+    case "authenticationOrAuthorizationChange": return "Authentication or authorization change";
+    case "securityPolicyChange": return "Security policy change";
+    case "externalNetworkBehaviorAddition": return "External network behavior addition";
+    case "externalDataTransmissionAddition": return "External data transmission addition";
+    case "largeScaleFileMoveOrDeletion": return "Large-scale file move or deletion";
+    case "publicApiOrStorageFormatChange": return "Public API or storage format change";
+    case "operatingSystemConfigurationChange": return "Operating system configuration change";
+    case "administratorPrivilegesRequired": return "Administrator privileges required";
+    case "breakingCompatibilityChange": return "Breaking compatibility change";
+    case "dataMigration": return "Data migration";
+    case "difficultToRecoverChange": return "Difficult-to-recover change";
+    default: return category;
   }
 }
 
@@ -607,6 +1259,137 @@ function renderReviewResult(state: ReviewResultLoadState | undefined) {
   return <div className="review-text-panel" aria-label="Claude Review result">
     <pre className="review-text">{state.result.reviewText}</pre>
   </div>;
+}
+
+function renderPostMergeValidationResults(state: PostMergeValidationLoadState | undefined) {
+  if (state === undefined || state.kind === "loading") {
+    return <p className="muted">Loading post-merge validation results…</p>;
+  }
+  if (state.kind === "error") {
+    return <p className="inline-notice">Post-merge validation results could not be loaded. Refresh to try again.</p>;
+  }
+  if (state.results.length === 0) {
+    return <p className="muted">No post-merge validation results are available for this task.</p>;
+  }
+  return <section className="post-merge-validation-panel" aria-label="Post-merge validation results">
+    <h3>Post-merge validation results</h3>
+    <ul>
+      {state.results.map((result) => <li key={`${result.commandKind}-${result.attemptSequence}`}>
+        <strong>{result.commandKind === "test" ? "Test" : "Build"}</strong>
+        <span className="muted">Outcome: {result.outcome}</span>
+        <span>{result.safeSummary}</span>
+        {result.exitCode !== null && <span className="muted">Exit code: {result.exitCode}</span>}
+      </li>)}
+    </ul>
+  </section>;
+}
+
+const MERGE_CONFLICT_KIND_LABELS = [
+  ["bothModified", "Both modified"],
+  ["bothAdded", "Both added"],
+  ["bothDeleted", "Both deleted"],
+  ["addedByUs", "Added by us"],
+  ["addedByThem", "Added by them"],
+  ["deletedByUs", "Deleted by us"],
+  ["deletedByThem", "Deleted by them"],
+] as const;
+
+function renderMergeConflictInspection(
+  state: MergeConflictInspectionLoadState | undefined,
+  onConfirm: () => void,
+  onAbort: () => void,
+  writeStatus: MergeConflictWriteStatusState | undefined,
+  writeStartedLocally: boolean,
+  writeNotice: string | undefined,
+) {
+  // The write-status gate is evaluated before the inspection outcome: an
+  // action-eligible outcome means nothing while a merge-conflict write is
+  // executing, and `loading`/`error`/absent are all fail-safe here. Only a
+  // confirmed `running: false` from the runtime's shared lock, with no
+  // locally started write outstanding, lets any action through.
+  if (writeStatus === undefined || writeStatus.kind === "loading") {
+    return <p className="muted">Checking whether a merge action is currently running…</p>;
+  }
+  if (writeStatus.kind === "error") {
+    return <p className="inline-notice">The merge action status could not be checked safely. No merge action is offered until it can be.</p>;
+  }
+  if (!mergeConflictActionsAllowed(writeStatus, writeStartedLocally)) {
+    return <div className="merge-conflict-panel">
+      <p className="muted">A merge action is in progress for this task. This status updates automatically.</p>
+      {writeNotice !== undefined && <p className="muted">{writeNotice}</p>}
+    </div>;
+  }
+  if (state === undefined || state.kind === "loading") {
+    return <p className="muted">Checking the Git merge state safely…</p>;
+  }
+  if (state.kind === "error") {
+    return <p className="inline-notice">The merge conflict state could not be loaded safely.</p>;
+  }
+  if (state.result === null) {
+    return <p className="muted">No merge conflict inspection is available.</p>;
+  }
+  // Only these three outcomes offer an abort action at all (see
+  // `docs/PHASE_PLAN.md` Phase 5e-4); `inconsistent`/`unavailable` never do.
+  const notice = writeNotice !== undefined ? <p className="muted">{writeNotice}</p> : null;
+  const abortAction = <button className="button button--secondary" onClick={onAbort}>Abort the in-progress merge</button>;
+  switch (state.result.outcome) {
+    case "confirmedUnresolved":
+      {
+        const { counts } = state.result;
+      return <div className="merge-conflict-panel">
+        <div className="inline-notice">
+          <p>Git reported merge conflicts. ChatOMS did not modify or resolve them.</p>
+          <ul>
+            <li>Total: {counts.total}</li>
+            {MERGE_CONFLICT_KIND_LABELS.filter(([key]) => counts[key] > 0).map(([key, label]) => <li key={key}>{label}: {counts[key]}</li>)}
+          </ul>
+        </div>
+        {notice}
+        {abortAction}
+      </div>;
+      }
+    case "resolvedPendingConfirmation":
+      return <div className="merge-conflict-panel">
+        <p className="muted">Git no longer reports unmerged entries, but ChatOMS has not confirmed or completed the merge.</p>
+        {notice}
+        <button className="button" onClick={onConfirm}>Confirm the staged merge resolution</button>
+        {abortAction}
+      </div>;
+    case "restoredPendingAbortConfirmation":
+      return <div className="merge-conflict-panel">
+        <p className="muted">Git reports no merge in progress, and the original checkout already matches the base state it had before the merge started. This task has not yet been confirmed cancelled.</p>
+        {notice}
+        {abortAction}
+      </div>;
+    case "inconsistent":
+      return <p className="inline-notice">The saved task and current Git merge state do not match. No merge action was attempted.</p>;
+    case "unavailable":
+      return <p className="inline-notice">The merge conflict state could not be verified safely. No merge action was attempted.</p>;
+    default:
+      return assertNever(state.result.outcome);
+  }
+}
+
+/**
+ * The single gate every merge-conflict action goes through, on the panel and
+ * inside the confirmation dialogs alike. Actions are permitted only when the
+ * runtime's shared lock has been read successfully, reports itself free, and
+ * this page has not just started a write of its own. `undefined`, `loading`
+ * and `error` all withhold the actions.
+ */
+function mergeConflictActionsAllowed(
+  status: MergeConflictWriteStatusState | undefined,
+  startedLocally: boolean,
+): boolean {
+  return status !== undefined && status.kind === "ready" && !status.running && !startedLocally;
+}
+
+/** Fixed, content-free copy: never a raw backend error string. */
+const MERGE_CONFLICT_WRITE_BUSY_NOTICE =
+  "A merge action is already processing for this task, or its status needs to be refreshed. This status updates automatically.";
+
+function assertNever(_value: never): never {
+  throw new Error("Unexpected merge conflict inspection outcome.");
 }
 
 export function formatTimestamp(value: number): string {

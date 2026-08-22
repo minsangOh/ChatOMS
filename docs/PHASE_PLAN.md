@@ -128,6 +128,19 @@ Phase 1 기반
 
 **완료 조건:** 승인 없는 고위험 동작과 병합이 차단되고, 기준 브랜치 변경·미커밋 상태·위험 충돌에서 실패 폐쇄하며 병합 결과와 검증이 기록된다.
 
+**현재 구현 상태 (Phase 5d-1~5f-3b):**
+
+- `GitCliAdapter`가 승인 hash·worktree/project identity·repository state를 재검증한 뒤 승인 candidate만 단일 task commit으로 만들고 원본 branch에 `--no-ff` merge한다. command timeout·spawn uncertainty는 success로 축소하지 않으며, 확인된 conflict는 typed outcome으로 반환한다.
+- `MergeExecutionStarter`/`Recorder`가 `AwaitingUserDiffApproval → Merging → PostMergeTesting | MergeConflict | RecoveryRequired` 결과를 기록한다. Tauri command는 `Merging` 전이를 확정한 뒤 detached execution을 시작하고 UI는 polling/read-only 상태만 표시한다.
+- `ValidationExecutionScope::{TaskWorktree, ProjectRoot}`와 forward migration, ProjectRoot post-merge result contract를 구현했다. ProjectRoot Cargo `Test`와 `Build` approval은 merge 전 현재 task version에 별도로 기록되며 TaskWorktree approval을 재사용하지 않는다.
+- diff approval-and-start-merge는 두 ProjectRoot approval이 모두 존재할 때만 통과한다. 승인 상태 API는 두 readiness flag만 반환한다. ProjectRoot Cargo 실행은 `PostMergeTesting`에서 `CargoValidationAdapter`로 수행되며, 결과는 content-free safe summary로만 기록한다.
+- (Phase 5e-2b) `MergeConflict`의 수동 해결을 diff/high-risk approval과 독립된 immutable confirmation(`task_manual_merge_resolution_confirmations`, content-free SHA-256 digest 결합)으로 확인하고, exact candidate·confirmation 재검증을 모두 통과한 뒤에만 원본 checkout에서 고정 argv `git merge --continue`를 실행해 `MergeConflict → Merging → PostMergeTesting | MergeConflict | RecoveryRequired`를 기록한다.
+- (Phase 5e-3~5e-6) 승인된 merge abort가 `MergeConflict`를 유지한 채 원본 checkout에서 고정 argv `git merge --abort`를 실행하고, 확인된 복원만 `MergeConflict → Cancelled`를 커밋한다. merge-conflict 읽기 전용 inspection, 수동 해결 확인, merge continue, merge abort의 Tauri command·IPC·UI가 모두 배선되어 있고, continue와 abort는 공유 write lock으로 상호 배제된다.
+- (Phase 5f-2) merge lifecycle 도달성 결함을 수정했다. `TaskGitIsolation.expected_task_version`은 isolation lifecycle의 optimistic-concurrency 값이며 `WorktreeReady`에서 고정되므로, merge-time gate에서 현재 task version과 비교하지 않는다. ProjectRoot validation approval은 `AwaitingUserDiffApproval` 전용 candidate 조회를 사용한다. merge provenance resolver는 `AwaitingUserDiffApproval → Merging → (MergeConflict → Merging)* → MergeConflict | PostMergeTesting` 체인을 모든 conflict round 수에 대해 인식한다.
+- (Phase 5f-3a) 통합 감사(5f-1)의 나머지 결함을 수정했다. 공용 read-only repository-status 관찰의 고정 argv에 `--no-optional-locks`를 추가해 merge-conflict inspection의 polling이 진행 중인 merge write와 index lock을 경합하지 않게 했다. 최초 merge의 prewrite residue 검사에 `MERGE_AUTOSTASH`를 추가해 merge-continue·merge-abort·conflict inspection과 동일한 판정 기준으로 통일했다. 최초 merge 성공 판정을 merge-continue와 동등한 수준(base branch, exact HEAD, ordered parents, residue 없음, clean status)으로 강화했다. merge execution·merge continue·merge abort 세 Tauri command의 background thread 생성을 panic 대신 typed 실패로 처리해, spawn 실패 시 shared lock과 각 registry가 누수되지 않고 이미 커밋된 상태 전이는 기존 fail-closed recovery 경로로 회수된다.
+- (Phase 5f-3b) `MergeConflict` UI의 continue/abort action을 backend의 공유 `MergeConflictWriteLock` 상태로 gate하는 content-free read-only IPC를 추가했다. UI는 이 status를 polling과 함께 조회하며, task 상태가 여전히 `MergeConflict`라는 사실만으로는 action을 재활성화하지 않고 authoritative status가 idle을 확인한 뒤에만 재활성화한다. status 조회의 loading/error/malformed 응답은 모두 fail-safe로 action을 노출하지 않는다.
+- 자동 conflict resolution, `AutoFixing`, `ReviewFixing`, Policy Engine은 후속 Unit이다.
+
 ## Phase 6 — 기록·복구·보존
 
 **선행조건:** Phase 2~5 완료.

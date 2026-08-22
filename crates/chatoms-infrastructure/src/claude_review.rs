@@ -83,6 +83,7 @@ use chatoms_ports::{
     repository::ReviewResultOutcome,
 };
 
+use crate::context_package::{ContextPackageAssemblyError, assemble_review_context_package};
 use crate::redaction::SecretRedactor;
 
 /// Built-in tools Claude Review may use. Identical to
@@ -251,6 +252,57 @@ where
         let result = interpret_completion(completion, &relay.buffer, &self.redactor);
         Ok(ClaudeReviewStartOutcome::Completed(result))
     }
+
+    /// Identical to [`Self::start_review`] except the stdin sent to the
+    /// child process is `assembled.into_bytes()` (a Context Package v1 body
+    /// already redacted and byte-capped by the caller — see
+    /// [`chatoms_ports::context_package_review::ContextPackageReviewExecutor`]'s
+    /// impl below, the only caller of this method) instead of
+    /// `format_stdin(&brief)`. Every other property is unchanged: the same
+    /// fresh capability recheck, the same read-only `--add-dir` argv built
+    /// by [`review_arguments`], the same trusted preflight CWD, the same
+    /// [`MAX_STDOUT_BYTES`] bound, and the same [`interpret_completion`]
+    /// parsing. This method is private: production and test code alike
+    /// reach it only through the `ContextPackageReviewExecutor` port impl,
+    /// never directly — mirroring
+    /// [`crate::claude_implementation::ClaudeImplementationAdapter::start_implementation_with_context_package`].
+    fn start_review_with_context_package(
+        &mut self,
+        worktree: &Path,
+        assembled: crate::context_package::AssembledContextPackage,
+        cancellation: &dyn CancellationSignal,
+        observer: &mut dyn ClaudeReviewObserver,
+    ) -> Result<ClaudeReviewStartOutcome, PortFailure> {
+        let capabilities = self.capability.provider_capabilities()?;
+        if capabilities.claude != ProviderCapabilityStatus::Supported {
+            return Ok(ClaudeReviewStartOutcome::PreflightRejected);
+        }
+
+        let stdin = assembled.into_bytes();
+        if stdin.len() > MAX_STDIN_BYTES {
+            return Ok(ClaudeReviewStartOutcome::StdinTooLarge);
+        }
+
+        let spec = ProcessSpec {
+            executable: self.claude_executable.clone(),
+            arguments: review_arguments(worktree),
+            working_directory: self.preflight_dir.clone(),
+            environment: None,
+        };
+        let mut relay = ResultCapturingRelay {
+            inner: observer,
+            buffer: Vec::new(),
+        };
+        let completion = self.streaming.run_streaming(
+            &spec,
+            Some(&stdin),
+            MAX_STDOUT_BYTES,
+            cancellation,
+            &mut relay,
+        )?;
+        let result = interpret_completion(completion, &relay.buffer, &self.redactor);
+        Ok(ClaudeReviewStartOutcome::Completed(result))
+    }
 }
 
 /// Forwards only [`ProcessLifecycleEvent`] values to the caller's
@@ -319,6 +371,74 @@ where
             self,
             worktree,
             mapped_brief,
+            cancellation,
+            &mut observer,
+        )? {
+            ClaudeReviewStartOutcome::PreflightRejected
+            | ClaudeReviewStartOutcome::StdinTooLarge => {
+                Ok(chatoms_ports::review::ReviewExecutionStartOutcome::PreflightRejected)
+            }
+            ClaudeReviewStartOutcome::Completed(result) => Ok(
+                chatoms_ports::review::ReviewExecutionStartOutcome::Completed(
+                    chatoms_ports::review::ReviewExecutionResult {
+                        outcome: result.outcome,
+                        exit_code: result.exit_code,
+                        turn_count: result.turn_count,
+                        review_text: result.review_text,
+                    },
+                ),
+            ),
+        }
+    }
+}
+
+impl<C, S> chatoms_ports::context_package_review::ContextPackageReviewExecutor
+    for ClaudeReviewAdapter<C, S>
+where
+    C: ProviderCapabilityPort,
+    S: StreamingProcessRunner,
+{
+    /// Assembles a Context Package v1 body from `brief` (via
+    /// [`assemble_review_context_package`], passing this adapter's own
+    /// [`MAX_STDIN_BYTES`] as the byte cap — the assembler defines no cap of
+    /// its own) and, only on success, hands it to the private
+    /// [`ClaudeReviewAdapter::start_review_with_context_package`] entrypoint.
+    /// A rejected assembly (`PayloadTooLarge` or `RedactionFailedClosed`)
+    /// never reaches a spawn attempt at all — it folds into
+    /// `PreflightRejected` here, exactly like this adapter's own
+    /// `StdinTooLarge`/capability-rejection cases already fold into
+    /// `PreflightRejected` at the
+    /// [`chatoms_ports::review::ClaudeReviewExecutor`] port boundary — so an
+    /// application-layer caller (see
+    /// `chatoms_application::context_package_review_execution`) reduces it
+    /// to the same `RecoveryRequired` fallback path a legacy preflight
+    /// rejection already uses, without ever constructing or naming an
+    /// assembled-package type itself.
+    fn start_review(
+        &mut self,
+        worktree: &Path,
+        brief: chatoms_ports::review::ReviewExecutionBrief<'_>,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<chatoms_ports::review::ReviewExecutionStartOutcome, PortFailure> {
+        let assembled = match assemble_review_context_package(
+            &self.redactor,
+            brief.requirements,
+            brief.completion_criteria,
+            brief.prohibited_scope,
+            brief.diff_text,
+            MAX_STDIN_BYTES,
+        ) {
+            Ok(assembled) => assembled,
+            Err(ContextPackageAssemblyError::PayloadTooLarge)
+            | Err(ContextPackageAssemblyError::RedactionFailedClosed) => {
+                return Ok(chatoms_ports::review::ReviewExecutionStartOutcome::PreflightRejected);
+            }
+        };
+        let mut observer = NoopObserver;
+        match ClaudeReviewAdapter::start_review_with_context_package(
+            self,
+            worktree,
+            assembled,
             cancellation,
             &mut observer,
         )? {
@@ -1164,6 +1284,179 @@ mod tests {
                 completion_criteria: "c",
                 prohibited_scope: "p",
                 diff_text: "d",
+            },
+            &cancellation,
+        )
+        .expect("typed fail-closed result, not an error");
+
+        assert_eq!(outcome, ReviewExecutionStartOutcome::PreflightRejected);
+    }
+
+    #[test]
+    fn context_package_review_executor_sends_only_the_assembled_package_as_stdin() {
+        use chatoms_ports::context_package_review::ContextPackageReviewExecutor;
+        use chatoms_ports::review::{ReviewExecutionBrief, ReviewExecutionStartOutcome};
+
+        let capability = FakeCapabilityPort::supported();
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            emit_stdout: Some(success_json("Looks correct", 5)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(capability, streaming);
+        let cancellation = never_cancelled();
+
+        let outcome = ContextPackageReviewExecutor::start_review(
+            &mut adapter,
+            Path::new("C:/managed/task-worktree"),
+            ReviewExecutionBrief {
+                requirements: "Add CSV export",
+                completion_criteria: "Export button downloads a CSV",
+                prohibited_scope: "Do not touch the import pipeline",
+                diff_text: "diff --git a/f b/f\n+added a line\n",
+            },
+            &cancellation,
+        )
+        .expect("port-level start_review");
+
+        let ReviewExecutionStartOutcome::Completed(result) = outcome else {
+            panic!("expected a completed run");
+        };
+        assert_eq!(result.outcome, ReviewResultOutcome::Completed);
+
+        let runs = observed.lock().expect("observed lock");
+        assert_eq!(runs.len(), 1);
+        let (spec, stdin, max_bytes) = &runs[0];
+        assert_eq!(spec.executable, Path::new("C:/trusted/claude.exe"));
+        assert_eq!(
+            spec.working_directory,
+            Path::new("C:/preflight/provider-preflight")
+        );
+        assert_eq!(
+            spec.arguments,
+            review_arguments(Path::new("C:/managed/task-worktree")),
+            "argv must be identical to the legacy path's own review_arguments()"
+        );
+        assert_eq!(*max_bytes, MAX_STDOUT_BYTES);
+        let stdin_bytes = stdin.clone().expect("stdin must be provided");
+        let assembled = crate::context_package::assemble_review_context_package(
+            &redactor(),
+            "Add CSV export",
+            "Export button downloads a CSV",
+            "Do not touch the import pipeline",
+            "diff --git a/f b/f\n+added a line\n",
+            MAX_STDIN_BYTES,
+        )
+        .expect("assembly succeeds")
+        .into_bytes();
+        assert_eq!(
+            stdin_bytes, assembled,
+            "stdin must be exactly the assembler's output, never format_stdin's legacy template"
+        );
+    }
+
+    #[test]
+    fn context_package_review_executor_folds_a_redaction_failure_into_preflight_rejected_without_spawning()
+     {
+        use chatoms_ports::context_package_review::ContextPackageReviewExecutor;
+        use chatoms_ports::review::{ReviewExecutionBrief, ReviewExecutionStartOutcome};
+
+        // Same fail-closed reproduction the assembler's own tests use, and
+        // the same reasoning `claude_implementation`'s analogous test
+        // documents for why a `PayloadTooLarge` reproduction is not
+        // independently addable here: each field is first redaction-capped
+        // to `SecretRedactor`'s own 64 KiB `MAX_REDACTION_INPUT_BYTES`
+        // before composition, so four fields can total at most ~256 KiB,
+        // always at or under this adapter's 1 MiB `MAX_STDIN_BYTES`.
+        let poisoned = "See api%5Fkey%3A%20supersecretvalue123456 in the config.";
+        let streaming = FakeStreamingRunner {
+            scripted: Some(completed(0)),
+            ..FakeStreamingRunner::default()
+        };
+        let observed = streaming.observed.clone();
+        let mut adapter = make_adapter(FakeCapabilityPort::supported(), streaming);
+        let cancellation = never_cancelled();
+
+        let outcome = ContextPackageReviewExecutor::start_review(
+            &mut adapter,
+            Path::new("C:/managed/task-worktree"),
+            ReviewExecutionBrief {
+                requirements: poisoned,
+                completion_criteria: "c",
+                prohibited_scope: "p",
+                diff_text: "diff",
+            },
+            &cancellation,
+        )
+        .expect("typed fail-closed result, not an error");
+
+        assert_eq!(outcome, ReviewExecutionStartOutcome::PreflightRejected);
+        assert!(
+            observed.lock().expect("observed lock").is_empty(),
+            "a redaction fail-closed assembly must never reach a spawn attempt"
+        );
+    }
+
+    #[test]
+    fn context_package_review_executor_re_runs_the_fresh_capability_check_every_call() {
+        use chatoms_ports::context_package_review::ContextPackageReviewExecutor;
+        use chatoms_ports::review::ReviewExecutionBrief;
+
+        let capability = FakeCapabilityPort::supported();
+        let calls = capability.calls.clone();
+        let mut adapter = make_adapter(
+            capability,
+            FakeStreamingRunner {
+                scripted: Some(completed(0)),
+                emit_stdout: Some(success_json("done", 1)),
+                ..FakeStreamingRunner::default()
+            },
+        );
+        let cancellation = never_cancelled();
+
+        for _ in 0..3 {
+            ContextPackageReviewExecutor::start_review(
+                &mut adapter,
+                Path::new("C:/managed/task-worktree"),
+                ReviewExecutionBrief {
+                    requirements: "r",
+                    completion_criteria: "c",
+                    prohibited_scope: "p",
+                    diff_text: "diff",
+                },
+                &cancellation,
+            )
+            .expect("start review");
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "an earlier Supported result must never be cached across calls"
+        );
+    }
+
+    #[test]
+    fn context_package_review_executor_reports_preflight_rejection_when_capability_is_unsupported()
+    {
+        use chatoms_ports::context_package_review::ContextPackageReviewExecutor;
+        use chatoms_ports::review::{ReviewExecutionBrief, ReviewExecutionStartOutcome};
+
+        let mut adapter = make_adapter(
+            FakeCapabilityPort::unsupported(),
+            FakeStreamingRunner::default(),
+        );
+        let cancellation = never_cancelled();
+
+        let outcome = ContextPackageReviewExecutor::start_review(
+            &mut adapter,
+            Path::new("C:/managed/task-worktree"),
+            ReviewExecutionBrief {
+                requirements: "r",
+                completion_criteria: "c",
+                prohibited_scope: "p",
+                diff_text: "diff",
             },
             &cancellation,
         )
