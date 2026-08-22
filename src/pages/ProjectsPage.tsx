@@ -3,6 +3,8 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
+import { ImplementationRiskAssessmentPanel } from "../components/ImplementationRiskAssessmentPanel";
+import type { OperationRiskAssessmentLoadState } from "../components/ImplementationRiskAssessmentPanel";
 import { LoadingState } from "../components/LoadingState";
 import { UserDiffReviewModal } from "../components/UserDiffReviewModal";
 import type { IpcClient } from "../ipc/client";
@@ -110,6 +112,7 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [testingRuns, setTestingRuns] = useState<Record<string, boolean>>({});
   const [reviewRuns, setReviewRuns] = useState<Record<string, boolean>>({});
   const [highRiskApprovals, setHighRiskApprovals] = useState<Record<string, Partial<Record<HighRiskCategory, HighRiskApprovalLoadState>>>>({});
+  const [operationRiskAssessments, setOperationRiskAssessments] = useState<Record<string, OperationRiskAssessmentLoadState>>({});
   const [highRiskApprovalDialog, setHighRiskApprovalDialog] = useState<{ projectId: string; taskId: string; taskVersion: number; category: HighRiskCategory } | null>(null);
   const [userDiffReviewDialog, setUserDiffReviewDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
   const [mergeContinueDialog, setMergeContinueDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
@@ -461,6 +464,39 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   }, [client, isolations, highRiskApprovals]);
 
   useEffect(() => {
+    const pending = Object.values(isolations).filter((isolation) =>
+      isolation.taskState === "awaitingDesignApproval" &&
+      operationRiskAssessments[operationRiskAssessmentKey(isolation.taskId, isolation.taskVersion)] === undefined,
+    );
+    if (pending.length === 0) return;
+    setOperationRiskAssessments((current) => {
+      const next = { ...current };
+      for (const isolation of pending) {
+        next[operationRiskAssessmentKey(isolation.taskId, isolation.taskVersion)] = { kind: "loading" };
+      }
+      return next;
+    });
+    let active = true;
+    void Promise.all(pending.map(async (isolation) => {
+      const key = operationRiskAssessmentKey(isolation.taskId, isolation.taskVersion);
+      try {
+        const status = await client.getProviderImplementationRiskAssessmentStatus(
+          isolation.taskId,
+          isolation.taskVersion,
+        );
+        if (active) {
+          setOperationRiskAssessments((current) => ({ ...current, [key]: { kind: "ready", status } }));
+        }
+      } catch {
+        if (active) {
+          setOperationRiskAssessments((current) => ({ ...current, [key]: { kind: "error" } }));
+        }
+      }
+    }));
+    return () => { active = false; };
+  }, [client, isolations, operationRiskAssessments]);
+
+  useEffect(() => {
     setValidationForm(emptyValidationCommandForm);
   }, [activeTaskId]);
 
@@ -762,6 +798,23 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
         ...current,
         [dialog.taskId]: { ...current[dialog.taskId], [dialog.category]: { kind: "ready", approved: true } },
       }));
+      const key = operationRiskAssessmentKey(dialog.taskId, dialog.taskVersion);
+      setOperationRiskAssessments((current) => {
+        const assessment = current[key];
+        if (assessment?.kind !== "ready" || assessment.status.failureCategory !== null) return current;
+        return {
+          ...current,
+          [key]: {
+            kind: "ready",
+            status: {
+              ...assessment.status,
+              approvalReadiness: assessment.status.approvalReadiness.map((entry) =>
+                entry.riskCategory === dialog.category ? { ...entry, approved: true } : entry,
+              ),
+            },
+          },
+        };
+      });
     });
   };
   const refreshMergeConflictWriteStatus = async (taskId: string): Promise<MergeConflictWriteStatusState> => {
@@ -1051,6 +1104,23 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
                   </li>;
                 })}</ul>
               </section>
+              <ImplementationRiskAssessmentPanel
+                state={operationRiskAssessments[operationRiskAssessmentKey(isolation.taskId, isolation.taskVersion)] ?? { kind: "loading" }}
+                busy={busy}
+                onDeclare={(categories, explicitEmpty) => client.declareProviderImplementationRisk(
+                  isolation.taskId,
+                  isolation.taskVersion,
+                  categories,
+                  explicitEmpty,
+                )}
+                onRecorded={(assessment) => setOperationRiskAssessments((current) => ({
+                  ...current,
+                  [operationRiskAssessmentKey(isolation.taskId, isolation.taskVersion)]: {
+                    kind: "ready",
+                    status: assessment,
+                  },
+                }))}
+              />
             </div>}
             {isolation.taskState === "implementing" && <div className="planning-panel">
               <p className="muted">Claude Implementation is applying changes inside this task's isolated worktree. This may take a few minutes.</p>
@@ -1187,6 +1257,10 @@ function contextPackagePreparationCopy(workKind: "planning" | "implementation" |
     title: "Prepare Context Package v1 consent",
     description: `This records a one-time transmission consent and a content-free reference for the Context Package v1 data scope, covering ${categories}. Actual values are never shown here. This does not start Claude and does not change this task's status.`,
   };
+}
+
+function operationRiskAssessmentKey(taskId: string, taskVersion: number): string {
+  return `${taskId}:${taskVersion}`;
 }
 
 function highRiskCategoryLabel(category: HighRiskCategory): string {

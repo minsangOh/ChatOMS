@@ -1,4 +1,5 @@
 import type { IpcClient } from "../ipc/client";
+import { HIGH_RISK_CATEGORIES } from "../ipc/high_risk_approval";
 import type {
   BootstrapStatusDto,
   HealthDto,
@@ -95,6 +96,17 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
     startClaudeReviewContextPackage: async () => { throw new Error("not implemented in frontend tests"); },
     getHighRiskApprovalStatus: async () => ({ approved: false }),
     approveHighRiskOperation: async () => { throw new Error("not implemented in frontend tests"); },
+    getProviderImplementationRiskAssessmentStatus: async () => ({
+      assessmentRequired: true,
+      declarationExists: false,
+      selectedCategories: [],
+      approvalReadiness: HIGH_RISK_CATEGORIES.map((riskCategory) => ({
+        riskCategory,
+        approved: false,
+      })),
+      failureCategory: null,
+    }),
+    declareProviderImplementationRisk: async () => { throw new Error("not implemented in frontend tests"); },
     getUserDiffForReview: async () => { throw new Error("not implemented in frontend tests"); },
     approveUserDiff: async () => { throw new Error("not implemented in frontend tests"); },
     approveUserDiffAndStartMerge: async () => { throw new Error("not implemented in frontend tests"); },

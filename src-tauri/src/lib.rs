@@ -60,6 +60,8 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::review::start_claude_review_context_package,
             commands::high_risk_approval::get_high_risk_approval_status,
             commands::high_risk_approval::approve_high_risk_operation,
+            commands::operation_risk_assessment::get_provider_implementation_risk_assessment_status,
+            commands::operation_risk_assessment::declare_provider_implementation_risk,
             commands::user_diff_review::get_user_diff_for_review,
             commands::user_diff_review::approve_user_diff,
             commands::merge_execution::approve_user_diff_and_start_merge,

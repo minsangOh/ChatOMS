@@ -7,6 +7,7 @@ pub mod merge_conflict_inspection;
 pub mod merge_conflict_write_status;
 pub mod merge_continue;
 pub mod merge_execution;
+pub mod operation_risk_assessment;
 pub mod planning;
 pub mod post_merge_validation;
 pub mod projects;
@@ -19,7 +20,7 @@ pub mod testing;
 pub mod user_diff_review;
 pub mod validation_commands;
 
-pub const REGISTERED_HANDLERS: [&str; 53] = [
+pub const REGISTERED_HANDLERS: [&str; 55] = [
     "get_version",
     "get_health",
     "get_system_status",
@@ -67,6 +68,8 @@ pub const REGISTERED_HANDLERS: [&str; 53] = [
     "start_claude_review_context_package",
     "get_high_risk_approval_status",
     "approve_high_risk_operation",
+    "get_provider_implementation_risk_assessment_status",
+    "declare_provider_implementation_risk",
     "get_user_diff_for_review",
     "approve_user_diff",
     "approve_user_diff_and_start_merge",

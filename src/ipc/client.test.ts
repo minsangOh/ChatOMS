@@ -30,7 +30,7 @@ describe("typed IPC client", () => {
       ["get_task", { taskId: "task-id" }],
       ["list_task_history", { taskId: "task-id" }],
     ]);
-    expect(Object.values(IPC_COMMANDS)).toHaveLength(53);
+    expect(Object.values(IPC_COMMANDS)).toHaveLength(55);
   });
 
   it("returns a validated result and rejects malformed success data safely", async () => {
@@ -492,6 +492,49 @@ describe("typed IPC client", () => {
     ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
   });
 
+  it("uses exact versioned payloads for Provider Implementation risk assessment", async () => {
+    const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
+    const client = createIpcClient(transport);
+    await client.getProviderImplementationRiskAssessmentStatus("task-id", 3);
+    await client.declareProviderImplementationRisk("task-id", 3, ["dataMigration"], false);
+    await client.declareProviderImplementationRisk("task-id", 3, [], true);
+    expect(transport.mock.calls).toEqual([
+      [
+        "get_provider_implementation_risk_assessment_status",
+        { taskId: "task-id", expectedVersion: 3 },
+      ],
+      [
+        "declare_provider_implementation_risk",
+        {
+          taskId: "task-id",
+          expectedVersion: 3,
+          riskCategories: ["dataMigration"],
+          explicitEmpty: false,
+        },
+      ],
+      [
+        "declare_provider_implementation_risk",
+        { taskId: "task-id", expectedVersion: 3, riskCategories: [], explicitEmpty: true },
+      ],
+    ]);
+  });
+
+  it("rejects expanded Provider Implementation risk assessment responses", async () => {
+    for (const field of ["path", "digest", "stdout", "operation"]) {
+      const client = createIpcClient(async () => ({
+        assessmentRequired: true,
+        declarationExists: false,
+        selectedCategories: [],
+        approvalReadiness: riskAssessmentReadiness,
+        failureCategory: null,
+        [field]: "leaked",
+      }));
+      await expect(
+        client.getProviderImplementationRiskAssessmentStatus("task-id", 3),
+      ).rejects.toMatchObject({ code: "IPC_INVALID_RESPONSE" });
+    }
+  });
+
   it("uses versioned task-scoped payloads for user diff review approval and merge start", async () => {
     const transport = vi.fn<InvokeTransport>(async (command) => responses[command]);
     const client = createIpcClient(transport);
@@ -713,6 +756,22 @@ describe("typed IPC client", () => {
   });
 });
 
+const riskAssessmentReadiness = [
+  "architectureChange",
+  "databaseSchemaChange",
+  "authenticationOrAuthorizationChange",
+  "securityPolicyChange",
+  "externalNetworkBehaviorAddition",
+  "externalDataTransmissionAddition",
+  "largeScaleFileMoveOrDeletion",
+  "publicApiOrStorageFormatChange",
+  "operatingSystemConfigurationChange",
+  "administratorPrivilegesRequired",
+  "breakingCompatibilityChange",
+  "dataMigration",
+  "difficultToRecoverChange",
+].map((riskCategory) => ({ riskCategory, approved: riskCategory === "dataMigration" }));
+
 const responses: Record<string, unknown> = {
   get_version: version,
   get_health: health,
@@ -851,6 +910,20 @@ const responses: Record<string, unknown> = {
   },
   get_high_risk_approval_status: { approved: false },
   approve_high_risk_operation: { riskCategory: "dataMigration", approvedAtMs: 100 },
+  get_provider_implementation_risk_assessment_status: {
+    assessmentRequired: true,
+    declarationExists: false,
+    selectedCategories: [],
+    approvalReadiness: riskAssessmentReadiness,
+    failureCategory: null,
+  },
+  declare_provider_implementation_risk: {
+    assessmentRequired: false,
+    declarationExists: true,
+    selectedCategories: ["dataMigration"],
+    approvalReadiness: riskAssessmentReadiness,
+    failureCategory: null,
+  },
   get_user_diff_for_review: {
     diffText: "diff --git a/x b/x\n+line\n",
     diffContentHash: "a".repeat(64),
