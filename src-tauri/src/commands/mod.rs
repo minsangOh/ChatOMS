@@ -4,6 +4,7 @@ pub mod high_risk_approval;
 pub mod implementation;
 pub mod merge_abort;
 pub mod merge_conflict_inspection;
+pub mod merge_conflict_write_status;
 pub mod merge_continue;
 pub mod merge_execution;
 pub mod planning;
@@ -18,7 +19,7 @@ pub mod testing;
 pub mod user_diff_review;
 pub mod validation_commands;
 
-pub const REGISTERED_HANDLERS: [&str; 52] = [
+pub const REGISTERED_HANDLERS: [&str; 53] = [
     "get_version",
     "get_health",
     "get_system_status",
@@ -71,6 +72,7 @@ pub const REGISTERED_HANDLERS: [&str; 52] = [
     "approve_user_diff_and_start_merge",
     "confirm_manual_resolution_and_start_merge_continue",
     "confirm_merge_abort_and_start",
+    "get_merge_conflict_write_status",
 ];
 
 #[cfg(test)]

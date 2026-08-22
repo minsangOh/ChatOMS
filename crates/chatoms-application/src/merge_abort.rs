@@ -102,7 +102,7 @@ where
         .list_task_transitions(task_id)
         .map_err(repository_error)?;
     let Some(source_approval_task_version) =
-        crate::merge_conflict_inspection::merge_chain_approval_version(&transitions, &task)
+        crate::merge_provenance::resolve_merge_conflict_approval_version(&transitions, &task)
     else {
         return Err(category_error(FailureCategory::InvariantViolation));
     };
@@ -111,10 +111,17 @@ where
         .get_task_isolation(task_id)
         .map_err(repository_error)?
         .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+    // `TaskGitIsolation.expected_task_version` is the optimistic-
+    // concurrency value of the *isolation* lifecycle: it is stamped when a
+    // worktree operation is recorded and frozen once the isolation reaches
+    // `WorktreeReady`. It is deliberately not compared against the task's
+    // current version here — by the time a task reaches this point it has
+    // advanced many versions past `WorktreeReady`, so such a comparison
+    // could never hold. The task's own version is verified above; the
+    // isolation is verified by identity and status instead.
     if isolation.task_id != task_id
         || isolation.project_id != task.project_id()
         || isolation.status != GitIsolationStatus::WorktreeReady
-        || isolation.expected_task_version != expected_version
         || !isolation.branch_created_by_app
         || !isolation.worktree_created_by_app
     {

@@ -341,6 +341,15 @@ export interface MergeAbortStartDto {
   started: boolean;
 }
 
+/**
+ * Content-free: whether a merge-conflict Git write (continue or abort) is
+ * currently executing for this task. Which of the two it is, and everything
+ * it touches, is deliberately not exposed.
+ */
+export interface MergeConflictWriteStatusDto {
+  running: boolean;
+}
+
 export type ValidationCommandKind = "format" | "lint" | "typecheck" | "test" | "build";
 
 export interface ValidationCommandCandidateDto {

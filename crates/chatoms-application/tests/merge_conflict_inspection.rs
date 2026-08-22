@@ -210,15 +210,32 @@ fn reinspection_is_read_only_and_preserves_the_active_lease() {
 
 #[test]
 fn stale_version_lease_history_approval_and_identity_mismatches_fail_closed() {
-    for case in ["version", "lease", "history", "approval", "identity"] {
+    for case in ["stale_chain", "lease", "history", "approval", "identity"] {
         let (mut repository, task_id) = configured_repository();
         match case {
-            "version" => {
-                repository
-                    .isolations
-                    .get_mut(&task_id)
-                    .expect("isolation")
-                    .expected_task_version = 99
+            // `inspect` takes no expected version: the binding it enforces
+            // is that the merge chain ends at the task's *current* version.
+            // Advancing the task past the end of its recorded history must
+            // therefore resolve no provenance at all.
+            // `TaskGitIsolation.expected_task_version` is deliberately not a
+            // case here — it is the isolation lifecycle's own concurrency
+            // value, frozen at `WorktreeReady` and always behind a
+            // `MergeConflict` task (see
+            // `tests/merge_lifecycle_reachability.rs`).
+            "stale_chain" => {
+                let task = repository.tasks.get_mut(&task_id).expect("task");
+                *task = chatoms_domain::Task::restore(chatoms_domain::TaskSnapshot {
+                    id: task.id(),
+                    project_id: task.project_id(),
+                    state: task.state(),
+                    version: task.version() + 1,
+                    task_branch_identity: task.task_branch_identity().clone(),
+                    resume_target_state: None,
+                    created_at_ms: task.created_at_ms(),
+                    updated_at_ms: task.updated_at_ms(),
+                    terminal_at_ms: None,
+                })
+                .expect("restored task");
             }
             "lease" => repository.active_lease = None,
             "history" => {

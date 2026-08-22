@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { FrontendError, isRecord, toFrontendError } from "./errors";
 import { isHighRiskApprovalDto, isHighRiskApprovalStatusDto } from "./high_risk_approval";
 import { isMergeAbortStartDto } from "./merge_abort";
+import { isMergeConflictWriteStatusDto } from "./merge_conflict_write_status";
 import { isNullablePlanningResultDto } from "./planning_result";
 import { isPostMergeValidationResultDtoArray } from "./post_merge_validation_result";
 import { isNullableMergeConflictInspectionDto } from "./merge_conflict_inspection";
@@ -46,6 +47,7 @@ import type {
   LoggingStatus,
   LegacyMigrationDiagnosticDto,
   MergeAbortStartDto,
+  MergeConflictWriteStatusDto,
   PlanningResultDto,
   PostMergeValidationResultDto,
   MergeConflictInspectionDto,
@@ -126,6 +128,7 @@ export const IPC_COMMANDS = {
   approveUserDiffAndStartMerge: "approve_user_diff_and_start_merge",
   confirmManualResolutionAndStartMergeContinue: "confirm_manual_resolution_and_start_merge_continue",
   confirmMergeAbortAndStart: "confirm_merge_abort_and_start",
+  getMergeConflictWriteStatus: "get_merge_conflict_write_status",
 } as const;
 
 export type InvokeTransport = (
@@ -231,6 +234,7 @@ export interface IpcClient {
   ): Promise<TaskDto>;
   confirmManualResolutionAndStartMergeContinue(taskId: string, expectedVersion: number): Promise<TaskDto>;
   confirmMergeAbortAndStart(taskId: string, expectedVersion: number): Promise<MergeAbortStartDto>;
+  getMergeConflictWriteStatus(taskId: string): Promise<MergeConflictWriteStatusDto>;
 }
 
 const tauriTransport: InvokeTransport = (command, payload) =>
@@ -426,6 +430,8 @@ export function createIpcClient(transport: InvokeTransport = tauriTransport): Ip
         taskId,
         expectedVersion,
       }),
+    getMergeConflictWriteStatus: (taskId) =>
+      request(IPC_COMMANDS.getMergeConflictWriteStatus, isMergeConflictWriteStatusDto, { taskId }),
   };
 }
 

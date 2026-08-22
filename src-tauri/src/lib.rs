@@ -65,6 +65,7 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::merge_execution::approve_user_diff_and_start_merge,
             commands::merge_continue::confirm_manual_resolution_and_start_merge_continue,
             commands::merge_abort::confirm_merge_abort_and_start,
+            commands::merge_conflict_write_status::get_merge_conflict_write_status,
         ])
         .run(tauri::generate_context!())
 }

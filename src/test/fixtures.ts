@@ -100,6 +100,9 @@ export function createFakeClient(overrides: Partial<IpcClient> = {}): IpcClient 
     approveUserDiffAndStartMerge: async () => { throw new Error("not implemented in frontend tests"); },
     confirmManualResolutionAndStartMergeContinue: async () => { throw new Error("not implemented in frontend tests"); },
     confirmMergeAbortAndStart: async () => { throw new Error("not implemented in frontend tests"); },
+    // Default: no merge-conflict write in flight. Tests that care about the
+    // gate override this explicitly.
+    getMergeConflictWriteStatus: async () => ({ running: false }),
     ...overrides,
   };
 }

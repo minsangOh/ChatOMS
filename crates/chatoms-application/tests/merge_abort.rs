@@ -353,13 +353,13 @@ fn wrong_state_version_lease_history_or_identity_fails_closed_without_writing() 
                 })
                 .expect("restored task");
             }
-            "version" => {
-                repository
-                    .isolations
-                    .get_mut(&task_id)
-                    .expect("isolation")
-                    .expected_task_version = 99;
-            }
+            // The task's own optimistic-concurrency version, supplied by
+            // the caller below. `TaskGitIsolation.expected_task_version` is
+            // deliberately *not* a case here: it is the isolation
+            // lifecycle's own concurrency value, frozen at `WorktreeReady`
+            // and therefore always behind a `MergeConflict` task's version
+            // (see `tests/merge_lifecycle_reachability.rs`).
+            "version" => {}
             "lease" => repository.active_lease = None,
             "history" => {
                 repository.transitions.insert(task_id, Vec::new());
@@ -383,7 +383,10 @@ fn wrong_state_version_lease_history_or_identity_fails_closed_without_writing() 
 
         let error =
             MergeAbortApprovalService::new(&mut repository, &mut time, &mut filesystem, &mut git)
-                .approve(ApproveMergeAbortRequest::new(task_id, 3))
+                .approve(ApproveMergeAbortRequest::new(
+                    task_id,
+                    if case == "version" { 2 } else { 3 },
+                ))
                 .expect_err(&format!("case {case} must fail closed"));
         let _ = error;
 

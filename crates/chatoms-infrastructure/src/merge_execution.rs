@@ -126,8 +126,15 @@ impl<'a> CommitAndMerge<'a> {
             }
     }
 
+    /// `MERGE_AUTOSTASH` is listed alongside the other three: it is merge
+    /// residue exactly like them, and `crate::merge_continue`,
+    /// `crate::merge_abort` and `crate::merge_conflict_inspection` all
+    /// already treat it as such. Leaving it out here meant a checkout
+    /// carrying a leftover autostash entry was not rejected as
+    /// `ExistingMergeResidue`, so this adapter would go on to stage, commit
+    /// and merge on top of it.
     fn has_merge_residue(&self) -> bool {
-        ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"]
+        ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_AUTOSTASH"]
             .iter()
             .any(|name| {
                 self.request
@@ -262,27 +269,61 @@ impl<'a> CommitAndMerge<'a> {
         }
     }
 
+    /// Postcondition for a merge this adapter believes succeeded, at the
+    /// same strength as `crate::merge_continue`'s `classify_after_success`.
+    ///
+    /// Every clause must hold: the original checkout is on the expected base
+    /// branch; `HEAD` is the merge commit this call just observed; that
+    /// commit has exactly two parents in the order (approved base commit,
+    /// task commit); no merge residue is left behind; and the checkout is
+    /// clean. Anything short of that returns `false`, and the caller maps
+    /// that to the existing `PostWriteUncertain` outcome — a merge is never
+    /// reported as `Merged` on the strength of the parent list alone.
+    ///
+    /// No commit hash, path, or Git output read here reaches a DTO, the UI,
+    /// or an error: the only thing that escapes is this boolean.
     fn merged_task_commit(&mut self, task_commit: &str) -> bool {
         let root = self.root();
+        let Some(new_head) = self.root_head() else {
+            return false;
+        };
         let output = match self
             .git
-            .run_command(&root, ["rev-list", "--parents", "-n", "1", "HEAD"])
+            .run_command(&root, ["rev-list", "--parents", "-n", "1", &new_head])
         {
             Ok(output) if output.status.success() => output,
             _ => return false,
         };
-        let Some(parents) = GitCliAdapter::output_text(&output).ok() else {
+        let Ok(parents) = GitCliAdapter::output_text(&output) else {
             return false;
         };
         let mut parts = parents.split_whitespace();
-        let _merge_commit = parts.next();
-        parts.next() == Some(self.request.base_commit.as_str())
-            && parts.next() == Some(task_commit)
-            && parts.next().is_none()
-            && self
-                .git
-                .repository_status(&root)
-                .is_ok_and(|status| status.clean)
+        if parts.next() != Some(new_head.as_str())
+            || parts.next() != Some(self.request.base_commit.as_str())
+            || parts.next() != Some(task_commit)
+            || parts.next().is_some()
+        {
+            return false;
+        }
+        if self.has_merge_residue() {
+            return false;
+        }
+        self.git.repository_status(&root).is_ok_and(|status| {
+            status.clean
+                && status.current_branch.as_deref() == Some(&self.request.base_branch)
+                && status.head_commit.as_deref() == Some(new_head.as_str())
+        })
+    }
+
+    /// The original checkout's current `HEAD`, mirroring [`Self::task_head`]
+    /// for the task worktree.
+    fn root_head(&mut self) -> Option<String> {
+        let root = self.root();
+        self.git
+            .run_command(&root, ["rev-parse", "--verify", "HEAD"])
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| GitCliAdapter::output_text(&output).ok().map(str::to_owned))
     }
 }
 

@@ -18,7 +18,10 @@ use crate::{
     state::{ManagedRuntime, MergeConflictWriteLock},
 };
 
-use super::{merge_execution::record_post_merge_recovery, tasks::parse_task_id};
+use super::{
+    merge_execution::{BackgroundRecoveryOutcome, record_post_merge_recovery},
+    tasks::parse_task_id,
+};
 
 const ACTOR_KIND: &str = "user";
 const RESULT_REASON: &str = "task.merge-continue.result";
@@ -117,7 +120,14 @@ pub fn handle_confirm_manual_resolution_and_start_merge_continue(
     let mut filesystem_for_thread = ready.filesystem.clone();
     let app_temp_dir = ready.app_temp_dir();
 
-    std::thread::spawn(move || {
+    // `Builder::spawn` rather than `thread::spawn`: the latter panics when
+    // the OS refuses a new thread. `write_lock_guard` has been moved into
+    // the closure by that point, and on the `Err` path `spawn` owns and
+    // drops the closure — so the guard's `Drop` releases the lock exactly as
+    // it does on every other exit path, and the same task can immediately
+    // try again. The `Merging` transition is already committed here, so the
+    // failure path below also records the existing fail-closed recovery.
+    let spawn_result = std::thread::Builder::new().spawn(move || {
         // Declared first so it is dropped last: the lock stays held for the
         // whole background write, including the fail-closed recovery
         // recording below, and is released on every exit from this closure.
@@ -164,14 +174,23 @@ pub fn handle_confirm_manual_resolution_and_start_merge_continue(
             }
         }));
         if result.is_err() {
-            record_uncertain_background(
-                &mut repository_for_thread,
-                &mut time_for_thread,
-                id,
-                started_version,
-            );
+            let _ =
+                record_uncertain_background(&mut repository_for_thread, &mut time_for_thread, id);
         }
     });
+    if spawn_result.is_err() {
+        // The lock was released when `spawn` dropped the closure. No Git
+        // write happened, but `MergeContinueStarter::begin` has already
+        // committed `MergeConflict -> Merging`, so the task is moved to the
+        // existing fail-closed recovery outcome against its currently
+        // persisted state and version rather than being left as if a
+        // merge-continue were running. The raw spawn error is dropped here.
+        let mut repository_for_recovery = ready.repository.clone();
+        let mut time_for_recovery = ready.time.clone();
+        let _ =
+            record_uncertain_background(&mut repository_for_recovery, &mut time_for_recovery, id);
+        return Err(category_error(FailureCategory::Internal));
+    }
 
     Ok(task_dto)
 }
@@ -193,31 +212,31 @@ fn record_uncertain_merge_continue(
     );
 }
 
-/// Mirrors `commands::merge_execution::record_uncertain_background`: a panic
-/// caught by the outer `catch_unwind` above could have happened either
-/// inside the merge-continue write itself (task still `Merging`) or inside
-/// the reused post-merge validation path that follows a successful
-/// `Continued` (task already `PostMergeTesting`) — the correct fail-closed
-/// recovery call differs by which stage was in flight.
+/// Mirrors [`crate::commands::merge_execution::record_uncertain_background`],
+/// including why the stage *and* the version are both read from the task as
+/// it is persisted now: a panic caught by the outer `catch_unwind` above
+/// could have happened either inside the merge-continue write itself (task
+/// still `Merging`) or inside the reused post-merge validation path that
+/// follows a successful `Continued` (task already `PostMergeTesting`), and
+/// the version this run started with is stale in the latter case.
 fn record_uncertain_background(
     repository: &mut crate::state::RepositoryHandle,
     time: &mut crate::state::TimeProviderHandle,
     task_id: chatoms_domain::TaskId,
-    expected_version: u64,
-) {
-    let state = repository
-        .get_task(task_id)
-        .ok()
-        .flatten()
-        .map(|task| task.state());
-    match state {
-        Some(TaskState::Merging) => {
-            record_uncertain_merge_continue(repository, time, task_id, expected_version);
+) -> BackgroundRecoveryOutcome {
+    let Ok(Some(task)) = repository.get_task(task_id) else {
+        return BackgroundRecoveryOutcome::Unresolved;
+    };
+    match task.state() {
+        TaskState::Merging => {
+            record_uncertain_merge_continue(repository, time, task_id, task.version());
+            BackgroundRecoveryOutcome::Recorded
         }
-        Some(TaskState::PostMergeTesting) => {
-            record_post_merge_recovery(repository, time, task_id, expected_version);
+        TaskState::PostMergeTesting => {
+            record_post_merge_recovery(repository, time, task_id, task.version());
+            BackgroundRecoveryOutcome::Recorded
         }
-        _ => {}
+        _ => BackgroundRecoveryOutcome::NotApplicable,
     }
 }
 
@@ -240,9 +259,44 @@ pub fn confirm_manual_resolution_and_start_merge_continue(
 
 #[cfg(test)]
 mod tests {
-    use super::ReleaseWriteLockOnDrop;
+    use super::super::merge_execution::tests::{handles, task_at};
+    use super::{BackgroundRecoveryOutcome, ReleaseWriteLockOnDrop};
     use crate::state::MergeConflictWriteLock;
-    use chatoms_domain::TaskId;
+    use chatoms_domain::{TaskId, TaskState};
+    use chatoms_ports::repository::RepositoryErrorCode;
+
+    /// The same defect as
+    /// `commands::merge_execution::tests::post_merge_recovery_uses_the_currently_persisted_version_not_the_starting_one`:
+    /// a merge-continue background run starts at the `MergeConflict ->
+    /// Merging` version, but once `Merging -> PostMergeTesting` commits, a
+    /// panic escaping the outer containment must record recovery against
+    /// the new version. The old code reused the starting version, so the
+    /// write failed `VersionConflict` and was silently discarded.
+    #[test]
+    fn post_merge_recovery_uses_the_currently_persisted_version_not_the_starting_one() {
+        let started_version = 5;
+        let task = task_at(TaskState::PostMergeTesting, started_version + 1);
+        let task_id = task.id();
+        let (mut repository, mut time, saved) = handles(Ok(Some(task)));
+
+        let outcome = super::record_uncertain_background(&mut repository, &mut time, task_id);
+
+        assert_eq!(outcome, BackgroundRecoveryOutcome::Recorded);
+        assert_eq!(
+            *saved.lock().expect("saved transitions mutex"),
+            vec![(started_version + 1, TaskState::RecoveryRequired)]
+        );
+    }
+
+    #[test]
+    fn a_failed_task_lookup_is_reported_unresolved_rather_than_silently_succeeding() {
+        let (mut repository, mut time, saved) = handles(Err(RepositoryErrorCode::OperationFailed));
+
+        let outcome = super::record_uncertain_background(&mut repository, &mut time, TaskId::new());
+
+        assert_eq!(outcome, BackgroundRecoveryOutcome::Unresolved);
+        assert!(saved.lock().expect("saved transitions mutex").is_empty());
+    }
 
     #[test]
     fn dropping_the_guard_when_the_background_thread_finishes_releases_the_lock() {
@@ -280,6 +334,33 @@ mod tests {
         assert!(
             lock.register(task_id),
             "the guard's Drop must release the lock during unwinding, not only on normal exit"
+        );
+    }
+
+    /// `Builder::spawn` takes ownership of the closure it is handed and, on
+    /// the `Err` path the OS can produce under thread exhaustion, drops it
+    /// without ever running it. The production code has already moved
+    /// `write_lock_guard` into that closure by then, so this models exactly
+    /// what a refused spawn does: the lock must come back, and the same task
+    /// must be able to start a merge-conflict write again immediately.
+    #[test]
+    fn a_closure_owning_the_guard_releases_the_lock_when_it_is_dropped_unrun() {
+        let lock = MergeConflictWriteLock::new();
+        let task_id = TaskId::new();
+        assert!(lock.register(task_id));
+        let write_lock_guard = ReleaseWriteLockOnDrop {
+            merge_conflict_writes: lock.clone(),
+            task_id,
+        };
+
+        let never_run = move || {
+            let _write_lock_guard = write_lock_guard;
+        };
+        drop(never_run);
+
+        assert!(
+            lock.register(task_id),
+            "a spawn that never ran the closure must still have released the lock"
         );
     }
 

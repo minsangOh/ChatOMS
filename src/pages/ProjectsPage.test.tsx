@@ -1638,7 +1638,179 @@ it("requires an explicit checkbox before confirming a merge abort, prevents dupl
   // Task state stays `mergeConflict` while the background abort runs, so
   // both the continue and (a second) abort action must be replaced by a
   // status message rather than remaining independently clickable.
-  expect(await screen.findByText("A merge abort is in progress for this task. This status updates automatically.")).toBeVisible();
+  expect(await screen.findByText("A merge action is in progress for this task. This status updates automatically.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+});
+
+// Phase 5f-3b: the merge-conflict actions are gated on the Tauri runtime's
+// shared `MergeConflictWriteLock`, not on this page's local state. A task
+// stays `mergeConflict` for the whole duration of a background
+// merge-continue or merge-abort write, so "still `mergeConflict` after
+// another polling tick" is not evidence that the write finished.
+
+it("offers no merge action while the runtime reports a merge-conflict write running, even for an action-eligible outcome", async () => {
+  renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    getMergeConflictWriteStatus: async () => ({ running: true }),
+  });
+
+  expect(await screen.findByText("A merge action is in progress for this task. This status updates automatically.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+});
+
+it("does not re-enable merge actions on a polling tick while the write is still running", async () => {
+  vi.useFakeTimers();
+  try {
+    const confirmMergeAbortAndStart = vi.fn().mockResolvedValue({ started: true });
+    // The lock is genuinely still held for the whole of this test: a
+    // polling tick must not override that with "the task is still
+    // mergeConflict, so let the user click again".
+    const getMergeConflictWriteStatus = vi.fn().mockResolvedValue({ running: true });
+    renderActiveTask("mergeConflict", {
+      getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+      getMergeConflictWriteStatus,
+      confirmMergeAbortAndStart,
+    });
+
+    await vi.waitFor(() => expect(getMergeConflictWriteStatus).toHaveBeenCalled());
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+    expect(confirmMergeAbortAndStart).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("restores the outcome's permitted actions only once the runtime confirms the write finished", async () => {
+  vi.useFakeTimers();
+  try {
+    const getMergeConflictWriteStatus = vi
+      .fn()
+      .mockResolvedValueOnce({ running: true })
+      .mockResolvedValue({ running: false });
+    renderActiveTask("mergeConflict", {
+      getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+      getMergeConflictWriteStatus,
+    });
+
+    await vi.waitFor(() =>
+      expect(screen.queryByText("A merge action is in progress for this task. This status updates automatically.")).not.toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(2000);
+
+    await vi.waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).not.toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).not.toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("offers no merge action and shows content-free copy while the write status is loading or failed", async () => {
+  const { unmount } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    getMergeConflictWriteStatus: () => new Promise(() => {}),
+  });
+  expect(await screen.findByText("Checking whether a merge action is currently running…")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+  unmount();
+
+  // A malformed payload reaches this page as exactly this rejection: the
+  // runtime guard in `src/ipc/merge_conflict_write_status.ts` refuses a
+  // response carrying any extra field (covered in that module's own tests),
+  // so the page never sees one and only has to fail safe on the rejection.
+  renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    getMergeConflictWriteStatus: async () => {
+      throw new FrontendError({
+        code: "IPC_INVALID_RESPONSE",
+        message: "PRIVATEPATH stdout leaked",
+        severity: "error",
+        retry: "never",
+      });
+    },
+  });
+  expect(
+    await screen.findByText("The merge action status could not be checked safely. No merge action is offered until it can be."),
+  ).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+  expect(document.body.textContent).not.toContain("PRIVATEPATH");
+});
+
+it("re-reads the write status after an abort reports started: false", async () => {
+  const confirmMergeAbortAndStart = vi.fn().mockResolvedValue({ started: false });
+  const getMergeConflictWriteStatus = vi.fn().mockResolvedValue({ running: false });
+  const { isolation } = renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "confirmedUnresolved", counts: noConflictCounts }),
+    getMergeConflictWriteStatus,
+    confirmMergeAbortAndStart,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Abort the in-progress merge" }));
+  fireEvent.click(await screen.findByRole("checkbox", { name: "I approve aborting the in-progress merge and cancelling this task." }));
+  const callsBefore = getMergeConflictWriteStatus.mock.calls.length;
+  fireEvent.click(screen.getByRole("button", { name: "Confirm abort" }));
+
+  await waitFor(() => expect(getMergeConflictWriteStatus.mock.calls.length).toBeGreaterThan(callsBefore));
+  expect(getMergeConflictWriteStatus).toHaveBeenLastCalledWith(isolation.taskId);
+});
+
+it("swallows a merge-continue rejection into the fixed busy notice only when the runtime confirms a write is running", async () => {
+  const confirmManualResolutionAndStartMergeContinue = vi.fn().mockRejectedValue(
+    new FrontendError({
+      code: "APP_CONFLICT",
+      message: "PRIVATEPATH another merge-conflict write is in flight",
+      severity: "error",
+      retry: "afterStateRefresh",
+    }),
+  );
+  const getMergeConflictWriteStatus = vi
+    .fn()
+    .mockResolvedValueOnce({ running: false })
+    .mockResolvedValue({ running: true });
+  renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    getMergeConflictWriteStatus,
+    confirmManualResolutionAndStartMergeContinue,
+  });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Confirm the staged merge resolution" }));
+  fireEvent.click(await screen.findByRole("checkbox", { name: /I reviewed the staged merge resolution/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and continue" }));
+
+  expect(await screen.findByText("A merge action is in progress for this task. This status updates automatically.")).toBeVisible();
+  expect(screen.queryByRole("heading", { name: "Confirm the staged merge resolution" })).toBeNull();
+  expect(document.body.textContent).not.toContain("PRIVATEPATH");
+  expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
+});
+
+it("never offers the continue and abort actions as simultaneously executable once one is started", async () => {
+  const confirmMergeAbortAndStart = vi.fn().mockResolvedValue({ started: true });
+  renderActiveTask("mergeConflict", {
+    getMergeConflictInspection: async () => ({ outcome: "resolvedPendingConfirmation", counts: noConflictCounts }),
+    getMergeConflictWriteStatus: async () => ({ running: false }),
+    confirmMergeAbortAndStart,
+  });
+
+  // Both are offered while nothing is running; that is the only moment they
+  // coexist, and choosing either must immediately withdraw both.
+  expect(await screen.findByRole("button", { name: "Confirm the staged merge resolution" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Abort the in-progress merge" }));
+  fireEvent.click(await screen.findByRole("checkbox", { name: "I approve aborting the in-progress merge and cancelling this task." }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm abort" }));
+
+  await waitFor(() => expect(confirmMergeAbortAndStart).toHaveBeenCalledTimes(1));
+  expect(await screen.findByText("A merge action is in progress for this task. This status updates automatically.")).toBeVisible();
   expect(screen.queryByRole("button", { name: "Confirm the staged merge resolution" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Abort the in-progress merge" })).toBeNull();
 });
@@ -1655,7 +1827,7 @@ it("shows a safe already-processing notice without a raw error when the abort co
   fireEvent.click(screen.getByRole("button", { name: "Confirm abort" }));
 
   expect(
-    await screen.findByText("A merge abort is already in progress for this task. Refresh to check its status."),
+    await screen.findByText("A merge action is already processing for this task, or its status needs to be refreshed. This status updates automatically."),
   ).toBeVisible();
   expect(screen.getByRole("heading", { name: "Abort the in-progress merge" })).toBeVisible();
   expect(confirmMergeAbortAndStart).toHaveBeenCalledTimes(1);

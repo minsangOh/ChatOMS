@@ -30,7 +30,7 @@ describe("typed IPC client", () => {
       ["get_task", { taskId: "task-id" }],
       ["list_task_history", { taskId: "task-id" }],
     ]);
-    expect(Object.values(IPC_COMMANDS)).toHaveLength(52);
+    expect(Object.values(IPC_COMMANDS)).toHaveLength(53);
   });
 
   it("returns a validated result and rejects malformed success data safely", async () => {

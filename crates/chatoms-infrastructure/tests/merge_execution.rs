@@ -120,6 +120,26 @@ impl GitWriteCommandObserver for ConflictBeforeMerge {
     }
 }
 
+/// Detaches the original checkout's `HEAD` immediately before the merge
+/// write. Everything the prewrite gate checked (clean checkout, on the base
+/// branch, at the base commit) was true when it looked, and the merge itself
+/// still succeeds and still produces a correct two-parent commit — only the
+/// postcondition can catch that the merge landed on a detached `HEAD`
+/// instead of on the expected base branch.
+struct DetachHeadBeforeMerge {
+    root: PathBuf,
+    detached: AtomicBool,
+}
+
+impl GitWriteCommandObserver for DetachHeadBeforeMerge {
+    fn before_command(&self, command: GitWriteCommand) {
+        if command != GitWriteCommand::Merge || self.detached.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        git(&self.root, &["checkout", "--detach"]);
+    }
+}
+
 struct TimeoutBeforeStage;
 
 impl GitWriteCommandObserver for TimeoutBeforeStage {
@@ -332,5 +352,94 @@ fn commit_and_merge_treats_a_write_timeout_as_uncertain_without_staging() {
             &["rev-parse", "HEAD"]
         ),
         request.base_commit
+    );
+}
+
+#[test]
+fn commit_and_merge_rejects_an_autostash_residue_before_any_git_write() {
+    let (root, _worktree_parent, _control, mut adapter, mut request) = prepared_task();
+    fs::write(
+        request.task_worktree.canonical_path.join("tracked.txt"),
+        "approved
+",
+    )
+    .expect("task change");
+    approve_current_candidate(&mut adapter, &mut request);
+    let worktree_head_before = git(
+        &request.task_worktree.canonical_path,
+        &["rev-parse", "HEAD"],
+    );
+    fs::write(
+        request
+            .original_common_dir
+            .canonical_path
+            .join("MERGE_AUTOSTASH"),
+        "0000000000000000000000000000000000000000
+",
+    )
+    .expect("autostash residue");
+
+    let outcome = adapter.commit_and_merge(&request);
+
+    assert_eq!(
+        outcome,
+        MergeExecutionOutcome::PreWriteRejected(PreWriteRejection::ExistingMergeResidue),
+        "a leftover MERGE_AUTOSTASH is merge residue exactly like MERGE_HEAD"
+    );
+    assert_eq!(
+        git(root.path(), &["rev-parse", "HEAD"]),
+        request.base_commit,
+        "the base branch must not have moved"
+    );
+    assert_eq!(
+        git(
+            &request.task_worktree.canonical_path,
+            &["rev-parse", "HEAD"]
+        ),
+        worktree_head_before,
+        "no task commit may be created"
+    );
+    assert!(
+        !git(
+            &request.task_worktree.canonical_path,
+            &["status", "--porcelain=v1"]
+        )
+        .is_empty(),
+        "the approved change is still uncommitted in the task worktree, i.e.          `git add` never ran"
+    );
+}
+
+#[test]
+fn commit_and_merge_does_not_report_success_when_the_merge_lands_off_the_base_branch() {
+    let (root, _worktree_parent, _control, mut adapter, mut request) = prepared_task();
+    fs::write(
+        request.task_worktree.canonical_path.join("tracked.txt"),
+        "approved
+",
+    )
+    .expect("task change");
+    approve_current_candidate(&mut adapter, &mut request);
+    let observer = Arc::new(DetachHeadBeforeMerge {
+        root: root.path().to_path_buf(),
+        detached: AtomicBool::new(false),
+    });
+    adapter.set_write_command_observer(Some(observer.clone()));
+
+    let outcome = adapter.commit_and_merge(&request);
+
+    adapter.set_write_command_observer(None);
+    assert!(
+        observer.detached.load(Ordering::SeqCst),
+        "the fixture must actually have detached HEAD before the merge"
+    );
+    assert_eq!(
+        outcome,
+        MergeExecutionOutcome::PostWriteUncertain,
+        "a merge that produced the right two parents but landed on a detached HEAD          instead of the expected base branch must not be reported as Merged"
+    );
+    assert_eq!(
+        git(root.path(), &["rev-parse", "main"]),
+        request.base_commit,
+        "the expected base branch itself never moved, which is exactly why          the parent list alone is not enough evidence"
     );
 }

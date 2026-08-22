@@ -42,6 +42,18 @@ type PostMergeValidationLoadState =
   | { kind: "loading" }
   | { kind: "ready"; results: readonly PostMergeValidationResultDto[] }
   | { kind: "error" };
+/**
+ * The authoritative answer to "is a merge-conflict Git write executing for
+ * this task right now", as reported by the Tauri runtime's shared
+ * `MergeConflictWriteLock`. `loading` and `error` are both treated as
+ * fail-safe: no merge action is offered until a `ready` response says the
+ * lock is free.
+ */
+type MergeConflictWriteStatusState =
+  | { kind: "loading" }
+  | { kind: "error" }
+  | { kind: "ready"; running: boolean };
+
 type MergeConflictInspectionLoadState =
   | { kind: "loading" }
   | { kind: "ready"; result: MergeConflictInspectionDto | null }
@@ -91,6 +103,7 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [reviewResults, setReviewResults] = useState<Record<string, ReviewResultLoadState>>({});
   const [postMergeValidationResults, setPostMergeValidationResults] = useState<Record<string, PostMergeValidationLoadState>>({});
   const [mergeConflictInspections, setMergeConflictInspections] = useState<Record<string, MergeConflictInspectionLoadState>>({});
+  const [mergeConflictWriteStatuses, setMergeConflictWriteStatuses] = useState<Record<string, MergeConflictWriteStatusState>>({});
   const [validationCandidates, setValidationCandidates] = useState<Record<string, ValidationCandidatesLoadState>>({});
   const [validationApprovals, setValidationApprovals] = useState<Record<string, ValidationApprovalLoadState>>({});
   const [validationForm, setValidationForm] = useState<ValidationCommandForm>(emptyValidationCommandForm);
@@ -104,7 +117,15 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   const [mergeAbortDialog, setMergeAbortDialog] = useState<{ projectId: string; taskId: string; taskVersion: number } | null>(null);
   const [mergeAbortConfirmed, setMergeAbortConfirmed] = useState(false);
   const [mergeAbortNotice, setMergeAbortNotice] = useState<string | null>(null);
-  const [mergeAbortRuns, setMergeAbortRuns] = useState<Record<string, boolean>>({});
+  /**
+   * Set the moment this page successfully asks the backend to start a
+   * merge-conflict write, so a second click cannot get through before the
+   * first status poll comes back. Unlike the flag it replaces, nothing
+   * clears this on a timer: only an authoritative `running: false`, or the
+   * task leaving `mergeConflict`, does.
+   */
+  const [mergeConflictWriteStarts, setMergeConflictWriteStarts] = useState<Record<string, boolean>>({});
+  const [mergeConflictWriteNotices, setMergeConflictWriteNotices] = useState<Record<string, string>>({});
 
   useEffect(() => {
     let active = true;
@@ -326,6 +347,30 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
 
   useEffect(() => {
     const pending = Object.values(isolations).filter(
+      (isolation) => isolation.taskState === "mergeConflict" && mergeConflictWriteStatuses[isolation.taskId] === undefined,
+    );
+    if (pending.length === 0) return;
+    setMergeConflictWriteStatuses((current) => {
+      const next = { ...current };
+      for (const isolation of pending) next[isolation.taskId] = { kind: "loading" };
+      return next;
+    });
+    let active = true;
+    void Promise.all(
+      pending.map(async (isolation) => {
+        try {
+          const status = await client.getMergeConflictWriteStatus(isolation.taskId);
+          if (active) setMergeConflictWriteStatuses((current) => ({ ...current, [isolation.taskId]: { kind: "ready", running: status.running } }));
+        } catch {
+          if (active) setMergeConflictWriteStatuses((current) => ({ ...current, [isolation.taskId]: { kind: "error" } }));
+        }
+      }),
+    );
+    return () => { active = false; };
+  }, [client, isolations, mergeConflictWriteStatuses]);
+
+  useEffect(() => {
+    const pending = Object.values(isolations).filter(
       (isolation) => isolation.taskState === "testing" && validationCandidates[isolation.taskId] === undefined,
     );
     if (pending.length === 0) return;
@@ -444,14 +489,29 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
             } catch {
               setMergeConflictInspections((current) => ({ ...current, [next.taskId]: { kind: "error" } }));
             }
-            // A background merge abort never changes task state until it is
-            // confirmed one way or another, so this task staying in
-            // `mergeConflict` across a full polling interval is the only
-            // available signal that enough time has passed to safely allow
-            // another attempt. The backend's `MergeAbortRunRegistry` is the
-            // actual safety net against a real duplicate write; this local
-            // flag only prevents an immediate double-click race.
-            setMergeAbortRuns((current) => (current[next.taskId] ? { ...current, [next.taskId]: false } : current));
+            // A background merge-conflict write never changes task state
+            // until it is confirmed one way or another, so "still
+            // `mergeConflict` after another tick" says nothing at all about
+            // whether a write is running. The authoritative answer is the
+            // runtime's shared `MergeConflictWriteLock`, so ask it — and
+            // clear this page's local in-flight flag only when that lock
+            // reports itself free, never on the strength of a tick.
+            try {
+              const status = await client.getMergeConflictWriteStatus(next.taskId);
+              setMergeConflictWriteStatuses((current) => ({ ...current, [next.taskId]: { kind: "ready", running: status.running } }));
+              if (!status.running) {
+                setMergeConflictWriteStarts((current) => (current[next.taskId] ? { ...current, [next.taskId]: false } : current));
+              }
+            } catch {
+              setMergeConflictWriteStatuses((current) => ({ ...current, [next.taskId]: { kind: "error" } }));
+            }
+          } else {
+            // `cancelled`, `merging`, `postMergeTesting`, `recoveryRequired`
+            // and friends: the merge-conflict surface is gone, so drop the
+            // state that belongs to it rather than leaving a stale
+            // in-flight flag behind for a later re-entry into
+            // `mergeConflict`.
+            clearMergeConflictWriteState(next.taskId);
           }
         }),
       ).catch(() => {});
@@ -459,6 +519,12 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
     return () => clearInterval(interval);
   }, [client, isolations]);
 
+  const clearMergeConflictWriteState = useCallback((taskId: string) => {
+    setMergeConflictWriteStatuses((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+    setMergeConflictWriteStarts((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+    setMergeConflictWriteNotices((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+    setMergeConflictInspections((current) => { if (current[taskId] === undefined) return current; const next = { ...current }; delete next[taskId]; return next; });
+  }, []);
   const retry = useCallback(() => setRequestId((value) => value + 1), []);
   const run = async (operation: () => Promise<void>) => {
     setBusy(true);
@@ -698,16 +764,51 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
       }));
     });
   };
+  const refreshMergeConflictWriteStatus = async (taskId: string): Promise<MergeConflictWriteStatusState> => {
+    let next: MergeConflictWriteStatusState;
+    try {
+      const status = await client.getMergeConflictWriteStatus(taskId);
+      next = { kind: "ready", running: status.running };
+    } catch {
+      next = { kind: "error" };
+    }
+    setMergeConflictWriteStatuses((current) => ({ ...current, [taskId]: next }));
+    return next;
+  };
   const confirmMergeContinue = async () => {
     if (!mergeContinueDialog) return;
     const dialog = mergeContinueDialog;
     await run(async () => {
-      const result = await client.confirmManualResolutionAndStartMergeContinue(
-        dialog.taskId,
-        dialog.taskVersion,
-      );
+      let result;
+      try {
+        result = await client.confirmManualResolutionAndStartMergeContinue(
+          dialog.taskId,
+          dialog.taskVersion,
+        );
+      } catch (error: unknown) {
+        // The rejection may be the shared lock turning this call away
+        // because a merge-conflict write is already running, or it may be a
+        // genuine failure the user needs to read (a stale resolution
+        // digest, say). The error code alone cannot tell those apart —
+        // `APP_CONFLICT` covers both — so ask the authoritative lock
+        // instead. Only a confirmed in-flight write is swallowed into the
+        // fixed busy notice; everything else propagates to the existing
+        // error surface with the dialog left open.
+        const status = await refreshMergeConflictWriteStatus(dialog.taskId);
+        if (status.kind === "ready" && status.running) {
+          setMergeContinueDialog(null);
+          setMergeContinueConfirmed(false);
+          setMergeConflictWriteNotices((current) => ({ ...current, [dialog.taskId]: MERGE_CONFLICT_WRITE_BUSY_NOTICE }));
+          return;
+        }
+        throw error;
+      }
       setMergeContinueDialog(null);
       setMergeContinueConfirmed(false);
+      // The write is now running and holds the shared lock. Nothing but an
+      // authoritative `running: false` clears this.
+      setMergeConflictWriteStarts((current) => ({ ...current, [dialog.taskId]: true }));
+      setMergeConflictWriteNotices((current) => { const next = { ...current }; delete next[dialog.taskId]; return next; });
       setIsolations((current) => {
         const existing = current[dialog.projectId];
         if (!existing) return current;
@@ -724,14 +825,17 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
         setMergeAbortDialog(null);
         setMergeAbortConfirmed(false);
         setMergeAbortNotice(null);
-        // Task state stays `mergeConflict` while the background abort runs;
-        // this flag hides both the continue and abort actions for this task
-        // until the next polling tick (see the polling effect above), which
-        // is what keeps merge-continue and merge-abort from ever appearing
-        // simultaneously executable for the same task.
-        setMergeAbortRuns((current) => ({ ...current, [dialog.taskId]: true }));
+        // Task state stays `mergeConflict` while the background abort runs.
+        // This flag withholds both the continue and abort actions until the
+        // shared `MergeConflictWriteLock` itself reports the write finished,
+        // which is what keeps merge-continue and merge-abort from ever
+        // appearing simultaneously executable for the same task.
+        setMergeConflictWriteStarts((current) => ({ ...current, [dialog.taskId]: true }));
+        setMergeConflictWriteNotices((current) => { const next = { ...current }; delete next[dialog.taskId]; return next; });
       } else {
-        setMergeAbortNotice("A merge abort is already in progress for this task. Refresh to check its status.");
+        await refreshMergeConflictWriteStatus(dialog.taskId);
+        setMergeAbortNotice(MERGE_CONFLICT_WRITE_BUSY_NOTICE);
+        setMergeConflictWriteNotices((current) => ({ ...current, [dialog.taskId]: MERGE_CONFLICT_WRITE_BUSY_NOTICE }));
       }
     });
   };
@@ -826,6 +930,13 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
   }
 
   if (mergeContinueDialog) {
+    // Re-checked here, not only where the action was offered: if the shared
+    // lock is taken (or its status becomes unreadable) while this dialog is
+    // open, confirming must not be possible.
+    const actionsAllowed = mergeConflictActionsAllowed(
+      mergeConflictWriteStatuses[mergeContinueDialog.taskId],
+      mergeConflictWriteStarts[mergeContinueDialog.taskId] === true,
+    );
     return <div className="page-stack">
       <header className="page-header"><div><p className="eyebrow">Merge conflict resolution</p><h1>Confirm the staged merge resolution</h1><p>Git reports no unresolved entries. Continuing will create a merge commit from the currently staged resolution in the original checkout. ChatOMS will stop if that staged result changes before the commit.</p></div></header>
       <section className="content-card" aria-labelledby="merge-continue-confirm-form"><h2 id="merge-continue-confirm-form">Confirm and continue</h2>
@@ -834,16 +945,21 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
           I reviewed the staged merge resolution and approve creating the merge commit.
         </label>
         <p className="muted">This confirmation is separate from the earlier task diff approval.</p>
+        {!actionsAllowed && <p className="muted">{MERGE_CONFLICT_WRITE_BUSY_NOTICE}</p>}
         {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
         <div className="form-actions">
           <button className="button button--secondary" type="button" onClick={() => { setMergeContinueDialog(null); setMergeContinueConfirmed(false); }} disabled={busy}>Cancel</button>
-          <button className="button" type="button" disabled={busy || !mergeContinueConfirmed} onClick={() => void confirmMergeContinue()}>Confirm and continue</button>
+          <button className="button" type="button" disabled={busy || !mergeContinueConfirmed || !actionsAllowed} onClick={() => void confirmMergeContinue()}>Confirm and continue</button>
         </div>
       </section>
     </div>;
   }
 
   if (mergeAbortDialog) {
+    const actionsAllowed = mergeConflictActionsAllowed(
+      mergeConflictWriteStatuses[mergeAbortDialog.taskId],
+      mergeConflictWriteStarts[mergeAbortDialog.taskId] === true,
+    );
     return <div className="page-stack">
       <header className="page-header"><div><p className="eyebrow">Merge conflict resolution</p><h1>Abort the in-progress merge</h1><p>This discards the staged merge resolution in the original checkout and restores it to the base commit it had before the merge started. Your task branch and its commit are not deleted. The task is then cancelled and cannot be resumed.</p></div></header>
       <section className="content-card" aria-labelledby="merge-abort-confirm-form"><h2 id="merge-abort-confirm-form">Confirm abort</h2>
@@ -856,7 +972,7 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
         {operationError && <div className="inline-notice" role="alert"><strong>{operationError.message}</strong><span className="identifier">{operationError.code}</span></div>}
         <div className="form-actions">
           <button className="button button--secondary" type="button" onClick={() => { setMergeAbortDialog(null); setMergeAbortConfirmed(false); setMergeAbortNotice(null); }} disabled={busy}>Cancel</button>
-          <button className="button" type="button" disabled={busy || !mergeAbortConfirmed} onClick={() => void confirmMergeAbort()}>Confirm abort</button>
+          <button className="button" type="button" disabled={busy || !mergeAbortConfirmed || !actionsAllowed} onClick={() => void confirmMergeAbort()}>Confirm abort</button>
         </div>
       </section>
     </div>;
@@ -1019,7 +1135,9 @@ export function ProjectsPage({ client }: ProjectsPageProps) {
               mergeConflictInspections[isolation.taskId],
               () => { setMergeAbortDialog(null); setMergeContinueDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion }); },
               () => { setMergeContinueDialog(null); setMergeAbortNotice(null); setMergeAbortDialog({ projectId: project.id, taskId: isolation.taskId, taskVersion: isolation.taskVersion }); },
-              mergeAbortRuns[isolation.taskId] === true,
+              mergeConflictWriteStatuses[isolation.taskId],
+              mergeConflictWriteStarts[isolation.taskId] === true,
+              mergeConflictWriteNotices[isolation.taskId],
             )}
             {isolation.taskState === "completed" && <>
               <p className="muted">This task is completed. Its active task lease has been released.</p>
@@ -1180,8 +1298,27 @@ function renderMergeConflictInspection(
   state: MergeConflictInspectionLoadState | undefined,
   onConfirm: () => void,
   onAbort: () => void,
-  abortInFlight: boolean,
+  writeStatus: MergeConflictWriteStatusState | undefined,
+  writeStartedLocally: boolean,
+  writeNotice: string | undefined,
 ) {
+  // The write-status gate is evaluated before the inspection outcome: an
+  // action-eligible outcome means nothing while a merge-conflict write is
+  // executing, and `loading`/`error`/absent are all fail-safe here. Only a
+  // confirmed `running: false` from the runtime's shared lock, with no
+  // locally started write outstanding, lets any action through.
+  if (writeStatus === undefined || writeStatus.kind === "loading") {
+    return <p className="muted">Checking whether a merge action is currently running…</p>;
+  }
+  if (writeStatus.kind === "error") {
+    return <p className="inline-notice">The merge action status could not be checked safely. No merge action is offered until it can be.</p>;
+  }
+  if (!mergeConflictActionsAllowed(writeStatus, writeStartedLocally)) {
+    return <div className="merge-conflict-panel">
+      <p className="muted">A merge action is in progress for this task. This status updates automatically.</p>
+      {writeNotice !== undefined && <p className="muted">{writeNotice}</p>}
+    </div>;
+  }
   if (state === undefined || state.kind === "loading") {
     return <p className="muted">Checking the Git merge state safely…</p>;
   }
@@ -1193,12 +1330,8 @@ function renderMergeConflictInspection(
   }
   // Only these three outcomes offer an abort action at all (see
   // `docs/PHASE_PLAN.md` Phase 5e-4); `inconsistent`/`unavailable` never do.
-  // While a prior abort attempt for this task is still in flight, both the
-  // continue and abort actions are replaced by a status message so the two
-  // writes can never appear simultaneously executable for the same task.
-  const abortAction = abortInFlight
-    ? <p className="muted">A merge abort is in progress for this task. This status updates automatically.</p>
-    : <button className="button button--secondary" onClick={onAbort}>Abort the in-progress merge</button>;
+  const notice = writeNotice !== undefined ? <p className="muted">{writeNotice}</p> : null;
+  const abortAction = <button className="button button--secondary" onClick={onAbort}>Abort the in-progress merge</button>;
   switch (state.result.outcome) {
     case "confirmedUnresolved":
       {
@@ -1211,18 +1344,21 @@ function renderMergeConflictInspection(
             {MERGE_CONFLICT_KIND_LABELS.filter(([key]) => counts[key] > 0).map(([key, label]) => <li key={key}>{label}: {counts[key]}</li>)}
           </ul>
         </div>
+        {notice}
         {abortAction}
       </div>;
       }
     case "resolvedPendingConfirmation":
       return <div className="merge-conflict-panel">
         <p className="muted">Git no longer reports unmerged entries, but ChatOMS has not confirmed or completed the merge.</p>
-        {!abortInFlight && <button className="button" onClick={onConfirm}>Confirm the staged merge resolution</button>}
+        {notice}
+        <button className="button" onClick={onConfirm}>Confirm the staged merge resolution</button>
         {abortAction}
       </div>;
     case "restoredPendingAbortConfirmation":
       return <div className="merge-conflict-panel">
         <p className="muted">Git reports no merge in progress, and the original checkout already matches the base state it had before the merge started. This task has not yet been confirmed cancelled.</p>
+        {notice}
         {abortAction}
       </div>;
     case "inconsistent":
@@ -1233,6 +1369,24 @@ function renderMergeConflictInspection(
       return assertNever(state.result.outcome);
   }
 }
+
+/**
+ * The single gate every merge-conflict action goes through, on the panel and
+ * inside the confirmation dialogs alike. Actions are permitted only when the
+ * runtime's shared lock has been read successfully, reports itself free, and
+ * this page has not just started a write of its own. `undefined`, `loading`
+ * and `error` all withhold the actions.
+ */
+function mergeConflictActionsAllowed(
+  status: MergeConflictWriteStatusState | undefined,
+  startedLocally: boolean,
+): boolean {
+  return status !== undefined && status.kind === "ready" && !status.running && !startedLocally;
+}
+
+/** Fixed, content-free copy: never a raw backend error string. */
+const MERGE_CONFLICT_WRITE_BUSY_NOTICE =
+  "A merge action is already processing for this task, or its status needs to be refreshed. This status updates automatically.";
 
 function assertNever(_value: never): never {
   throw new Error("Unexpected merge conflict inspection outcome.");

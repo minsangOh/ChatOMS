@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use chatoms_domain::{
-    ProjectId, TaskId, TaskState, ValidationCommandKind, ValidationExecutionScope,
+    ProjectId, Task, TaskId, TaskState, ValidationCommandKind, ValidationExecutionScope,
 };
 use chatoms_ports::{
     TimeProvider,
@@ -166,6 +166,45 @@ where
             .map_err(|error| ApplicationError::from_categorized(&error))
     }
 
+    /// Read-only: the structured candidates `discovery` proposes for a
+    /// `ProjectRoot` validation approval on `task_id`.
+    ///
+    /// Deliberately **not** [`Self::list_candidates`]: that method gates on
+    /// the `Implementing`/`Testing` states in which a task approves
+    /// commands for its *own* worktree, while a `ProjectRoot` approval is
+    /// only ever recorded in `AwaitingUserDiffApproval` (see
+    /// [`Self::approve_project_root_command`], which re-derives and
+    /// re-validates the same candidate set independently). Reusing the
+    /// `TaskWorktree` gate here would make every `ProjectRoot` approval
+    /// unreachable. Candidates are still derived from the task worktree's
+    /// manifests — that is where this task's manifests live — but the
+    /// approval they feed targets the project root and is stored under
+    /// [`ValidationExecutionScope::ProjectRoot`], never substituting for a
+    /// `TaskWorktree` approval.
+    ///
+    /// Never executes anything and never writes.
+    pub fn list_project_root_candidates(
+        &mut self,
+        task_id: TaskId,
+        expected_version: u64,
+    ) -> Result<Vec<ValidationCommandCandidate>, ApplicationError> {
+        let task = self
+            .repository
+            .get_task(task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        if task.version() != expected_version {
+            return Err(category_error(FailureCategory::VersionConflict));
+        }
+        if task.state() != TaskState::AwaitingUserDiffApproval {
+            return Err(category_error(FailureCategory::InvalidState));
+        }
+        let worktree_path = self.candidate_worktree_path(task_id, &task)?;
+        self.discovery
+            .discover_candidates(Path::new(&worktree_path))
+            .map_err(|error| ApplicationError::from_categorized(&error))
+    }
+
     /// Approves exactly one discovered candidate for `(task_id,
     /// expected_version, request.kind)` together with a user-approved
     /// executable binding, persisting both as a single immutable row.
@@ -284,20 +323,7 @@ where
         {
             return Err(category_error(FailureCategory::InvariantViolation));
         }
-        let isolation = self
-            .repository
-            .get_task_isolation(request.task_id)
-            .map_err(|error| ApplicationError::from_categorized(&error))?
-            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
-        if isolation.project_id != task.project_id()
-            || isolation.expected_task_version != request.expected_version
-        {
-            return Err(category_error(FailureCategory::InvariantViolation));
-        }
-        let worktree_path = isolation
-            .worktree_path
-            .filter(|_| isolation.status == GitIsolationStatus::WorktreeReady)
-            .ok_or_else(|| category_error(FailureCategory::InvariantViolation))?;
+        let worktree_path = self.candidate_worktree_path(request.task_id, &task)?;
         let candidates = self
             .discovery
             .discover_candidates(Path::new(&worktree_path))
@@ -544,6 +570,34 @@ where
             volume_serial_hex: directory_identity.volume_serial_hex,
             file_id_hex: directory_identity.file_id_hex,
         })
+    }
+
+    /// Resolves the `WorktreeReady` worktree path candidates are derived
+    /// from, verifying that the isolation record really belongs to `task`.
+    ///
+    /// `TaskGitIsolation.expected_task_version` is the optimistic-
+    /// concurrency value of the *isolation* lifecycle: it is stamped when a
+    /// worktree operation is recorded and frozen once the isolation reaches
+    /// `WorktreeReady`, so it is not compared against the task's current
+    /// version. The caller verifies the task's own version and state.
+    /// Read-only.
+    fn candidate_worktree_path(
+        &mut self,
+        task_id: TaskId,
+        task: &Task,
+    ) -> Result<String, ApplicationError> {
+        let isolation = self
+            .repository
+            .get_task_isolation(task_id)
+            .map_err(|error| ApplicationError::from_categorized(&error))?
+            .ok_or_else(|| category_error(FailureCategory::NotFound))?;
+        if isolation.task_id != task_id || isolation.project_id != task.project_id() {
+            return Err(category_error(FailureCategory::InvariantViolation));
+        }
+        isolation
+            .worktree_path
+            .filter(|_| isolation.status == GitIsolationStatus::WorktreeReady)
+            .ok_or_else(|| category_error(FailureCategory::InvariantViolation))
     }
 
     /// Loads `task_id`, verifies its version and that it is `Implementing`

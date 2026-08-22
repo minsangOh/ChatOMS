@@ -176,7 +176,15 @@ fn start_locked(ready: &AppRuntime, id: TaskId, expected_version: u64) -> Result
     let mut repository_for_thread = ready.repository.clone();
     let mut time_for_thread = ready.time.clone();
 
-    std::thread::spawn(move || {
+    // `Builder::spawn` rather than `thread::spawn`: the latter panics when
+    // the OS refuses a new thread, and unlike `commands::merge_continue`
+    // this closure *constructs* its `UnregisterOnDrop` rather than receiving
+    // one, so a failed spawn would leave both holds taken with no thread to
+    // release them — permanently blocking every later abort and
+    // merge-continue for this task. Returning `Err` instead hands both holds
+    // back to `handle_confirm_merge_abort_and_start`, whose existing error
+    // arm releases them.
+    let spawn_result = std::thread::Builder::new().spawn(move || {
         let _unregister_guard = UnregisterOnDrop {
             merge_abort_runs,
             merge_conflict_writes,
@@ -197,6 +205,13 @@ fn start_locked(ready: &AppRuntime, id: TaskId, expected_version: u64) -> Result
                 &mut git,
             );
     });
+    if spawn_result.is_err() {
+        // No approval is rolled back and no state changes: this matches the
+        // documented merge-abort contract, where the immutable approval
+        // survives so a retry re-verifies live state from scratch. The task
+        // stays `MergeConflict`. The raw spawn error is not propagated.
+        return Err(category_error(FailureCategory::Internal));
+    }
 
     Ok(())
 }
@@ -246,6 +261,48 @@ mod tests {
             write_lock.register(task_id),
             "a normal drop must have released the shared merge-conflict write lock"
         );
+    }
+
+    /// Unlike `commands::merge_continue`, this closure *constructs* its
+    /// `UnregisterOnDrop` rather than receiving one, so `Builder::spawn`
+    /// dropping the closure unrun releases nothing at all. That asymmetry is
+    /// the entire reason `start_locked` must report a refused spawn as
+    /// `Err` and let `handle_confirm_merge_abort_and_start`'s error arm
+    /// release both holds — this test pins the asymmetry itself down so the
+    /// two commands are never "simplified" into the same shape.
+    #[test]
+    fn a_closure_that_builds_its_own_guard_releases_nothing_when_dropped_unrun() {
+        let registry = MergeAbortRunRegistry::new();
+        let write_lock = MergeConflictWriteLock::new();
+        let task_id = TaskId::new();
+        assert!(registry.register(task_id));
+        assert!(write_lock.register(task_id));
+        let registry_for_closure = registry.clone();
+        let write_lock_for_closure = write_lock.clone();
+
+        let never_run = move || {
+            let _unregister_guard = UnregisterOnDrop {
+                merge_abort_runs: registry_for_closure,
+                merge_conflict_writes: write_lock_for_closure,
+                task_id,
+            };
+        };
+        drop(never_run);
+
+        assert!(
+            !registry.register(task_id),
+            "the closure never ran, so it never built the guard that would have released this"
+        );
+        assert!(
+            !write_lock.register(task_id),
+            "same for the shared write lock"
+        );
+
+        // What the caller's error arm does, and why it has to.
+        registry.unregister(task_id);
+        write_lock.unregister(task_id);
+        assert!(registry.register(task_id));
+        assert!(write_lock.register(task_id));
     }
 
     #[test]

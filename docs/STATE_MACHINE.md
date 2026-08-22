@@ -63,7 +63,7 @@
 | `Validation` | format, lint, typecheck, test와 build 검증 |
 | `ApprovalDecision` | 사용자 결정 기록과 승인된 전이 실행 |
 | `Commit` | 승인된 단일 작업 commit 생성 |
-| `Merge` | 승인된 기본 브랜치 `--no-ff` 병합 |
+| `Merge` | 승인된 기본 브랜치 `--no-ff` 병합, 그리고 승인된 그 병합의 중단(`git merge --abort`) |
 | `RecoveryDiagnostic` | checkpoint, worktree, provider session과 external effect의 읽기 전용 진단 |
 | `Cleanup` | 보존 기간과 안전 조건을 통과한 branch, worktree와 artifact 정리 |
 
@@ -84,7 +84,7 @@
 | `ReviewFixing` | `ReadOnly`, `ProviderWrite`, `WorktreeWrite`, `Validation` |
 | `AwaitingUserDiffApproval` | `ReadOnly`, `ApprovalDecision` |
 | `Merging` | `ReadOnly`, `Commit`, `Merge` |
-| `MergeConflict` | `ReadOnly`, `ApprovalDecision`, 정책이 허용한 `WorktreeWrite` |
+| `MergeConflict` | `ReadOnly`, `ApprovalDecision`, 정책이 허용한 `WorktreeWrite`, 승인된 merge abort의 원본 checkout `Merge` write |
 | `PostMergeTesting` | `ReadOnly`, `Validation` |
 | `Completed` | `ReadOnly` |
 | `Paused` | `ReadOnly`, `RecoveryDiagnostic`, `ApprovalDecision` |

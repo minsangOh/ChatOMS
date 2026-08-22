@@ -1350,6 +1350,27 @@ impl MergeConflictWriteLock {
             guard.remove(&task_id);
         }
     }
+
+    /// Read-only: whether a merge-conflict write for `task_id` is executing
+    /// right now. Observes the same shared set every clone of this handle
+    /// sees and mutates nothing -- it neither acquires nor releases the
+    /// lock, so it can never be mistaken for a `register`.
+    ///
+    /// This exists so the UI can gate its merge-continue/merge-abort
+    /// actions on the *authoritative* in-flight state rather than on a
+    /// local flag that a polling tick would clear while the write is still
+    /// running. It stays a boolean on purpose: which of the two writes is
+    /// running, and everything it touches, is not the UI's business.
+    ///
+    /// A poisoned mutex reports `true`, matching `register`'s fail-closed
+    /// direction: an unreadable lock must never be presented as "nothing is
+    /// running, go ahead".
+    #[must_use]
+    pub fn is_running(&self, task_id: TaskId) -> bool {
+        self.inner
+            .lock()
+            .map_or(true, |guard| guard.contains(&task_id))
+    }
 }
 
 /// In-memory-only registry of cancellation handles for Cargo-only Testing

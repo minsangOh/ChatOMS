@@ -127,21 +127,31 @@ impl<'a> ContinueMerge<'a> {
         let root = self.root();
         let name = OsStr::new(name);
         let email = OsStr::new(email);
-        // `GIT_EDITOR=true` is the mechanism verified to prevent
-        // `merge --continue`'s internal commit step from opening an
-        // interactive editor for the already-prepared `MERGE_MSG`.
-        // Confirmed empirically: with no editor override, Vim launches,
-        // reads from this call's null stdin, and hangs indefinitely instead
-        // of failing fast.
+        // `GIT_EDITOR=true` prevents `merge --continue`'s internal commit
+        // step from opening an interactive editor for the already-prepared
+        // `MERGE_MSG`. Confirmed empirically: with no editor override, Vim
+        // launches, reads from this call's null stdin, and hangs
+        // indefinitely instead of failing fast.
         //
-        // `true` has no shell metacharacters, so Git executes the argv
-        // directly with no shell wrapper; on Windows, Git then resolves it
-        // via its own PATH lookup. This adapter's child process PATH is
-        // restricted to the trusted Git installation's `cmd`/`bin` and
-        // system directory only -- it never includes the task worktree,
-        // the user's PATH, or the current directory -- so this fixed
-        // literal always resolves to `mingw64\bin\true.exe` inside that
-        // trusted Git-for-Windows installation.
+        // What is *verified* about how this literal resolves is the
+        // end-to-end behaviour, not one specific lookup path: the real-Git
+        // integration test
+        // `crates/chatoms-infrastructure/tests/merge_continue.rs`'s
+        // `continued_creates_the_exact_two_parent_commit_and_clears_residue`
+        // drives this exact call under this exact controlled environment and
+        // observes the merge commit being created. In a standard Git for
+        // Windows layout `true.exe` lives in the installation's `usr\bin`,
+        // *not* in `mingw64\bin` -- an earlier version of this comment
+        // asserted the latter, which is wrong -- so resolution also depends
+        // on the directories Git itself prepends to a child's PATH from its
+        // own runtime prefix, not only on the three this adapter sets.
+        //
+        // The security property does not depend on which of those it is, and
+        // it is the one that matters here: `configure_controlled_environment`
+        // replaces PATH outright, so every directory `true` could be resolved
+        // from belongs to the trusted Git installation or the system
+        // directory. It can never resolve from the user's PATH, the current
+        // directory, or the task worktree.
         let editor = OsStr::new("true");
         self.git.run_write_command_with_env(
             &root,

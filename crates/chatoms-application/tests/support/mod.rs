@@ -1645,6 +1645,77 @@ pub fn restored_task(
     (task, vec![initial])
 }
 
+/// Builds a task by *applying* every state in `states` through
+/// `Task::transition_to`, starting from a freshly `Created` task, and
+/// returns it together with the transition history the state machine
+/// actually produced.
+///
+/// Nothing here is hand-picked: the resulting `task.version()` and every
+/// recorded `task_version`/`sequence` are whatever the domain assigns. That
+/// is the point — a fixture that assigns versions itself can silently make
+/// an unreachable production shape look reachable, which is exactly the
+/// class of defect
+/// `crates/chatoms-application/tests/merge_lifecycle_reachability.rs`
+/// exists to catch. Callers that need the version a task had at some
+/// intermediate state (an isolation record's frozen
+/// `expected_task_version`, say) must read it back out of the returned
+/// history rather than assume it.
+pub fn task_through(states: &[TaskState]) -> (Task, Vec<TaskStateTransition>) {
+    let id = TaskId::new();
+    let created_at_ms = 10;
+    let mut task = Task::restore(TaskSnapshot {
+        id,
+        project_id: ProjectId::new(),
+        state: TaskState::Created,
+        version: 0,
+        task_branch_identity: TaskBranchIdentity::for_task(id),
+        resume_target_state: None,
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+        terminal_at_ms: None,
+    })
+    .expect("a freshly created task satisfies the domain invariants");
+    let mut history = vec![TaskStateTransition::initial(
+        TaskStateTransitionId::new(),
+        id,
+        "test.actor".parse::<ActorKind>().expect("actor"),
+        "test.reason".parse::<ReasonCode>().expect("reason"),
+        created_at_ms,
+    )];
+    for (index, next) in states.iter().copied().enumerate() {
+        let from_state = task.state();
+        let occurred_at_ms = created_at_ms + 1 + index as i64;
+        task.transition_to(next, occurred_at_ms)
+            .expect("the requested chain must be a real state-machine path");
+        history.push(
+            TaskStateTransition::new(chatoms_domain::TaskStateTransitionSnapshot {
+                id: TaskStateTransitionId::new(),
+                task_id: id,
+                sequence: history.len() as u64 + 1,
+                from_state: Some(from_state),
+                to_state: next,
+                task_version: task.version(),
+                actor_kind: "test.actor".parse::<ActorKind>().expect("actor"),
+                reason_code: "test.reason".parse::<ReasonCode>().expect("reason"),
+                occurred_at_ms,
+            })
+            .expect("transition snapshot"),
+        );
+    }
+    (task, history)
+}
+
+/// The `task_version` recorded by the first transition that entered
+/// `state`, read back out of a real history built by [`task_through`].
+#[must_use]
+pub fn version_on_entering(history: &[TaskStateTransition], state: TaskState) -> u64 {
+    history
+        .iter()
+        .find(|transition| transition.to_state() == state)
+        .map(TaskStateTransition::task_version)
+        .expect("the history must contain the requested state")
+}
+
 pub fn storage_failure() -> PortFailure {
     PortFailure::new(FailureCategory::StorageUnavailable)
 }

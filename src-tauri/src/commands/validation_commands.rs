@@ -212,9 +212,14 @@ pub fn handle_approve_project_root_validation(
         .get_task(id)
         .map_err(IpcErrorDto::from)?
         .ok_or_else(IpcErrorDto::not_found)?;
+    // `list_project_root_candidates`, never `list_candidates`: the latter
+    // gates on `Implementing`/`Testing` (the states a task approves commands
+    // for its own worktree in), which no `AwaitingUserDiffApproval` task can
+    // satisfy. `ValidationCommandService::approve_project_root_command`
+    // re-derives and re-validates the same candidate set independently below.
     let candidates =
         ValidationCommandService::new(&mut repository, &mut time, &mut discovery, &mut filesystem)
-            .list_candidates(id, expected_version)
+            .list_project_root_candidates(id, expected_version)
             .map_err(IpcErrorDto::from)?;
     let mut resolved = Vec::new();
     for (kind, already_approved) in [

@@ -31,8 +31,9 @@ use chatoms_ports::{
 
 use super::{
     REGISTERED_HANDLERS, context_package, high_risk_approval, implementation, merge_abort,
-    merge_continue, merge_execution, planning, post_merge_validation, projects,
-    provider_eligibility, review, system, tasks, testing, user_diff_review, validation_commands,
+    merge_conflict_write_status, merge_continue, merge_execution, planning, post_merge_validation,
+    projects, provider_eligibility, review, system, tasks, testing, user_diff_review,
+    validation_commands,
 };
 use crate::{
     dto::HealthStateDto,
@@ -58,6 +59,12 @@ struct RepositoryFake {
     isolation: Option<TaskGitIsolation>,
     approvals: Vec<ValidationCommandApprovalRecord>,
     high_risk_approvals: Vec<HighRiskApprovalRecord>,
+    /// Seeded only by `ready_runtime_for_project_root_approval`; every other
+    /// builder leaves these `None`, which keeps `get_project`/
+    /// `get_project_identity` reporting "absent" rather than succeeding by
+    /// accident.
+    project: Option<chatoms_ports::repository::ProjectRecord>,
+    project_identity: Option<chatoms_ports::repository::ProjectFilesystemIdentityRecord>,
     /// Scripted result for whichever `prepare_*_context_package` method a
     /// test calls. `None` falls through to `operation_failed()`, matching
     /// every other not-yet-scripted method on this fake.
@@ -144,6 +151,19 @@ impl FoundationRepository for RepositoryFake {
     ) -> Result<Option<TaskGitIsolation>, RepositoryError> {
         Ok(self.isolation.clone())
     }
+    fn get_project(
+        &mut self,
+        _project_id: chatoms_domain::ProjectId,
+    ) -> Result<Option<chatoms_ports::repository::ProjectRecord>, RepositoryError> {
+        Ok(self.project.clone())
+    }
+    fn get_project_identity(
+        &mut self,
+        _project_id: chatoms_domain::ProjectId,
+    ) -> Result<Option<chatoms_ports::repository::ProjectFilesystemIdentityRecord>, RepositoryError>
+    {
+        Ok(self.project_identity.clone())
+    }
     fn save_validation_command_approval(
         &mut self,
         approval: &ValidationCommandApprovalRecord,
@@ -160,6 +180,10 @@ impl FoundationRepository for RepositoryFake {
         self.approvals.push(approval.clone());
         Ok(())
     }
+    /// Scoped to `TaskWorktree`, matching
+    /// `SqliteFoundationRepository::list_validation_command_approvals`. The
+    /// fake previously returned every scope, which would have hidden a
+    /// `ProjectRoot` approval leaking into the `TaskWorktree` surface.
     fn list_validation_command_approvals(
         &mut self,
         task_id: TaskId,
@@ -171,6 +195,8 @@ impl FoundationRepository for RepositoryFake {
             .filter(|approval| {
                 approval.task_id == task_id
                     && approval.approved_task_version == approved_task_version
+                    && approval.execution_scope
+                        == chatoms_domain::ValidationExecutionScope::TaskWorktree
             })
             .cloned()
             .collect())
@@ -504,6 +530,8 @@ fn ready_runtime_with_git_and_claude_binding(
                 isolation: None,
                 approvals: Vec::new(),
                 high_risk_approvals: Vec::new(),
+                project: None,
+                project_identity: None,
                 prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
@@ -553,6 +581,8 @@ fn ready_runtime_with_task(
                 isolation: None,
                 approvals: Vec::new(),
                 high_risk_approvals: Vec::new(),
+                project: None,
+                project_identity: None,
                 prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
@@ -607,6 +637,8 @@ fn ready_runtime_with_task_and_review_result(
                 isolation: None,
                 approvals: Vec::new(),
                 high_risk_approvals: Vec::new(),
+                project: None,
+                project_identity: None,
                 prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
@@ -665,6 +697,8 @@ fn ready_runtime_with_task_isolation_and_context_package_outcome(
                 isolation,
                 approvals: Vec::new(),
                 high_risk_approvals: Vec::new(),
+                project: None,
+                project_identity: None,
                 prepare_context_package_outcome,
             }),
             time: TimeProviderHandle::new(TimeFake),
@@ -755,6 +789,8 @@ fn ready_runtime_with_task_isolation_filesystem_and_resolved_paths(
                 isolation,
                 approvals: Vec::new(),
                 high_risk_approvals: Vec::new(),
+                project: None,
+                project_identity: None,
                 prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
@@ -763,6 +799,86 @@ fn ready_runtime_with_task_isolation_filesystem_and_resolved_paths(
                 available: Ok(true),
             }),
             filesystem,
+            worktree_paths: crate::state::WorktreePathHandle::new(
+                chatoms_platform::ManagedWorktreePaths::windows_from_environment()
+                    .expect("test worktree paths"),
+            ),
+            provider_capabilities: crate::state::ProviderCapabilityHandle::new(),
+            preflight_dir: None,
+            planning_runs: crate::state::PlanningRunRegistry::new(),
+            implementation_runs: crate::state::ImplementationRunRegistry::new(),
+            testing_runs: crate::state::TestingRunRegistry::new(),
+            review_runs: crate::state::ReviewRunRegistry::new(),
+            merge_abort_runs: crate::state::MergeAbortRunRegistry::new(),
+            merge_conflict_writes: crate::state::MergeConflictWriteLock::new(),
+        },
+        RuntimeResources {
+            paths: Arc::new(std::sync::Mutex::new(Some(resolved_app_paths_stub()))),
+            ..RuntimeResources::default()
+        },
+    ))
+}
+
+/// A runtime with everything `handle_approve_project_root_validation`
+/// needs: the task, its `WorktreeReady` isolation (whose
+/// `expected_task_version` is deliberately *behind* the task's current
+/// version, as production leaves it once the isolation completes), the
+/// project record, and its confirmed filesystem identity.
+fn ready_runtime_for_project_root_approval(
+    task: Task,
+    isolation: TaskGitIsolation,
+    project_root: &std::path::Path,
+) -> ManagedRuntime {
+    let root_path = project_root.to_string_lossy().into_owned();
+    ManagedRuntime::ready(AppRuntime::new(
+        BootstrapStatus {
+            storage_status: StorageStatus::Ready,
+            database_status: DatabaseStatus::Ready,
+            logging_status: LoggingStatus::Ready,
+            active_task_status: ActiveTaskStatus::None,
+            application_version: APPLICATION_VERSION,
+            ready: true,
+        },
+        RuntimePorts {
+            repository: RepositoryHandle::new(RepositoryFake {
+                calls: Arc::new(CallCounts::default()),
+                claude_binding: None,
+                project: Some(chatoms_ports::repository::ProjectRecord {
+                    id: task.project_id(),
+                    name: "fixture".to_owned(),
+                    root_path: root_path.clone(),
+                    canonical_path_key: root_path.to_lowercase(),
+                    display_path: root_path.clone(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                }),
+                project_identity: Some(
+                    chatoms_ports::repository::ProjectFilesystemIdentityRecord {
+                        project_id: task.project_id(),
+                        root_volume_serial_hex: "0000000000000001".to_owned(),
+                        root_file_id_hex: "00000000000000000000000000000001".to_owned(),
+                        repository_kind: chatoms_ports::git::RepositoryKind::Git,
+                        git_common_volume_serial_hex: None,
+                        git_common_file_id_hex: None,
+                        confirmed: true,
+                        revision: 3,
+                        verified_at_ms: 2,
+                    },
+                ),
+                task: Some(task),
+                planning_result: None,
+                review_result: None,
+                isolation: Some(isolation),
+                approvals: Vec::new(),
+                high_risk_approvals: Vec::new(),
+                prepare_context_package_outcome: None,
+            }),
+            time: TimeProviderHandle::new(TimeFake),
+            capabilities: CapabilityHandle::new(CapabilityFake),
+            git: crate::state::GitServiceHandle::new(GitCapabilityFake {
+                available: Ok(true),
+            }),
+            filesystem: crate::state::FilesystemIdentityHandle::new(EchoFilesystemIdentity),
             worktree_paths: crate::state::WorktreePathHandle::new(
                 chatoms_platform::ManagedWorktreePaths::windows_from_environment()
                     .expect("test worktree paths"),
@@ -819,6 +935,8 @@ fn ready_runtime_with_blocking_git(
                 isolation: None,
                 approvals: Vec::new(),
                 high_risk_approvals: Vec::new(),
+                project: None,
+                project_identity: None,
                 prepare_context_package_outcome: None,
             }),
             time: TimeProviderHandle::new(TimeFake),
@@ -1007,7 +1125,7 @@ fn task_not_found_and_unavailable_state_return_stable_safe_errors() {
 
 #[test]
 fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
-    assert_eq!(REGISTERED_HANDLERS.len(), 52);
+    assert_eq!(REGISTERED_HANDLERS.len(), 53);
     assert_eq!(
         REGISTERED_HANDLERS,
         [
@@ -1063,6 +1181,7 @@ fn handler_allowlist_contains_only_approved_purpose_specific_commands() {
             "approve_user_diff_and_start_merge",
             "confirm_manual_resolution_and_start_merge_continue",
             "confirm_merge_abort_and_start",
+            "get_merge_conflict_write_status",
         ]
     );
     for forbidden in [
@@ -1744,6 +1863,161 @@ fn project_root_validation_status_is_content_free_and_requires_the_awaiting_diff
 
     assert!(!status.test_approved);
     assert!(!status.build_approved);
+}
+
+/// The ProjectRoot approval command must derive its candidates from the
+/// `AwaitingUserDiffApproval`-gated listing, never from `list_candidates`,
+/// which only serves `Implementing`/`Testing`. Reusing the latter made every
+/// call return `InvalidState`, so no task could ever satisfy
+/// `MergeExecutionStarter`'s ProjectRoot approval requirement.
+///
+/// The isolation here is frozen two versions behind the task, exactly as
+/// production leaves it once the worktree is ready.
+#[test]
+fn approve_project_root_validation_succeeds_while_awaiting_user_diff_approval() {
+    let worktree = TempWorktree::new("project-root-approve");
+    worktree.write(
+        "Cargo.toml",
+        "[package]
+name = \"fixture\"
+",
+    );
+
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingUserDiffApproval);
+    let isolation = worktree_ready_isolation(
+        task.id(),
+        task.project_id(),
+        &worktree.path,
+        task.version() - 1,
+    );
+    let runtime = ready_runtime_for_project_root_approval(task.clone(), isolation, &worktree.path);
+
+    let status = validation_commands::handle_approve_project_root_validation(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::ApproveProjectRootValidationInputDto {
+            executable_path: "C:/fake-tools/cargo/bin/cargo.exe".to_owned(),
+            cargo_home_path: None,
+            rustup_home_path: None,
+        },
+    )
+    .expect("ProjectRoot approval must be reachable from AwaitingUserDiffApproval");
+
+    assert!(status.test_approved);
+    assert!(status.build_approved);
+
+    let readback = validation_commands::handle_get_project_root_validation_approval_status(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect("ProjectRoot approval status loads");
+    assert!(readback.test_approved && readback.build_approved);
+
+    let task_worktree_scoped = validation_commands::handle_get_validation_command_approval_status(
+        &runtime,
+        &task.id().to_string(),
+    )
+    .expect("TaskWorktree approval status loads");
+    assert!(
+        task_worktree_scoped.approved_kinds.is_empty(),
+        "a ProjectRoot approval must never be readable as a TaskWorktree approval"
+    );
+}
+
+#[test]
+fn approve_project_root_validation_rejects_a_blank_path_a_wrong_state_and_a_stale_version() {
+    let worktree = TempWorktree::new("project-root-reject");
+    worktree.write(
+        "Cargo.toml",
+        "[package]
+name = \"fixture\"
+",
+    );
+
+    let task = task_in_state(chatoms_domain::TaskState::AwaitingUserDiffApproval);
+    let isolation = worktree_ready_isolation(
+        task.id(),
+        task.project_id(),
+        &worktree.path,
+        task.version() - 1,
+    );
+    let runtime = ready_runtime_for_project_root_approval(task.clone(), isolation, &worktree.path);
+
+    let blank = validation_commands::handle_approve_project_root_validation(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+        crate::dto::ApproveProjectRootValidationInputDto {
+            executable_path: "   ".to_owned(),
+            cargo_home_path: None,
+            rustup_home_path: None,
+        },
+    )
+    .expect_err("a blank executable path is rejected at the boundary");
+    assert_eq!(blank.code, "APP_INVALID_INPUT");
+
+    let stale = validation_commands::handle_approve_project_root_validation(
+        &runtime,
+        &task.id().to_string(),
+        task.version() + 1,
+        crate::dto::ApproveProjectRootValidationInputDto {
+            executable_path: "C:/fake-tools/cargo/bin/cargo.exe".to_owned(),
+            cargo_home_path: None,
+            rustup_home_path: None,
+        },
+    )
+    .expect_err("a version that is not the task's current version is rejected");
+    assert_eq!(stale.code, "APP_VERSION_CONFLICT");
+
+    assert!(
+        validation_commands::handle_get_project_root_validation_approval_status(
+            &runtime,
+            &task.id().to_string(),
+            task.version(),
+        )
+        .expect("status loads")
+            == crate::dto::ProjectRootValidationApprovalStatusDto {
+                test_approved: false,
+                build_approved: false,
+            },
+        "a rejected request must approve nothing"
+    );
+
+    // A task that is not awaiting diff approval cannot record a ProjectRoot
+    // approval at all, and must not fall back to the TaskWorktree flow.
+    let testing_worktree = TempWorktree::new("project-root-wrong-state");
+    testing_worktree.write(
+        "Cargo.toml",
+        "[package]
+name = \"fixture\"
+",
+    );
+    let testing_task = task_in_state(chatoms_domain::TaskState::Testing);
+    let testing_isolation = worktree_ready_isolation(
+        testing_task.id(),
+        testing_task.project_id(),
+        &testing_worktree.path,
+        testing_task.version(),
+    );
+    let testing_runtime = ready_runtime_for_project_root_approval(
+        testing_task.clone(),
+        testing_isolation,
+        &testing_worktree.path,
+    );
+    let wrong_state = validation_commands::handle_approve_project_root_validation(
+        &testing_runtime,
+        &testing_task.id().to_string(),
+        testing_task.version(),
+        crate::dto::ApproveProjectRootValidationInputDto {
+            executable_path: "C:/fake-tools/cargo/bin/cargo.exe".to_owned(),
+            cargo_home_path: None,
+            rustup_home_path: None,
+        },
+    )
+    .expect_err("Testing is not a state a ProjectRoot approval may be recorded in");
+    assert_eq!(wrong_state.code, "APP_INVALID_STATE");
 }
 
 #[test]
@@ -3065,6 +3339,125 @@ fn confirm_merge_abort_and_start_returns_started_false_without_touching_git_when
 // completion and on panic is covered by the guard tests in
 // `commands::merge_continue` and `commands::merge_abort` themselves, which
 // exercise the exact `Drop` impls these commands hand to their threads.
+
+/// Phase 5f-3a: `handle_confirm_merge_abort_and_start` takes two in-memory
+/// holds (`merge_abort_runs`, then `merge_conflict_writes`) before
+/// `start_locked` does anything, and `start_locked` is the function that
+/// now also reports a refused `Builder::spawn` as `Err`. Whatever inside it
+/// fails, the caller's error arm must hand both holds back — otherwise the
+/// task would be permanently unable to abort or merge-continue again. This
+/// drives the real command and then proves the retry is possible.
+/// Phase 5f-3b: the read-only write-status command the MergeConflict UI
+/// gates its actions on. It must report the shared lock faithfully in both
+/// directions and must not disturb either in-memory hold, since it runs on
+/// the same 2-second poll as the inspection query.
+#[test]
+fn merge_conflict_write_status_reports_the_shared_lock_without_changing_any_registry() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let calls = Arc::new(CallCounts::default());
+    let runtime = ready_runtime_with_task(Arc::clone(&calls), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+
+    let idle = merge_conflict_write_status::handle_get_merge_conflict_write_status(
+        &runtime,
+        &task.id().to_string(),
+    )
+    .expect("write status loads");
+    assert!(!idle.running);
+
+    assert!(ready.merge_conflict_writes.register(task.id()));
+    let running = merge_conflict_write_status::handle_get_merge_conflict_write_status(
+        &runtime,
+        &task.id().to_string(),
+    )
+    .expect("write status loads");
+    assert!(running.running);
+
+    // Neither hold moved, and no task read was needed: this command touches
+    // the lock only, never the repository.
+    assert!(
+        !ready.merge_conflict_writes.register(task.id()),
+        "observing the status must not have released the lock"
+    );
+    assert!(
+        ready.merge_abort_runs.register(task.id()),
+        "the abort registry is a different hold and must be untouched"
+    );
+    ready.merge_abort_runs.unregister(task.id());
+    assert_eq!(
+        calls.task.load(Ordering::SeqCst),
+        0,
+        "a content-free lock observation must not read the task at all"
+    );
+
+    ready.merge_conflict_writes.unregister(task.id());
+    let released = merge_conflict_write_status::handle_get_merge_conflict_write_status(
+        &runtime,
+        &task.id().to_string(),
+    )
+    .expect("write status loads");
+    assert!(!released.running);
+}
+
+#[test]
+fn merge_conflict_write_status_rejects_an_unparseable_task_id() {
+    let runtime = ready_runtime(Arc::new(CallCounts::default()));
+
+    let error = merge_conflict_write_status::handle_get_merge_conflict_write_status(
+        &runtime,
+        "not-a-task-id",
+    )
+    .expect_err("an unparseable task id must be rejected");
+    assert_eq!(error.code, "APP_INVALID_INPUT");
+}
+
+#[test]
+fn a_failed_merge_abort_start_releases_both_holds_so_the_same_task_can_retry() {
+    let task = task_in_state(chatoms_domain::TaskState::MergeConflict);
+    let runtime =
+        ready_runtime_with_task(Arc::new(CallCounts::default()), Some(task.clone()), None);
+    let ready = runtime
+        .ready_snapshot()
+        .expect("runtime must be ready for this test");
+
+    let error = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    )
+    .expect_err("this fake repository cannot satisfy the abort preflight");
+    assert!(
+        !error.code.is_empty(),
+        "the failure must be a typed IPC error, never a raw OS or Git string"
+    );
+
+    assert!(
+        ready.merge_abort_runs.register(task.id()),
+        "a failed start must release its merge_abort_runs entry"
+    );
+    assert!(
+        ready.merge_conflict_writes.register(task.id()),
+        "a failed start must release the shared merge-conflict write lock"
+    );
+    ready.merge_abort_runs.unregister(task.id());
+    ready.merge_conflict_writes.unregister(task.id());
+
+    // And the retry really does get as far as the same failure rather than
+    // being turned away by the previous attempt's leftovers.
+    let retry = merge_abort::handle_confirm_merge_abort_and_start(
+        &runtime,
+        &task.id().to_string(),
+        task.version(),
+    );
+    assert!(
+        retry.is_err(),
+        "the retry reaches the same preflight failure, not a stale-hold rejection"
+    );
+    assert!(ready.merge_abort_runs.register(task.id()));
+    assert!(ready.merge_conflict_writes.register(task.id()));
+}
 
 #[test]
 fn merge_continue_is_rejected_as_a_conflict_when_the_shared_write_lock_is_already_held() {

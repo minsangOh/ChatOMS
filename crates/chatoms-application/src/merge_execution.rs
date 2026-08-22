@@ -187,9 +187,19 @@ where
             .get_task_isolation(request.task_id)
             .map_err(repository_error)?
             .ok_or_else(|| category_error(FailureCategory::NotFound))?;
-        if isolation.project_id != task.project_id()
-            || isolation.expected_task_version != request.expected_version
+        // `TaskGitIsolation.expected_task_version` is the optimistic-
+        // concurrency value of the *isolation* lifecycle: it is stamped when a
+        // worktree operation is recorded and frozen once the isolation reaches
+        // `WorktreeReady`. It is deliberately not compared against the task's
+        // current version here — by the time a task reaches this point it has
+        // advanced many versions past `WorktreeReady`, so such a comparison
+        // could never hold. The task's own version is verified above; the
+        // isolation is verified by identity and status instead.
+        if isolation.task_id != request.task_id
+            || isolation.project_id != task.project_id()
             || isolation.status != GitIsolationStatus::WorktreeReady
+            || !isolation.branch_created_by_app
+            || !isolation.worktree_created_by_app
         {
             return Err(category_error(FailureCategory::InvariantViolation));
         }

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chatoms_domain::{TaskId, TaskState, TaskStateTransition};
+use chatoms_domain::{TaskId, TaskState};
 use chatoms_ports::{
     filesystem::FilesystemIdentityPort,
     git::RepositoryKind,
@@ -98,10 +98,17 @@ where
             (Some(branch), Some(commit), Some(path)) => (branch, commit, path),
             _ => return Ok(Some(inconsistent())),
         };
+        // `TaskGitIsolation.expected_task_version` is the optimistic-
+        // concurrency value of the *isolation* lifecycle: it is stamped when a
+        // worktree operation is recorded and frozen once the isolation reaches
+        // `WorktreeReady`. It is deliberately not compared against the task's
+        // current version here — by the time a task reaches this point it has
+        // advanced many versions past `WorktreeReady`, so such a comparison
+        // could never hold. The task's own version is verified above; the
+        // isolation is verified by identity and status instead.
         if isolation.task_id != task_id
             || isolation.project_id != task.project_id()
             || isolation.status != GitIsolationStatus::WorktreeReady
-            || isolation.expected_task_version != approval_version
             || !isolation.branch_created_by_app
             || !isolation.worktree_created_by_app
             || identity.repository_kind != RepositoryKind::Git
@@ -166,31 +173,8 @@ where
             .repository
             .list_task_transitions(task.id())
             .map_err(repository_error)?;
-        Ok(merge_chain_approval_version(&transitions, task))
+        Ok(crate::merge_provenance::resolve_merge_conflict_approval_version(&transitions, task))
     }
-}
-
-pub(crate) fn merge_chain_approval_version(
-    transitions: &[TaskStateTransition],
-    task: &chatoms_domain::Task,
-) -> Option<u64> {
-    transitions.windows(3).find_map(|chain| {
-        let consecutive = chain[0].sequence().checked_add(1) == Some(chain[1].sequence())
-            && chain[1].sequence().checked_add(1) == Some(chain[2].sequence())
-            && chain[0].task_id() == task.id()
-            && chain[1].task_id() == task.id()
-            && chain[2].task_id() == task.id()
-            && chain[0].task_version().checked_add(1) == Some(chain[1].task_version())
-            && chain[1].task_version().checked_add(1) == Some(chain[2].task_version());
-        (consecutive
-            && chain[0].to_state() == TaskState::AwaitingUserDiffApproval
-            && chain[1].from_state() == Some(TaskState::AwaitingUserDiffApproval)
-            && chain[1].to_state() == TaskState::Merging
-            && chain[2].from_state() == Some(TaskState::Merging)
-            && chain[2].to_state() == TaskState::MergeConflict
-            && chain[2].task_version() == task.version())
-        .then_some(chain[0].task_version())
-    })
 }
 
 fn repository_error(error: chatoms_ports::repository::RepositoryError) -> ApplicationError {

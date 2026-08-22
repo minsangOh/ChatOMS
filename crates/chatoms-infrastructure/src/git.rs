@@ -607,6 +607,18 @@ impl GitCliAdapter {
     }
 }
 
+/// Fixed argv for the shared read-only repository-status observation.
+///
+/// `--no-optional-locks` is a *global* Git option, so it must precede the
+/// subcommand — that ordering is the whole point of pinning this array down
+/// as a named constant with a regression test.
+pub(crate) const READ_ONLY_STATUS_ARGUMENTS: [&str; 4] = [
+    "--no-optional-locks",
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+];
+
 impl GitService for GitCliAdapter {
     fn is_available(&mut self) -> Result<bool, PortFailure> {
         Ok(self
@@ -675,7 +687,27 @@ impl GitService for GitCliAdapter {
     }
 
     fn repository_status(&mut self, root: &Path) -> Result<RepositoryStatus, PortFailure> {
-        let status = self.at_str(root, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+        // `--no-optional-locks` (a global option, so it must precede the
+        // subcommand) stops `git status` from opportunistically refreshing
+        // and rewriting the index, which is the only reason this read-only
+        // observation would ever take `.git/index.lock`.
+        //
+        // This matters because `MergeConflictInspectionService` reaches this
+        // helper on a 2-second UI poll while the task sits in
+        // `MergeConflict` — and `commands::merge_abort` performs its
+        // `git merge --abort` write against that same original checkout for
+        // the whole of that window. Without this flag the two contend for
+        // the index lock, and a merge abort that should have succeeded can
+        // come back as `PostWriteUncertain`.
+        //
+        // Applied here rather than at the single merge-conflict call site
+        // because every caller of this helper is a read-only observer
+        // (project inspection, merge execution/continue/abort pre- and
+        // post-write verification): none of them wants an index refresh as
+        // a side effect. Mutation commands are untouched — they legitimately
+        // take the index lock. Still a fixed argv array, still no shell
+        // string.
+        let status = self.at_str(root, READ_ONLY_STATUS_ARGUMENTS)?;
         ensure_success(&status)?;
         let branch = self.at_str(root, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
         let current_branch = branch
@@ -1689,6 +1721,50 @@ fn map_io_error(error: std::io::Error) -> PortFailure {
 mod tests {
     use super::*;
     use chatoms_ports::error::CategorizedFailure;
+
+    /// `--no-optional-locks` only takes effect as a global option, i.e.
+    /// before the subcommand. If it ever drifts after `status`, Git silently
+    /// treats it as an unknown `status` flag and the read-only observation
+    /// starts taking `.git/index.lock` again, contending with the
+    /// merge-conflict writes that run against the same checkout.
+    #[test]
+    fn read_only_status_argv_passes_no_optional_locks_before_the_subcommand() {
+        assert_eq!(
+            READ_ONLY_STATUS_ARGUMENTS,
+            [
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ]
+        );
+        let flag = READ_ONLY_STATUS_ARGUMENTS
+            .iter()
+            .position(|argument| *argument == "--no-optional-locks")
+            .expect("the read-only status argv must carry --no-optional-locks");
+        let subcommand = READ_ONLY_STATUS_ARGUMENTS
+            .iter()
+            .position(|argument| *argument == "status")
+            .expect("the read-only status argv must invoke `status`");
+        assert!(
+            flag < subcommand,
+            "--no-optional-locks is a global option and must precede the subcommand"
+        );
+    }
+
+    /// Every element is a separate argv entry: no element may smuggle in a
+    /// space-separated pair, which is how a fixed argv array degrades into
+    /// something shell-like.
+    #[test]
+    fn read_only_status_argv_has_no_combined_or_empty_arguments() {
+        for argument in READ_ONLY_STATUS_ARGUMENTS {
+            assert!(!argument.is_empty());
+            assert!(
+                !argument.contains(char::is_whitespace),
+                "argv entries must stay separate"
+            );
+        }
+    }
 
     // These tests exercise `capture_bounded_stdout`/`classify_capture`
     // against fixture `cmd.exe` processes, never a real (or even fake) Git
